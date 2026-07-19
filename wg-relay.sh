@@ -1,9 +1,9 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v20.0 (终极输入修复版)
+# WireGuard 智能中转部署脚本 v21.0 (彻底解决交互跳转版)
 # ==========================================
 
-# 核心：强制重定向输入终端，确保 curl | bash 模式下交互正常
+# 强制重定向输入终端
 if [ -t 0 ]; then :; else exec </dev/tty; fi
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -15,7 +15,7 @@ SYSCTL_FILE="/etc/sysctl.d/99-yw-optimize.conf"
 
 export DEBIAN_FRONTEND=noninteractive
 
-# ================= 基础检查 =================
+# ================= 基础与工具函数 =================
 check_root() { [ "$EUID" -ne 0 ] && echo -e "${RED}请使用root运行${NC}" && exit 1; }
 
 check_system() {
@@ -27,6 +27,18 @@ check_system() {
     else
         echo -e "${RED}⚠️ 无法识别操作系统${NC}"; exit 1
     fi
+}
+
+# 核心：清理输入缓冲区，防止残留字符导致跳过暂停
+clear_stdin() {
+    while read -t 0.1 -n 1 dummy; do :; done
+}
+
+# 统一的暂停函数
+pause_return() {
+    clear_stdin
+    echo -e "${YELLOW}按 Enter 键返回主菜单...${NC}"
+    read -r
 }
 
 kill_apt_locks() {
@@ -229,8 +241,7 @@ tune_system() {
         echo -e "${YELLOW}[3/4] 应用网关极限网络参数...${NC}"
         _kernel_optimize_core
         echo -e "${GREEN}[4/4] 优化完成！${NC}"
-        read -p "按回车键继续..."
-        return
+        pause_return; return
     fi
     
     echo -e "${YELLOW}[2/4] 尝试添加 XanMod BBRv3 仓库...${NC}"
@@ -244,7 +255,7 @@ tune_system() {
             if apt-get install -y ${pkg_name}; then
                 _kernel_optimize_core
                 echo -e "${GREEN}✓ 内核安装并调优成功！请重启服务器。${NC}"
-                read -p "按回车键重启..." && reboot
+                pause_return && reboot
             else
                 echo -e "${RED}✘ 内核下载/安装失败，自动回退普通调优${NC}"
                 _kernel_optimize_core
@@ -258,7 +269,7 @@ tune_system() {
         _kernel_optimize_core
     fi
     echo -e "${GREEN}[4/4] 优化完成！${NC}"
-    read -p "按回车键继续..."
+    pause_return
 }
 
 # ================= 1. 中转机初始化 =================
@@ -267,7 +278,7 @@ init_relay() {
     echo -e "${YELLOW}━━━ 初始化中转机 ━━━${NC}"
     if [ -f "$WG_CONF" ]; then
         read -p "${RED}⚠️ 已有配置将被覆盖！确定？${NC} [y/N]: " confirm
-        [[ ! "$confirm" =~ ^[Yy]$ ]] && return
+        [[ ! "$confirm" =~ ^[Yy]$ ]] && { pause_return; return; }
     fi
     kill_apt_locks
     apt-get install -y wireguard > /dev/null 2>&1
@@ -286,31 +297,52 @@ EOF
     echo -e " 中转机初始化成功！IP: ${CYAN}${RELAY_IP}${NC}"
     echo -e " 中转机公钥: ${CYAN}${WG_PUB}${NC}"
     echo -e "=========================================="
+    pause_return
 }
 
 # ================= 2. 生成落地部署码 =================
 gen_landing_code() {
     clear
     echo -e "${YELLOW}━━━ 生成落地部署码 ━━━${NC}"
-    if [ ! -f "$WG_CONF" ]; then echo -e "${RED}请先初始化中转机${NC}"; return; fi
+    if [ ! -f "$WG_CONF" ]; then echo -e "${RED}请先初始化中转机${NC}"; pause_return; return; fi
+    
+    # 修复: 移除过于严格的正则，只判断非空
     while true; do
         read -p "请输入节点名称 (支持中文): " NODE_NAME
-        if [ -z "$NODE_NAME" ] || [[ "$NODE_NAME" =~ [\/\\\|\&] ]]; then echo -e "${RED}名称为空或含非法字符${NC}"; else break; fi
+        if [ -z "$NODE_NAME" ]; then
+            echo -e "${RED}名称不能为空${NC}"
+        else
+            break
+        fi
     done
+    
     MAX_IP=1
     for ip in $(grep "^AllowedIPs = 10.0.0." $WG_CONF | awk '{print $3}' | cut -d'.' -f4 | cut -d'/' -f1); do [ "$ip" -gt "$MAX_IP" ] && MAX_IP=$ip; done
     LAND_IP="10.0.0.$((MAX_IP + 1))"
+    
     while true; do
         read -p "客户端连接端口 (1-65535): " MAP_PORT
-        if [ "$MAP_PORT" != "$WG_PORT" ] && [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && [ "$MAP_PORT" -ge 1 ] && [ "$MAP_PORT" -le 65535 ]; then break; fi
-        echo -e "${RED}端口无效或与隧道冲突${NC}"
+        if [ "$MAP_PORT" == "$WG_PORT" ]; then
+            echo -e "${RED}错误：不能使用 WireGuard 隧道端口 $WG_PORT！${NC}"
+            continue
+        fi
+        if [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && [ "$MAP_PORT" -ge 1 ] && [ "$MAP_PORT" -le 65535 ]; then
+            break
+        else
+            echo -e "${RED}端口必须是1-65535的数字！${NC}"
+        fi
     done
-    RELAY_IP=$(get_pub_ip); RELAY_PUB=$(grep "^PrivateKey" $WG_CONF | awk '{print $3}' | wg pubkey)
+    
+    RELAY_IP=$(get_pub_ip)
+    RELAY_PUB=$(grep "^PrivateKey" $WG_CONF | awk '{print $3}' | wg pubkey)
     DEPLOY_CODE=$(echo -n "${RELAY_IP}|${RELAY_PUB}|${LAND_IP}|${MAP_PORT}|${NODE_NAME}" | base64)
+    
+    echo ""
     echo -e "${GREEN}=========================================="
     echo -e " 部署码 (内网IP: ${LAND_IP}, 端口: ${MAP_PORT})"
     echo -e " ${CYAN}${DEPLOY_CODE}${NC}"
     echo -e "==========================================${NC}"
+    pause_return
 }
 
 # ================= 3. 落地机一键部署 =================
@@ -319,17 +351,21 @@ deploy_landing() {
     echo -e "${YELLOW}━━━ 落地机一键部署 ━━━${NC}"
     read -p "请粘贴部署码: " DEPLOY_CODE
     DEPLOY_CODE=$(echo "$DEPLOY_CODE" | tr -d '[:space:]')
-    if [ -z "$DEPLOY_CODE" ]; then echo -e "${RED}部署码为空！${NC}"; read -p "按回车继续..."; return; fi
+    
+    if [ -z "$DEPLOY_CODE" ]; then 
+        echo -e "${RED}部署码为空！${NC}"
+        pause_return; return
+    fi
 
     CODE_RAW=$(echo -n "$DEPLOY_CODE" | base64 -d 2>/dev/null)
     if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then 
-        echo -e "${RED}部署码无效或已损坏！${NC}"; read -p "按回车继续..."; return
+        echo -e "${RED}部署码无效或已损坏！${NC}"
+        pause_return; return
     fi
 
     RELAY_IP=$(echo $CODE_RAW | cut -d'|' -f1); RELAY_PUB=$(echo $CODE_RAW | cut -d'|' -f2)
     LAND_IP=$(echo $CODE_RAW | cut -d'|' -f3); MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
     
-    local LAND_PORT
     while true; do
         read -p "请输入落地机 Sing-box 监听端口 (默认 443): " LAND_PORT
         if [ -z "$LAND_PORT" ]; then LAND_PORT=443; break; fi
@@ -343,7 +379,8 @@ deploy_landing() {
     
     echo -e "${YELLOW}[*] 正在检查 Sing-box 环境...${NC}"
     if ! install_singbox; then 
-        echo -e "${RED}Sing-box 安装失败，流程中止。${NC}"; read -p "按回车继续..."; return
+        echo -e "${RED}Sing-box 安装失败，流程中止。${NC}"
+        pause_return; return
     fi
     
     force_sync_time
@@ -415,12 +452,13 @@ SNI伪装域名: $SNI
 # ${NODE_NAME} END
 EOF
     
+    echo ""
     echo -e "${GREEN}=========================================="
     echo -e " 落地机 [${NODE_NAME}] 部署成功！"
     echo -e " ${YELLOW}回传绑定码：${NC}\n ${CYAN}${BIND_CODE}${NC}"
     echo -e " ${YELLOW}客户端链接：${NC}\n ${GREEN}${VLESS_LINK}${NC}"
     echo -e "==========================================${NC}"
-    read -p "按回车键继续..."
+    pause_return
 }
 
 # ================= 4. 绑定落地机 =================
@@ -429,7 +467,11 @@ bind_landing() {
     echo -e "${YELLOW}━━━ 绑定落地机 ━━━${NC}"
     read -p "请粘贴回传绑定码: " BIND_CODE
     CODE_RAW=$(echo -n "$BIND_CODE" | base64 -d 2>/dev/null)
-    if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then echo -e "${RED}绑定码无效！${NC}"; return; fi
+    
+    if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then 
+        echo -e "${RED}绑定码无效！${NC}"
+        pause_return; return
+    fi
     
     LANDING_PUB=$(echo $CODE_RAW | cut -d'|' -f1); LAND_IP=$(echo $CODE_RAW | cut -d'|' -f2)
     MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f3); LAND_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
@@ -456,16 +498,16 @@ bind_landing() {
     echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
     
     echo -e "${GREEN}✓ 节点 [${NODE_NAME}] 绑定成功！隧道已打通。${NC}"
+    pause_return
 }
 
-# ================= 5. 中转机查看节点 =================
+# ================= 5 & 6. 查看节点 =================
 list_relay_nodes() {
     clear
     echo -e "${YELLOW}━━━ 中转机节点状态列表 ━━━${NC}"
     if [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ]; then
         echo -e "${RED}暂无绑定的节点${NC}"
-        read -p "按回车继续..."
-        return
+        pause_return; return
     fi
     printf "${GREEN}%-15s | %-18s | %-12s | %-20s\n${NC}" "客户端端口" "落地内网IP" "落地端口" "节点名称"
     echo "-------------------------------------------------------------------------"
@@ -473,23 +515,21 @@ list_relay_nodes() {
         printf "%-15s | %-18s | %-12s | %-20s\n" "$c_port" "$l_ip" "$l_port" "$n_name"
     done < "$NODES_INFO"
     echo "-------------------------------------------------------------------------"
-    read -p "按回车继续..."
+    pause_return
 }
 
-# ================= 6. 落地机查看节点 =================
 list_landing_nodes() {
     clear
     echo -e "${YELLOW}━━━ 落地机本机节点信息 ━━━${NC}"
     if [ ! -f "$LAND_INFO" ] || [ ! -s "$LAND_INFO" ]; then
         echo -e "${RED}未找到本机节点记录，可能尚未部署。${NC}"
-        read -p "按回车继续..."
-        return
+        pause_return; return
     fi
     cat "$LAND_INFO" | sed -e 's/节点名称: /\x1b[33m节点名称: \x1b[0m/g' \
                            -e 's/客户端导入链接:/\x1b[33m客户端导入链接:\x1b[0m/g' \
                            -e 's/vless:\/\/\([^#]*\)#/\x1b[32mvless:\/\/\1#\x1b[0m/g'
     echo "-------------------------------------------------------------------------"
-    read -p "按回车继续..."
+    pause_return
 }
 
 # ================= 主循环 =================
@@ -497,7 +537,7 @@ check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   WireGuard 智能中转 v20.0 (终极输入修复版)           ║${NC}"
+    echo -e "${CYAN}║   WireGuard 智能中转 v21.0 (彻底解决交互跳转版)       ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (智能CPU检测安装BBRv3+极限调优)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
@@ -511,6 +551,7 @@ while true; do
     echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}0${NC}  退出                                             ${CYAN}║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════════════╝${NC}"
+    
     read -p "请输入选项: " choice
     case $choice in
         1) tune_system ;;
