@@ -1,11 +1,12 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v14.0 (工作室管理增强版)
+# WireGuard 智能中转部署脚本 v15.0 (双端信息管理版)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 WG_CONF="/etc/wireguard/wg0.conf"
-NODES_INFO="/etc/wireguard/nodes_info.txt"
+NODES_INFO="/etc/wireguard/nodes_info.txt"       # 中转机节点记录
+LAND_INFO="/etc/wireguard/landing_info.txt"      # 落地机节点记录
 WG_PORT="51820"
 SYSCTL_FILE="/etc/sysctl.d/99-yw-optimize.conf"
 
@@ -240,7 +241,7 @@ MTU = 1380
 EOF
     systemctl enable wg-quick@wg0 > /dev/null 2>&1
     wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
-    echo "" > "$NODES_INFO" # 初始化节点记录文件
+    echo "" > "$NODES_INFO"
     echo -e "${GREEN}=========================================="
     echo -e " 中转机初始化成功！IP: ${CYAN}${RELAY_IP}${NC}"
     echo -e " 中转机公钥: ${CYAN}${WG_PUB}${NC}"
@@ -272,7 +273,7 @@ gen_landing_code() {
     echo -e "==========================================${NC}"
 }
 
-# ================= 3. 落地机一键部署 (支持自定义落地端口) =================
+# ================= 3. 落地机一键部署 =================
 deploy_landing() {
     clear
     echo -e "${YELLOW}━━━ 落地机一键部署 ━━━${NC}"
@@ -288,7 +289,6 @@ deploy_landing() {
     RELAY_IP=$(echo $CODE_RAW | cut -d'|' -f1); RELAY_PUB=$(echo $CODE_RAW | cut -d'|' -f2)
     LAND_IP=$(echo $CODE_RAW | cut -d'|' -f3); MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
     
-    # 新增：落地机自定义端口
     local LAND_PORT
     while true; do
         read -p "请输入落地机 Sing-box 监听端口 (默认 443): " LAND_PORT
@@ -336,7 +336,6 @@ EOF
     SB_PRIV=$(echo "$REALITY_KEYS" | grep PrivateKey | awk '{print $2}'); SB_PUB=$(echo "$REALITY_KEYS" | grep PublicKey | awk '{print $2}')
     UUID=$(/usr/local/bin/sing-box generate uuid); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8)
     
-    # 写入配置时使用自定义的 LAND_PORT
     cat > /etc/sing-box/config.json << EOF
 {
   "inbounds": [{
@@ -359,8 +358,22 @@ EOF
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
     VLESS_LINK="vless://${UUID}@${RELAY_IP}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&type=tcp#WG-${SAFE_NAME}"
-    # 回传绑定码增加 LAND_PORT 字段
     BIND_CODE=$(echo -n "${WG_PUB}|${LAND_IP}|${MAP_PORT}|${LAND_PORT}|${NODE_NAME}" | base64)
+    
+    # 核心: 落地机本地保存节点信息
+    touch "$LAND_INFO"
+    sed -i "/# ${NODE_NAME} START/,/# ${NODE_NAME} END/d" "$LAND_INFO"
+    cat >> "$LAND_INFO" << EOF
+# ${NODE_NAME} START
+节点名称: $NODE_NAME
+中转机IP: $RELAY_IP
+客户端端口: $MAP_PORT
+落地机端口: $LAND_PORT
+SNI伪装域名: $SNI
+客户端导入链接:
+ $VLESS_LINK
+# ${NODE_NAME} END
+EOF
     
     echo -e "${GREEN}=========================================="
     echo -e " 落地机 [${NODE_NAME}] 部署成功！"
@@ -370,7 +383,7 @@ EOF
     read -p "按回车键继续..."
 }
 
-# ================= 4. 绑定落地机 (支持自定义落地端口与状态记录) =================
+# ================= 4. 绑定落地机 =================
 bind_landing() {
     clear
     echo -e "${YELLOW}━━━ 绑定落地机 ━━━${NC}"
@@ -378,23 +391,19 @@ bind_landing() {
     CODE_RAW=$(echo -n "$BIND_CODE" | base64 -d 2>/dev/null)
     if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then echo -e "${RED}绑定码无效！${NC}"; return; fi
     
-    # 解析5段数据
     LANDING_PUB=$(echo $CODE_RAW | cut -d'|' -f1); LAND_IP=$(echo $CODE_RAW | cut -d'|' -f2)
     MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f3); LAND_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
     
-    # 清理 wg0.conf 旧节点
     sed -i "/# ${NODE_NAME}/,/AllowedIPs = ${LAND_IP}\/32/d" $WG_CONF
     echo -e "\n# ${NODE_NAME}\n[Peer]\nPublicKey = $LANDING_PUB\nAllowedIPs = ${LAND_IP}/32" >> $WG_CONF
     wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
     
-    # 清理旧的 iptables 规则 (基于客户端端口 MAP_PORT)
     iptables -t nat -D PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT} 2>/dev/null
     iptables -t nat -D PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT} 2>/dev/null
     iptables -t nat -D POSTROUTING -d ${LAND_IP} -j MASQUERADE 2>/dev/null
     iptables -D FORWARD -d ${LAND_IP} -j ACCEPT 2>/dev/null; iptables -D FORWARD -s ${LAND_IP} -j ACCEPT 2>/dev/null
     iptables -D INPUT -p tcp --dport $MAP_PORT -j ACCEPT 2>/dev/null; iptables -D INPUT -p udp --dport $MAP_PORT -j ACCEPT 2>/dev/null
     
-    # 添加新的 iptables 规则 (DNAT 到自定义的 LAND_PORT)
     iptables -t nat -A PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
     iptables -t nat -A PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
     iptables -t nat -A POSTROUTING -d ${LAND_IP} -j MASQUERADE
@@ -402,18 +411,17 @@ bind_landing() {
     iptables -A INPUT -p tcp --dport $MAP_PORT -j ACCEPT; iptables -A INPUT -p udp --dport $MAP_PORT -j ACCEPT
     netfilter-persistent save > /dev/null 2>&1
     
-    # 记录节点状态到文件
     touch "$NODES_INFO"
-    sed -i "/|${NODE_NAME}$/d" "$NODES_INFO" # 去重
+    sed -i "/|${NODE_NAME}$/d" "$NODES_INFO"
     echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
     
     echo -e "${GREEN}✓ 节点 [${NODE_NAME}] 绑定成功！隧道已打通。${NC}"
 }
 
-# ================= 5. 查看节点状态列表 =================
-list_nodes() {
+# ================= 5. 中转机查看节点 =================
+list_relay_nodes() {
     clear
-    echo -e "${YELLOW}━━━ 节点状态列表 ━━━${NC}"
+    echo -e "${YELLOW}━━━ 中转机节点状态列表 ━━━${NC}"
     if [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ]; then
         echo -e "${RED}暂无绑定的节点${NC}"
         read -p "按回车继续..."
@@ -428,19 +436,40 @@ list_nodes() {
     read -p "按回车继续..."
 }
 
+# ================= 6. 落地机查看节点 =================
+list_landing_nodes() {
+    clear
+    echo -e "${YELLOW}━━━ 落地机本机节点信息 ━━━${NC}"
+    if [ ! -f "$LAND_INFO" ] || [ ! -s "$LAND_INFO" ]; then
+        echo -e "${RED}未找到本机节点记录，可能尚未部署。${NC}"
+        read -p "按回车继续..."
+        return
+    fi
+    # 输出文件内容，并用颜色高亮关键信息
+    cat "$LAND_INFO" | sed -e 's/节点名称: /\x1b[33m节点名称: \x1b[0m/g' \
+                           -e 's/客户端导入链接:/\x1b[33m客户端导入链接:\x1b[0m/g' \
+                           -e 's/vless:\/\/\([^#]*\)#/\x1b[32mvless:\/\/\1#\x1b[0m/g'
+    echo "-------------------------------------------------------------------------"
+    read -p "按回车继续..."
+}
+
 # ================= 主循环 =================
 check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   WireGuard 智能中转 v14.0 (工作室管理增强版)         ║${NC}"
+    echo -e "${CYAN}║   WireGuard 智能中转 v15.0 (双端信息管理版)           ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (智能CPU检测安装BBRv3+极限调优)     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}2${NC}  [中转机] 初始化网关                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}3${NC}  [中转机] 生成落地部署码 (可自定义端口)            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}4${NC}  [落地机] 粘贴部署码一键部署 (可自定义落地端口)    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}4${NC}  [落地机] 粘贴部署码一键部署 (内置Sing-box+测速)   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}5${NC}  [中转机] 粘贴回传码完成绑定                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}6${NC}  [中转机] 查看所有节点状态列表                     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}7${NC}  [落地机] 查看本机节点与导入链接                   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}0${NC}  退出                                             ${CYAN}║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════════════╝${NC}"
     read -p "请输入选项: " choice
@@ -450,7 +479,8 @@ while true; do
         3) gen_landing_code ;;
         4) deploy_landing ;;
         5) bind_landing ;;
-        6) list_nodes ;;
+        6) list_relay_nodes ;;
+        7) list_landing_nodes ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
     esac
