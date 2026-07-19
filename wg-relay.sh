@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v16.0 (彻底防卡死版)
+# WireGuard 智能中转部署脚本 v17.0 (彻底解决APT锁死版)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -24,19 +24,25 @@ check_system() {
     fi
 }
 
+# 核心：强制清理 APT 锁，防止安装时卡死
+kill_apt_locks() {
+    rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null
+    dpkg --configure -a 2>/dev/null
+}
+
 prepare_env() {
-    echo -e "${YELLOW}正在准备基础环境 (最多等待30秒)...${NC}"
-    # 修复: 增加 APT 超时参数，防止卡死
-    apt-get update -o Acquire::http::Timeout="15" -o Acquire::https::Timeout="15" -y > /dev/null 2>&1
-    apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl > /dev/null 2>&1
+    echo -e "${YELLOW}正在准备基础环境...${NC}"
+    systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
+    kill_apt_locks
+    timeout 30 apt-get update -y > /dev/null 2>&1
+    timeout 60 apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
     echo -e "${GREEN}✓ 环境准备完毕！${NC}"
     sleep 1
 }
 
 get_pub_ip() {
-    # 修复: curl 增加 -m 3 (3秒超时)
-    local ip=$(curl -m 3 -s -4 ifconfig.me || curl -m 3 -s -4 ip.sb || curl -m 3 -s -4 api.ipify.org)
+    local ip=$(timeout 3 curl -s -4 ifconfig.me || timeout 3 curl -s -4 ip.sb || timeout 3 curl -s -4 api.ipify.org)
     if [ -z "$ip" ]; then echo -e "${RED}无法获取公网IP，请检查网络${NC}"; exit 1; fi
     echo "$ip"
 }
@@ -53,8 +59,9 @@ install_singbox() {
     SB_VER="1.8.5"
     URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
     
-    # 修复: wget 增加超时和重试限制
-    wget -T 15 -t 2 -qO /tmp/sb.tar.gz "$URL" || wget -T 15 -t 2 -qO /tmp/sb.tar.gz "https://ghproxy.net/$URL"
+    if ! timeout 30 wget -qO /tmp/sb.tar.gz "$URL"; then
+        timeout 30 wget -qO /tmp/sb.tar.gz "https://ghproxy.net/$URL"
+    fi
     if [ ! -s /tmp/sb.tar.gz ]; then echo -e "${RED}Sing-box 下载失败！请检查网络。${NC}"; return 1; fi
     
     tar -xzf /tmp/sb.tar.gz -C /tmp
@@ -81,21 +88,19 @@ EOF
 
 # ================= 军工级 Reality 增强模块 =================
 force_sync_time() {
-    echo -e "${YELLOW}[*] 正在校准系统时间 (Reality 协议对时间极其敏感)...${NC}"
+    echo -e "${YELLOW}[*] 正在校准系统时间...${NC}"
     command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
     local current_year=$(date +%Y)
     if [ "$current_year" -lt 2020 ] || [ "$current_year" -gt 2030 ]; then
-        echo -e "${YELLOW}检测到系统时间异常($current_year)，正在通过 HTTP 强制校准...${NC}"
-        # 修复: curl 增加超时
-        local sys_time=$(curl -m 5 -sI https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+        local sys_time=$(timeout 5 curl -sI https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
         if [ -n "$sys_time" ]; then
             date -s "$sys_time" >/dev/null 2>&1
-            echo -e "${GREEN}✅ 系统时间已强制校准至: $(date)${NC}"
+            echo -e "${GREEN}✅ 系统时间已校准${NC}"
         else
-            echo -e "${RED}⚠ HTTP 校准失败，请确保服务器时间正确，否则 Reality 节点将无法连通！${NC}"
+            echo -e "${RED}⚠ 时间校准失败，Reality 可能无法连通！${NC}"
         fi
     else
-        echo -e "${GREEN}✅ 系统时间正常: $(date)${NC}"
+        echo -e "${GREEN}✅ 系统时间正常${NC}"
     fi
 }
 
@@ -107,7 +112,7 @@ SNI_DOMAINS=(
 )
 
 select_best_domain() {
-    echo -e "${YELLOW}[*] 正在测试 ${#SNI_DOMAINS[@]} 个大厂 SNI 延迟...${NC}"
+    echo -e "${YELLOW}[*] 正在测试大厂 SNI 延迟...${NC}"
     local tmp_res="/tmp/sb_domain_speed"
     > "$tmp_res"
     for domain in "${SNI_DOMAINS[@]}"; do
@@ -142,34 +147,35 @@ xanmod_add_repo() {
     if ! echo "bookworm trixie forky sid noble plucky" | grep -qw "$os_codename"; then os_codename="releases"; fi
     if echo "jammy focal buster releases" | grep -qw "$os_codename"; then echo -e "${RED}XanMod 已停止支持${NC}"; return 1; fi
     [ -z "$os_codename" ] && { echo "无法获取代号"; return 1; }
-    echo -e "${YELLOW}[*] 安装必要依赖...${NC}"
-    apt-get install -y wget gnupg ca-certificates >/dev/null 2>&1; mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
     
-    echo -e "${YELLOW}[*] 下载 XanMod 密钥 (超时15秒)...${NC}"
-    # 修复: wget 增加超时
-    if ! wget -T 15 -t 2 -qO - "https://dl.xanmod.org/archive.key" | gpg --dearmor -o "$keyring" --yes 2>/dev/null; then
-        echo -e "${RED}❌ XanMod 密钥下载失败！(网络不通或被墙)${NC}"
-        return 1
+    kill_apt_locks
+    echo -e "${YELLOW}  - 安装基础工具 (最多30秒)...${NC}"
+    timeout 30 apt-get install -y wget gnupg ca-certificates >/dev/null 2>&1; mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+    
+    echo -e "${YELLOW}  - 下载 XanMod 密钥 (最多15秒)...${NC}"
+    if ! timeout 15 wget -qO /tmp/xanmod.key "https://dl.xanmod.org/archive.key"; then
+        echo -e "${RED}❌ 密钥下载失败！${NC}"; return 1
     fi
-    if [ ! -s "$keyring" ]; then echo -e "${RED}❌ XanMod 密钥为空！${NC}"; return 1; fi
+    gpg --dearmor -o "$keyring" --yes /tmp/xanmod.key 2>/dev/null
+    if [ ! -s "$keyring" ]; then echo -e "${RED}❌ 密钥解密失败！${NC}"; return 1; fi
     chmod 644 "$keyring"
     echo "deb [signed-by=$keyring] http://deb.xanmod.org $os_codename main" > "$list_file"
-    echo -e "${GREEN}✓ 仓库添加成功${NC}"
+    echo -e "${GREEN}  - 仓库添加成功${NC}"
 }
 
 xanmod_detect_package() {
     local arch=$(uname -m)
+    kill_apt_locks
+    echo -e "${YELLOW}  - 更新软件源 (最多30秒)...${NC}"
+    timeout 30 apt-get update -y >/dev/null 2>&1
+    
     if [ "$arch" = "aarch64" ]; then
-        echo -e "${YELLOW}[*] 更新软件源 (超时15秒)...${NC}"
-        apt-get update -o Acquire::http::Timeout="15" -o Acquire::https::Timeout="15" -y >/dev/null 2>&1
         if apt-cache policy "linux-xanmod-arm64" 2>/dev/null | grep -q 'Candidate: [0-9]'; then printf '%s\n' "linux-xanmod-arm64"; return 0; fi
         return 1
     fi
     local psabi_level=$(awk -F: '/^flags/{ if(/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level=1; if(level==1&&/cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level=2; if(level==2&&/avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level=3; if(level>0){print level;exit} }' /proc/cpuinfo 2>/dev/null)
     if [ -z "$psabi_level" ]; then return 1; fi
     [ "$psabi_level" -gt 3 ] && psabi_level=3
-    echo -e "${YELLOW}[*] 更新软件源 (超时15秒)...${NC}"
-    apt-get update -o Acquire::http::Timeout="15" -o Acquire::https::Timeout="15" -y >/dev/null 2>&1
     for prefix in linux-xanmod linux-xanmod-lts; do 
         local l="$psabi_level"
         while [ "$l" -ge 1 ]; do 
@@ -211,35 +217,45 @@ EOF
 tune_system() {
     clear
     echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
+    
+    echo -e "${YELLOW}[1/4] 停止系统后台自动更新...${NC}"
+    systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
+    
     if uname -r | grep -qi "xanmod"; then
-        echo -e "${GREEN}✓ 已是 XanMod 内核，应用极限调优...${NC}"
+        echo -e "${GREEN}[2/4] 已是 XanMod 内核，跳过安装${NC}"
+        echo -e "${YELLOW}[3/4] 应用网关极限网络参数...${NC}"
         _kernel_optimize_core
-    else
-        echo -e "${YELLOW}检测到非 XanMod 内核，尝试安装 BBRv3...${NC}"
-        if xanmod_add_repo; then
-            echo -e "${YELLOW}正在检测 CPU 支持的内核版本...${NC}"
-            local pkg_name=$(xanmod_detect_package)
-            if [ -n "$pkg_name" ]; then
-                echo -e "${GREEN}✓ 检测到适合: ${pkg_name}${NC}"
-                echo -e "${YELLOW}开始安装内核 (过程可能较慢，请勿中断)...${NC}"
-                if apt-get install -y ${pkg_name}; then
-                    _kernel_optimize_core
-                    echo -e "${GREEN}✓ 安装并调优成功！请重启服务器以加载新内核。${NC}"
-                    read -p "按回车键重启..." && reboot
-                else
-                    echo -e "${RED}✘ 内核安装失败，自动回退到普通 BBR 调优。${NC}"
-                    _kernel_optimize_core
-                fi
+        echo -e "${GREEN}[4/4] 优化完成！${NC}"
+        read -p "按回车键继续..."
+        return
+    fi
+    
+    echo -e "${YELLOW}[2/4] 尝试添加 XanMod BBRv3 仓库...${NC}"
+    if xanmod_add_repo; then
+        echo -e "${YELLOW}[3/4] 检测 CPU 版本并安装内核...${NC}"
+        local pkg_name=$(xanmod_detect_package)
+        if [ -n "$pkg_name" ]; then
+            echo -e "${GREEN}✓ 检测到适合: ${pkg_name}${NC}"
+            echo -e "${YELLOW}开始下载安装内核 (体积较大，请耐心等待)...${NC}"
+            kill_apt_locks
+            if apt-get install -y ${pkg_name}; then
+                _kernel_optimize_core
+                echo -e "${GREEN}✓ 内核安装并调优成功！请重启服务器。${NC}"
+                read -p "按回车键重启..." && reboot
             else
-                echo -e "${RED}✘ 找不到适合的内核包，自动回退到普通 BBR 调优。${NC}"
+                echo -e "${RED}✘ 内核下载/安装失败，自动回退普通调优${NC}"
                 _kernel_optimize_core
             fi
         else
-            echo -e "${YELLOW}✘ 仓库添加失败，自动回退到普通 BBR 调优。${NC}"
+            echo -e "${RED}✘ 找不到合适的内核包，自动回退普通调优${NC}"
             _kernel_optimize_core
         fi
+    else
+        echo -e "${YELLOW}✘ XanMod 仓库添加失败，自动回退普通 BBR 调优${NC}"
+        _kernel_optimize_core
     fi
-    echo -e "${GREEN}✓ 优化完成！${NC}"
+    echo -e "${GREEN}[4/4] 优化完成！${NC}"
+    read -p "按回车键继续..."
 }
 
 # ================= 1. 中转机初始化 =================
@@ -250,6 +266,7 @@ init_relay() {
         read -p "${RED}⚠️ 已有配置将被覆盖！确定？${NC} [y/N]: " confirm
         [[ ! "$confirm" =~ ^[Yy]$ ]] && return
     fi
+    kill_apt_locks
     apt-get install -y wireguard > /dev/null 2>&1
     WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey); RELAY_IP=$(get_pub_ip)
     cat > $WG_CONF << EOF
@@ -318,6 +335,7 @@ deploy_landing() {
     done
 
     echo -e "${YELLOW}[*] 正在安装 WireGuard...${NC}"
+    kill_apt_locks
     apt-get install -y wireguard > /dev/null 2>&1
     
     echo -e "${YELLOW}[*] 正在检查 Sing-box 环境...${NC}"
@@ -476,7 +494,7 @@ check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   WireGuard 智能中转 v16.0 (YW版)             ║${NC}"
+    echo -e "${CYAN}║   WireGuard 智能中转 v17.0 (YW版)       ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (智能CPU检测安装BBRv3+极限调优)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
