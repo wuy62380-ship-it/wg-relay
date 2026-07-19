@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v103.0 (终极路由修复版)
-# 找回丢失的 MASQUERADE 规则，彻底解决非对称路由
+# WireGuard 智能中转部署脚本 v104.0 (最终实战版)
+# 整合：时间死循环修复、端口冲突检测、路由强制修复
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -32,7 +32,7 @@ prepare_env() {
     echo -e "${YELLOW}正在准备环境...${NC}"
     kill_apt_locks
     apt-get update -y > /dev/null 2>&1
-    apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl coreutils > /dev/null 2>&1
+    apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl coreutils iproute2 > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
     echo -e "${GREEN}✓ 环境准备完毕${NC}"; sleep 1
 }
@@ -75,10 +75,10 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
+# 核心修复1：使用 -k 跳过证书校验，防止时间不对导致拿不到时间
 force_sync_time() {
     echo -e "${YELLOW}[*] 正在强制校准系统时间...${NC}"
     command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
-    # 修复：使用 -k 跳过证书验证，防止因时间不对导致拿不到时间
     local sys_time=$(curl -k -s --connect-timeout 3 --max-time 5 -I https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
     if [ -n "$sys_time" ]; then
         date -s "$sys_time" >/dev/null 2>&1
@@ -145,7 +145,7 @@ gen_landing_code() {
     LAND_IP="10.0.0.$((MAX_IP + 1))"
     
     while true; do
-        read -p "客户端端口: " MAP_PORT < /dev/tty
+        read -p "客户端连接端口: " MAP_PORT < /dev/tty
         [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && [ "$MAP_PORT" -ge 1 ] && [ "$MAP_PORT" -le 65535 ] && [ "$MAP_PORT" != "$WG_PORT" ] && break
         echo -e "${RED}端口无效${NC}"
     done
@@ -177,8 +177,16 @@ deploy_landing() {
         echo -e "${RED}❌ 致命错误：IP或端口为空！${NC}"; pause_return; return
     fi
 
-    read -p "落地机监听端口 (默认 443): " LAND_PORT < /dev/tty
-    [ -z "$LAND_PORT" ] && LAND_PORT=443
+    # 核心修复2：端口冲突检测，防止生成起不来的死节点
+    while true; do
+        read -p "落地机监听端口 (默认 443): " LAND_PORT < /dev/tty
+        [ -z "$LAND_PORT" ] && LAND_PORT=443
+        if ss -tlnp | grep -q ":$LAND_PORT "; then
+            echo -e "${RED}❌ 端口 $LAND_PORT 已被占用！请换一个端口：${NC}"
+        else
+            break
+        fi
+    done
 
     echo -e "${YELLOW}[*] 安装 WG 与 Sing-box...${NC}"
     kill_apt_locks; apt-get install -y wireguard > /dev/null 2>&1
@@ -279,7 +287,7 @@ bind_landing() {
     iptables -t nat -A PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
     iptables -t nat -A PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
     
-    # 核心修复：找回丢失的 MASQUERADE 规则，解决非对称路由导致的不通
+    # 核心修复3：强制确保 MASQUERADE 规则存在，解决非对称路由
     while iptables -t nat -D POSTROUTING -d ${LAND_IP} -j MASQUERADE 2>/dev/null; do :; done
     iptables -t nat -A POSTROUTING -d ${LAND_IP} -j MASQUERADE
     
@@ -288,7 +296,10 @@ bind_landing() {
     netfilter-persistent save > /dev/null 2>&1
     
     touch "$NODES_INFO"; sed -i "/|${NODE_NAME}$/d" "$NODES_INFO"; echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
-    echo -e "${GREEN}✓ 节点 [${NODE_NAME}] 绑定成功${NC}"; pause_return
+    
+    echo -e "${GREEN}✓ 节点 [${NODE_NAME}] 绑定成功${NC}"
+    echo -e "${YELLOW}⚠️ 提醒：请确保中转机云后台已放行端口 ${MAP_PORT} (TCP/UDP)！${NC}"
+    pause_return
 }
 
 list_relay_nodes() {
@@ -310,7 +321,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║ WG 智能中转 v103.0 (终极路由修复)  ║${NC}"
+    echo -e "${CYAN}║ WG 智能中转 v104.0 (最终实战版)   ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表 ${CYAN}║${NC}"
