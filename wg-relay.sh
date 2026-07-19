@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v17.0 (彻底解决APT锁死版)
+# WireGuard 智能中转部署脚本 v18.0 (绝对纯净防卡版)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -9,6 +9,9 @@ NODES_INFO="/etc/wireguard/nodes_info.txt"
 LAND_INFO="/etc/wireguard/landing_info.txt"
 WG_PORT="51820"
 SYSCTL_FILE="/etc/sysctl.d/99-yw-optimize.conf"
+
+# 强制设为非交互模式，防止 apt 弹出配置提示卡死
+export DEBIAN_FRONTEND=noninteractive
 
 # ================= 基础检查 =================
 check_root() { [ "$EUID" -ne 0 ] && echo -e "${RED}请使用root运行${NC}" && exit 1; }
@@ -24,7 +27,6 @@ check_system() {
     fi
 }
 
-# 核心：强制清理 APT 锁，防止安装时卡死
 kill_apt_locks() {
     rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null
     dpkg --configure -a 2>/dev/null
@@ -34,15 +36,16 @@ prepare_env() {
     echo -e "${YELLOW}正在准备基础环境...${NC}"
     systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
     kill_apt_locks
-    timeout 30 apt-get update -y > /dev/null 2>&1
-    timeout 60 apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl > /dev/null 2>&1
+    # 移除 timeout 命令依赖，直接执行，apt 会自动处理
+    apt-get update -y > /dev/null 2>&1
+    apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
     echo -e "${GREEN}✓ 环境准备完毕！${NC}"
     sleep 1
 }
 
 get_pub_ip() {
-    local ip=$(timeout 3 curl -s -4 ifconfig.me || timeout 3 curl -s -4 ip.sb || timeout 3 curl -s -4 api.ipify.org)
+    local ip=$(curl -m 3 -s -4 ifconfig.me || curl -m 3 -s -4 ip.sb || curl -m 3 -s -4 api.ipify.org)
     if [ -z "$ip" ]; then echo -e "${RED}无法获取公网IP，请检查网络${NC}"; exit 1; fi
     echo "$ip"
 }
@@ -59,9 +62,7 @@ install_singbox() {
     SB_VER="1.8.5"
     URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
     
-    if ! timeout 30 wget -qO /tmp/sb.tar.gz "$URL"; then
-        timeout 30 wget -qO /tmp/sb.tar.gz "https://ghproxy.net/$URL"
-    fi
+    wget -qO /tmp/sb.tar.gz "$URL" || wget -qO /tmp/sb.tar.gz "https://ghproxy.net/$URL"
     if [ ! -s /tmp/sb.tar.gz ]; then echo -e "${RED}Sing-box 下载失败！请检查网络。${NC}"; return 1; fi
     
     tar -xzf /tmp/sb.tar.gz -C /tmp
@@ -92,7 +93,7 @@ force_sync_time() {
     command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
     local current_year=$(date +%Y)
     if [ "$current_year" -lt 2020 ] || [ "$current_year" -gt 2030 ]; then
-        local sys_time=$(timeout 5 curl -sI https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+        local sys_time=$(curl -m 5 -sI https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
         if [ -n "$sys_time" ]; then
             date -s "$sys_time" >/dev/null 2>&1
             echo -e "${GREEN}✅ 系统时间已校准${NC}"
@@ -149,11 +150,11 @@ xanmod_add_repo() {
     [ -z "$os_codename" ] && { echo "无法获取代号"; return 1; }
     
     kill_apt_locks
-    echo -e "${YELLOW}  - 安装基础工具 (最多30秒)...${NC}"
-    timeout 30 apt-get install -y wget gnupg ca-certificates >/dev/null 2>&1; mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+    echo -e "${YELLOW}  - 安装基础工具...${NC}"
+    apt-get install -y wget gnupg ca-certificates >/dev/null 2>&1; mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
     
-    echo -e "${YELLOW}  - 下载 XanMod 密钥 (最多15秒)...${NC}"
-    if ! timeout 15 wget -qO /tmp/xanmod.key "https://dl.xanmod.org/archive.key"; then
+    echo -e "${YELLOW}  - 下载 XanMod 密钥...${NC}"
+    if ! wget -T 15 -t 2 -qO /tmp/xanmod.key "https://dl.xanmod.org/archive.key"; then
         echo -e "${RED}❌ 密钥下载失败！${NC}"; return 1
     fi
     gpg --dearmor -o "$keyring" --yes /tmp/xanmod.key 2>/dev/null
@@ -166,8 +167,8 @@ xanmod_add_repo() {
 xanmod_detect_package() {
     local arch=$(uname -m)
     kill_apt_locks
-    echo -e "${YELLOW}  - 更新软件源 (最多30秒)...${NC}"
-    timeout 30 apt-get update -y >/dev/null 2>&1
+    echo -e "${YELLOW}  - 更新软件源...${NC}"
+    apt-get update -y >/dev/null 2>&1
     
     if [ "$arch" = "aarch64" ]; then
         if apt-cache policy "linux-xanmod-arm64" 2>/dev/null | grep -q 'Candidate: [0-9]'; then printf '%s\n' "linux-xanmod-arm64"; return 0; fi
@@ -494,7 +495,7 @@ check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   WireGuard 智能中转 v17.0 (YW版)       ║${NC}"
+    echo -e "${CYAN}║   WireGuard 智能中转 v18.0 (YW版)           ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (智能CPU检测安装BBRv3+极限调优)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
