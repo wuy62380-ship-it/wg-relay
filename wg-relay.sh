@@ -1,10 +1,11 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v13.0 (终极完整版)
+# WireGuard 智能中转部署脚本 v14.0 (工作室管理增强版)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 WG_CONF="/etc/wireguard/wg0.conf"
+NODES_INFO="/etc/wireguard/nodes_info.txt"
 WG_PORT="51820"
 SYSCTL_FILE="/etc/sysctl.d/99-yw-optimize.conf"
 
@@ -25,7 +26,6 @@ check_system() {
 prepare_env() {
     echo -e "${YELLOW}正在准备基础环境 (1分钟)...${NC}"
     apt update -y > /dev/null 2>&1
-    # 确保 jq 和 openssl 被安装，用于 JSON 处理和 SNI 测速
     apt install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
     echo -e "${GREEN}✓ 环境准备完毕！${NC}"
@@ -49,13 +49,8 @@ install_singbox() {
     
     SB_VER="1.8.5"
     URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
-    
-    # 优先直连，失败走加速
     wget -qO /tmp/sb.tar.gz "$URL" || wget -qO /tmp/sb.tar.gz "https://ghproxy.net/$URL"
-    if [ ! -s /tmp/sb.tar.gz ]; then 
-        echo -e "${RED}Sing-box 下载失败！请检查网络。${NC}"
-        return 1
-    fi
+    if [ ! -s /tmp/sb.tar.gz ]; then echo -e "${RED}Sing-box 下载失败！${NC}"; return 1; fi
     
     tar -xzf /tmp/sb.tar.gz -C /tmp
     mv /tmp/sing-box-${SB_VER}-linux-${SB_ARCH}/sing-box /usr/local/bin/
@@ -106,15 +101,13 @@ SNI_DOMAINS=(
 )
 
 select_best_domain() {
-    echo -e "${YELLOW}[*] 正在测试 ${#SNI_DOMAINS[@]} 个大厂 SNI 延迟 (用于 Reality 偷步)...${NC}"
+    echo -e "${YELLOW}[*] 正在测试 ${#SNI_DOMAINS[@]} 个大厂 SNI 延迟...${NC}"
     local tmp_res="/tmp/sb_domain_speed"
     > "$tmp_res"
-    
     for domain in "${SNI_DOMAINS[@]}"; do
         local t1 t2 ms
         t1=$(date +%s%3N 2>/dev/null)
         [[ ! "$t1" =~ ^[0-9]+$ ]] && t1=$(date +%s)000
-        
         if timeout 2 openssl s_client -connect "${domain}:443" -servername "${domain}" </dev/null &>/dev/null; then
             t2=$(date +%s%3N 2>/dev/null)
             [[ ! "$t2" =~ ^[0-9]+$ ]] && t2=$(date +%s)000
@@ -124,10 +117,8 @@ select_best_domain() {
             echo "9999 ${domain}" >> "$tmp_res"
         fi
     done
-    
     local best_domain=$(grep -v "^9999" "$tmp_res" | sort -n | head -1 | awk '{print $2}')
     rm -f "$tmp_res"
-    
     if [ -z "$best_domain" ]; then
         echo -e "${RED}测速失败，使用默认域名。${NC}"
         echo "www.microsoft.com"
@@ -136,16 +127,14 @@ select_best_domain() {
     fi
 }
 
-url_encode() { 
-    jq -rn --arg v "$1" '$v|@uri' | sed 's/%2F/\//g'
-}
+url_encode() { jq -rn --arg v "$1" '$v|@uri' | sed 's/%2F/\//g'; }
 
 # ================= 军工级 BBRv3 与极限调优模块 =================
 xanmod_add_repo() {
     local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg" list_file="/etc/apt/sources.list.d/xanmod-release.list" os_codename=""
     if command -v lsb_release >/dev/null 2>&1; then os_codename=$(lsb_release -sc); elif [ -r /etc/os-release ]; then os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME"); fi
     if ! echo "bookworm trixie forky sid noble plucky" | grep -qw "$os_codename"; then os_codename="releases"; fi
-    if echo "jammy focal buster releases" | grep -qw "$os_codename"; then echo -e "${RED}XanMod 已停止对当前系统支持${NC}"; return 1; fi
+    if echo "jammy focal buster releases" | grep -qw "$os_codename"; then echo -e "${RED}XanMod 已停止支持${NC}"; return 1; fi
     [ -z "$os_codename" ] && { echo "无法获取代号"; return 1; }
     apt-get install -y wget gnupg ca-certificates >/dev/null 2>&1; mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
     wget -qO - "https://dl.xanmod.org/archive.key" | gpg --dearmor -o "$keyring" --yes 2>/dev/null
@@ -251,6 +240,7 @@ MTU = 1380
 EOF
     systemctl enable wg-quick@wg0 > /dev/null 2>&1
     wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
+    echo "" > "$NODES_INFO" # 初始化节点记录文件
     echo -e "${GREEN}=========================================="
     echo -e " 中转机初始化成功！IP: ${CYAN}${RELAY_IP}${NC}"
     echo -e " 中转机公钥: ${CYAN}${WG_PUB}${NC}"
@@ -282,37 +272,39 @@ gen_landing_code() {
     echo -e "==========================================${NC}"
 }
 
-# ================= 3. 落地机一键部署 (军工级 Reality 增强) =================
+# ================= 3. 落地机一键部署 (支持自定义落地端口) =================
 deploy_landing() {
     clear
     echo -e "${YELLOW}━━━ 落地机一键部署 ━━━${NC}"
     read -p "请粘贴部署码: " DEPLOY_CODE
-    
-    # 修复: 强制去除所有空白字符和换行符，防止粘贴导致解码失败
     DEPLOY_CODE=$(echo "$DEPLOY_CODE" | tr -d '[:space:]')
     if [ -z "$DEPLOY_CODE" ]; then echo -e "${RED}部署码为空！${NC}"; read -p "按回车继续..."; return; fi
 
     CODE_RAW=$(echo -n "$DEPLOY_CODE" | base64 -d 2>/dev/null)
     if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then 
-        echo -e "${RED}部署码无效或已损坏！${NC}"
-        read -p "按回车继续..."
-        return
+        echo -e "${RED}部署码无效或已损坏！${NC}"; read -p "按回车继续..."; return
     fi
 
     RELAY_IP=$(echo $CODE_RAW | cut -d'|' -f1); RELAY_PUB=$(echo $CODE_RAW | cut -d'|' -f2)
     LAND_IP=$(echo $CODE_RAW | cut -d'|' -f3); MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
     
+    # 新增：落地机自定义端口
+    local LAND_PORT
+    while true; do
+        read -p "请输入落地机 Sing-box 监听端口 (默认 443): " LAND_PORT
+        if [ -z "$LAND_PORT" ]; then LAND_PORT=443; break; fi
+        if [[ "$LAND_PORT" =~ ^[0-9]+$ ]] && [ "$LAND_PORT" -ge 1 ] && [ "$LAND_PORT" -le 65535 ]; then break; fi
+        echo -e "${RED}端口必须是1-65535的数字！${NC}"
+    done
+
     echo -e "${YELLOW}[*] 正在安装 WireGuard...${NC}"
     apt install -y wireguard > /dev/null 2>&1
     
     echo -e "${YELLOW}[*] 正在检查 Sing-box 环境...${NC}"
     if ! install_singbox; then 
-        echo -e "${RED}Sing-box 安装失败，流程中止。${NC}"
-        read -p "按回车继续..."
-        return
+        echo -e "${RED}Sing-box 安装失败，流程中止。${NC}"; read -p "按回车继续..."; return
     fi
     
-    # 核心1: 强制时间校准
     force_sync_time
 
     echo -e "${YELLOW}[*] 正在配置 WireGuard 隧道...${NC}"
@@ -335,20 +327,20 @@ EOF
     iptables -t nat -A POSTROUTING -o $(ip route show default | awk '/default/ {print $5}') -j MASQUERADE
     netfilter-persistent save > /dev/null 2>&1
 
-    # 核心2: 大厂 SNI 智能测速
     apt install -y openssl > /dev/null 2>&1
     SNI=$(select_best_domain)
     echo -e "${GREEN}✓ 选用最优 SNI: ${CYAN}${SNI}${NC}"
 
-    echo -e "${YELLOW}[*] 正在生成 Reality 密钥与配置...${NC}"
+    echo -e "${YELLOW}[*] 正在生成 Reality 密钥与配置 (监听 ${LAND_PORT})...${NC}"
     REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair)
     SB_PRIV=$(echo "$REALITY_KEYS" | grep PrivateKey | awk '{print $2}'); SB_PUB=$(echo "$REALITY_KEYS" | grep PublicKey | awk '{print $2}')
     UUID=$(/usr/local/bin/sing-box generate uuid); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8)
     
+    # 写入配置时使用自定义的 LAND_PORT
     cat > /etc/sing-box/config.json << EOF
 {
   "inbounds": [{
-    "type": "vless", "listen": "::", "listen_port": 443,
+    "type": "vless", "listen": "::", "listen_port": ${LAND_PORT},
     "users": [{ "name": "u1", "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
     "tls": {
       "enabled": true, "server_name": "${SNI}",
@@ -365,47 +357,75 @@ EOF
     systemctl enable wg-quick@wg0 > /dev/null 2>&1; wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
     
-    # 核心3: URL 安全转码生成链接
     SAFE_NAME=$(url_encode "$NODE_NAME")
     VLESS_LINK="vless://${UUID}@${RELAY_IP}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&type=tcp#WG-${SAFE_NAME}"
-    BIND_CODE=$(echo -n "${WG_PUB}|${LAND_IP}|${MAP_PORT}|${NODE_NAME}" | base64)
+    # 回传绑定码增加 LAND_PORT 字段
+    BIND_CODE=$(echo -n "${WG_PUB}|${LAND_IP}|${MAP_PORT}|${LAND_PORT}|${NODE_NAME}" | base64)
     
     echo -e "${GREEN}=========================================="
     echo -e " 落地机 [${NODE_NAME}] 部署成功！"
     echo -e " ${YELLOW}回传绑定码：${NC}\n ${CYAN}${BIND_CODE}${NC}"
-    echo -e " ${YELLOW}客户端链接 (已注入最优SNI)：${NC}\n ${GREEN}${VLESS_LINK}${NC}"
+    echo -e " ${YELLOW}客户端链接：${NC}\n ${GREEN}${VLESS_LINK}${NC}"
     echo -e "==========================================${NC}"
-    
     read -p "按回车键继续..."
 }
 
-# ================= 4. 绑定落地机 =================
+# ================= 4. 绑定落地机 (支持自定义落地端口与状态记录) =================
 bind_landing() {
     clear
     echo -e "${YELLOW}━━━ 绑定落地机 ━━━${NC}"
     read -p "请粘贴回传绑定码: " BIND_CODE
     CODE_RAW=$(echo -n "$BIND_CODE" | base64 -d 2>/dev/null)
     if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then echo -e "${RED}绑定码无效！${NC}"; return; fi
-    LANDING_PUB=$(echo $CODE_RAW | cut -d'|' -f1); LAND_IP=$(echo $CODE_RAW | cut -d'|' -f2)
-    MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f3); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f4)
     
+    # 解析5段数据
+    LANDING_PUB=$(echo $CODE_RAW | cut -d'|' -f1); LAND_IP=$(echo $CODE_RAW | cut -d'|' -f2)
+    MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f3); LAND_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
+    
+    # 清理 wg0.conf 旧节点
     sed -i "/# ${NODE_NAME}/,/AllowedIPs = ${LAND_IP}\/32/d" $WG_CONF
     echo -e "\n# ${NODE_NAME}\n[Peer]\nPublicKey = $LANDING_PUB\nAllowedIPs = ${LAND_IP}/32" >> $WG_CONF
     wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
     
-    iptables -t nat -D PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:443 2>/dev/null
-    iptables -t nat -D PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:443 2>/dev/null
+    # 清理旧的 iptables 规则 (基于客户端端口 MAP_PORT)
+    iptables -t nat -D PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT} 2>/dev/null
+    iptables -t nat -D PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT} 2>/dev/null
     iptables -t nat -D POSTROUTING -d ${LAND_IP} -j MASQUERADE 2>/dev/null
     iptables -D FORWARD -d ${LAND_IP} -j ACCEPT 2>/dev/null; iptables -D FORWARD -s ${LAND_IP} -j ACCEPT 2>/dev/null
     iptables -D INPUT -p tcp --dport $MAP_PORT -j ACCEPT 2>/dev/null; iptables -D INPUT -p udp --dport $MAP_PORT -j ACCEPT 2>/dev/null
     
-    iptables -t nat -A PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:443
-    iptables -t nat -A PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:443
+    # 添加新的 iptables 规则 (DNAT 到自定义的 LAND_PORT)
+    iptables -t nat -A PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
+    iptables -t nat -A PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
     iptables -t nat -A POSTROUTING -d ${LAND_IP} -j MASQUERADE
     iptables -A FORWARD -d ${LAND_IP} -j ACCEPT; iptables -A FORWARD -s ${LAND_IP} -j ACCEPT
     iptables -A INPUT -p tcp --dport $MAP_PORT -j ACCEPT; iptables -A INPUT -p udp --dport $MAP_PORT -j ACCEPT
     netfilter-persistent save > /dev/null 2>&1
+    
+    # 记录节点状态到文件
+    touch "$NODES_INFO"
+    sed -i "/|${NODE_NAME}$/d" "$NODES_INFO" # 去重
+    echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
+    
     echo -e "${GREEN}✓ 节点 [${NODE_NAME}] 绑定成功！隧道已打通。${NC}"
+}
+
+# ================= 5. 查看节点状态列表 =================
+list_nodes() {
+    clear
+    echo -e "${YELLOW}━━━ 节点状态列表 ━━━${NC}"
+    if [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ]; then
+        echo -e "${RED}暂无绑定的节点${NC}"
+        read -p "按回车继续..."
+        return
+    fi
+    printf "${GREEN}%-15s | %-18s | %-12s | %-20s\n${NC}" "客户端端口" "落地内网IP" "落地端口" "节点名称"
+    echo "-------------------------------------------------------------------------"
+    while IFS='|' read -r c_port l_ip l_port n_name; do
+        printf "%-15s | %-18s | %-12s | %-20s\n" "$c_port" "$l_ip" "$l_port" "$n_name"
+    done < "$NODES_INFO"
+    echo "-------------------------------------------------------------------------"
+    read -p "按回车继续..."
 }
 
 # ================= 主循环 =================
@@ -413,13 +433,14 @@ check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   WireGuard 智能中转 v13.0 (终极完整版)               ║${NC}"
+    echo -e "${CYAN}║   WireGuard 智能中转 v14.0 (工作室管理增强版)         ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (智能CPU检测安装BBRv3+极限调优)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}2${NC}  [中转机] 初始化网关                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}3${NC}  [中转机] 生成落地部署码 (可自定义端口)            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}4${NC}  [落地机] 粘贴部署码一键部署 (内置Sing-box+测速)   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}4${NC}  [落地机] 粘贴部署码一键部署 (可自定义落地端口)    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}5${NC}  [中转机] 粘贴回传码完成绑定                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}6${NC}  [中转机] 查看所有节点状态列表                     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}0${NC}  退出                                             ${CYAN}║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════════════╝${NC}"
     read -p "请输入选项: " choice
@@ -429,8 +450,8 @@ while true; do
         3) gen_landing_code ;;
         4) deploy_landing ;;
         5) bind_landing ;;
+        6) list_nodes ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
     esac
-    read -p "按 Enter 键继续..."
 done
