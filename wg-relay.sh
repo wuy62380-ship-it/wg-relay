@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v12.0 (军工级Reality增强版)
+# WireGuard 智能中转部署脚本 v13.0 (终极完整版)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -25,8 +25,8 @@ check_system() {
 prepare_env() {
     echo -e "${YELLOW}正在准备基础环境 (1分钟)...${NC}"
     apt update -y > /dev/null 2>&1
-    # 增加 jq 用于 JSON 处理和 URL 编码
-    apt install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq > /dev/null 2>&1
+    # 确保 jq 和 openssl 被安装，用于 JSON 处理和 SNI 测速
+    apt install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
     echo -e "${GREEN}✓ 环境准备完毕！${NC}"
     sleep 1
@@ -41,7 +41,7 @@ get_pub_ip() {
 # ================= 内置 Sing-box 安装 =================
 install_singbox() {
     if command -v sing-box &> /dev/null; then return 0; fi
-    echo -e "${YELLOW}正在内置下载 Sing-box...${NC}"
+    echo -e "${YELLOW}[*] 正在内置下载 Sing-box...${NC}"
     ARCH=$(uname -m)
     if [ "$ARCH" == "x86_64" ]; then SB_ARCH="amd64";
     elif [ "$ARCH" == "aarch64" ]; then SB_ARCH="arm64";
@@ -49,8 +49,13 @@ install_singbox() {
     
     SB_VER="1.8.5"
     URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
+    
+    # 优先直连，失败走加速
     wget -qO /tmp/sb.tar.gz "$URL" || wget -qO /tmp/sb.tar.gz "https://ghproxy.net/$URL"
-    if [ ! -s /tmp/sb.tar.gz ]; then echo -e "${RED}Sing-box 下载失败！${NC}"; return 1; fi
+    if [ ! -s /tmp/sb.tar.gz ]; then 
+        echo -e "${RED}Sing-box 下载失败！请检查网络。${NC}"
+        return 1
+    fi
     
     tar -xzf /tmp/sb.tar.gz -C /tmp
     mv /tmp/sing-box-${SB_VER}-linux-${SB_ARCH}/sing-box /usr/local/bin/
@@ -93,7 +98,6 @@ force_sync_time() {
     fi
 }
 
-# 顶级大厂域名优选
 SNI_DOMAINS=(
     "www.microsoft.com" "www.cloudflare.com" "www.amazon.com" "www.apple.com" "www.bing.com"
     "www.yahoo.com" "www.icloud.com" "www.office.com" "aws.amazon.com" "azure.microsoft.com"
@@ -283,17 +287,35 @@ deploy_landing() {
     clear
     echo -e "${YELLOW}━━━ 落地机一键部署 ━━━${NC}"
     read -p "请粘贴部署码: " DEPLOY_CODE
+    
+    # 修复: 强制去除所有空白字符和换行符，防止粘贴导致解码失败
+    DEPLOY_CODE=$(echo "$DEPLOY_CODE" | tr -d '[:space:]')
+    if [ -z "$DEPLOY_CODE" ]; then echo -e "${RED}部署码为空！${NC}"; read -p "按回车继续..."; return; fi
+
     CODE_RAW=$(echo -n "$DEPLOY_CODE" | base64 -d 2>/dev/null)
-    if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then echo -e "${RED}部署码无效！${NC}"; return; fi
+    if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then 
+        echo -e "${RED}部署码无效或已损坏！${NC}"
+        read -p "按回车继续..."
+        return
+    fi
+
     RELAY_IP=$(echo $CODE_RAW | cut -d'|' -f1); RELAY_PUB=$(echo $CODE_RAW | cut -d'|' -f2)
     LAND_IP=$(echo $CODE_RAW | cut -d'|' -f3); MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
     
+    echo -e "${YELLOW}[*] 正在安装 WireGuard...${NC}"
     apt install -y wireguard > /dev/null 2>&1
-    if ! install_singbox; then return; fi
+    
+    echo -e "${YELLOW}[*] 正在检查 Sing-box 环境...${NC}"
+    if ! install_singbox; then 
+        echo -e "${RED}Sing-box 安装失败，流程中止。${NC}"
+        read -p "按回车继续..."
+        return
+    fi
     
     # 核心1: 强制时间校准
     force_sync_time
 
+    echo -e "${YELLOW}[*] 正在配置 WireGuard 隧道...${NC}"
     WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey)
     cat > $WG_CONF << EOF
 [Interface]
@@ -314,9 +336,11 @@ EOF
     netfilter-persistent save > /dev/null 2>&1
 
     # 核心2: 大厂 SNI 智能测速
+    apt install -y openssl > /dev/null 2>&1
     SNI=$(select_best_domain)
     echo -e "${GREEN}✓ 选用最优 SNI: ${CYAN}${SNI}${NC}"
 
+    echo -e "${YELLOW}[*] 正在生成 Reality 密钥与配置...${NC}"
     REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair)
     SB_PRIV=$(echo "$REALITY_KEYS" | grep PrivateKey | awk '{print $2}'); SB_PUB=$(echo "$REALITY_KEYS" | grep PublicKey | awk '{print $2}')
     UUID=$(/usr/local/bin/sing-box generate uuid); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8)
@@ -351,6 +375,8 @@ EOF
     echo -e " ${YELLOW}回传绑定码：${NC}\n ${CYAN}${BIND_CODE}${NC}"
     echo -e " ${YELLOW}客户端链接 (已注入最优SNI)：${NC}\n ${GREEN}${VLESS_LINK}${NC}"
     echo -e "==========================================${NC}"
+    
+    read -p "按回车键继续..."
 }
 
 # ================= 4. 绑定落地机 =================
@@ -387,12 +413,12 @@ check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   WireGuard 智能中转 v12.0 (军工级Reality增强版)      ║${NC}"
+    echo -e "${CYAN}║   WireGuard 智能中转 v13.0 (终极完整版)               ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (智能CPU检测安装BBRv3+极限调优)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}2${NC}  [中转机] 初始化网关                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}3${NC}  [中转机] 生成落地部署码 (可自定义端口)            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}4${NC}  [落地机] 粘贴部署码一键部署 (自动测速SNI+校时)    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}4${NC}  [落地机] 粘贴部署码一键部署 (内置Sing-box+测速)   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}5${NC}  [中转机] 粘贴回传码完成绑定                       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}0${NC}  退出                                             ${CYAN}║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════════════╝${NC}"
