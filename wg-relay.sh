@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v11.0 (融合军工级BBRv3与极限调优)
+# WireGuard 智能中转部署脚本 v12.0 (军工级Reality增强版)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -25,15 +25,15 @@ check_system() {
 prepare_env() {
     echo -e "${YELLOW}正在准备基础环境 (1分钟)...${NC}"
     apt update -y > /dev/null 2>&1
-    # 安装必要的依赖 (增加了 jq, ethtool, iproute2 等，用于极限优化)
-    apt install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq ethtool iproute2 procps kmod > /dev/null 2>&1
+    # 增加 jq 用于 JSON 处理和 URL 编码
+    apt install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
     echo -e "${GREEN}✓ 环境准备完毕！${NC}"
     sleep 1
 }
 
 get_pub_ip() {
-    local ip=$(curl -s -m 3 -4 ifconfig.me || curl -s -m 3 -4 ip.sb || curl -s -m 3 -4 api.ipify.org || curl -s -m 3 -4 ipv4.icanhazip.com)
+    local ip=$(curl -s -m 3 -4 ifconfig.me || curl -s -m 3 -4 ip.sb || curl -s -m 3 -4 api.ipify.org)
     if [ -z "$ip" ]; then echo -e "${RED}无法获取公网IP${NC}"; exit 1; fi
     echo "$ip"
 }
@@ -49,7 +49,6 @@ install_singbox() {
     
     SB_VER="1.8.5"
     URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
-    
     wget -qO /tmp/sb.tar.gz "$URL" || wget -qO /tmp/sb.tar.gz "https://ghproxy.net/$URL"
     if [ ! -s /tmp/sb.tar.gz ]; then echo -e "${RED}Sing-box 下载失败！${NC}"; return 1; fi
     
@@ -75,6 +74,68 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
+# ================= 军工级 Reality 增强模块 =================
+force_sync_time() {
+    echo -e "${YELLOW}[*] 正在校准系统时间 (Reality 协议对时间极其敏感)...${NC}"
+    command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
+    local current_year=$(date +%Y)
+    if [ "$current_year" -lt 2020 ] || [ "$current_year" -gt 2030 ]; then
+        echo -e "${YELLOW}检测到系统时间异常($current_year)，正在通过 HTTP 强制校准...${NC}"
+        local sys_time=$(curl -sI https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+        if [ -n "$sys_time" ]; then
+            date -s "$sys_time" >/dev/null 2>&1
+            echo -e "${GREEN}✅ 系统时间已强制校准至: $(date)${NC}"
+        else
+            echo -e "${RED}⚠ HTTP 校准失败，请确保服务器时间正确，否则 Reality 节点将无法连通！${NC}"
+        fi
+    else
+        echo -e "${GREEN}✅ 系统时间正常: $(date)${NC}"
+    fi
+}
+
+# 顶级大厂域名优选
+SNI_DOMAINS=(
+    "www.microsoft.com" "www.cloudflare.com" "www.amazon.com" "www.apple.com" "www.bing.com"
+    "www.yahoo.com" "www.icloud.com" "www.office.com" "aws.amazon.com" "azure.microsoft.com"
+    "dl.google.com" "cdn.apple.com" "api.apple.com" "www.sony.com" "www.oracle.com"
+    "www.nvidia.com" "www.amd.com" "www.ebay.com" "www.paypal.com" "www.tesla.com"
+)
+
+select_best_domain() {
+    echo -e "${YELLOW}[*] 正在测试 ${#SNI_DOMAINS[@]} 个大厂 SNI 延迟 (用于 Reality 偷步)...${NC}"
+    local tmp_res="/tmp/sb_domain_speed"
+    > "$tmp_res"
+    
+    for domain in "${SNI_DOMAINS[@]}"; do
+        local t1 t2 ms
+        t1=$(date +%s%3N 2>/dev/null)
+        [[ ! "$t1" =~ ^[0-9]+$ ]] && t1=$(date +%s)000
+        
+        if timeout 2 openssl s_client -connect "${domain}:443" -servername "${domain}" </dev/null &>/dev/null; then
+            t2=$(date +%s%3N 2>/dev/null)
+            [[ ! "$t2" =~ ^[0-9]+$ ]] && t2=$(date +%s)000
+            ms=$((t2 - t1))
+            [ "$ms" -ge 0 ] 2>/dev/null && echo "${ms} ${domain}" >> "$tmp_res" || echo "9999 ${domain}" >> "$tmp_res"
+        else
+            echo "9999 ${domain}" >> "$tmp_res"
+        fi
+    done
+    
+    local best_domain=$(grep -v "^9999" "$tmp_res" | sort -n | head -1 | awk '{print $2}')
+    rm -f "$tmp_res"
+    
+    if [ -z "$best_domain" ]; then
+        echo -e "${RED}测速失败，使用默认域名。${NC}"
+        echo "www.microsoft.com"
+    else
+        echo "$best_domain"
+    fi
+}
+
+url_encode() { 
+    jq -rn --arg v "$1" '$v|@uri' | sed 's/%2F/\//g'
+}
+
 # ================= 军工级 BBRv3 与极限调优模块 =================
 xanmod_add_repo() {
     local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg" list_file="/etc/apt/sources.list.d/xanmod-release.list" os_codename=""
@@ -96,7 +157,6 @@ xanmod_detect_package() {
         if apt-cache policy "linux-xanmod-arm64" 2>/dev/null | grep -q 'Candidate: [0-9]'; then printf '%s\n' "linux-xanmod-arm64"; return 0; fi
         return 1
     fi
-    # 智能检测 CPU 支持的内核版本 (v3 > v2 > v1)
     local psabi_level=$(awk -F: '/^flags/{ if(/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level=1; if(level==1&&/cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level=2; if(level==2&&/avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level=3; if(level>0){print level;exit} }' /proc/cpuinfo 2>/dev/null)
     if [ -z "$psabi_level" ]; then return 1; fi
     [ "$psabi_level" -gt 3 ] && psabi_level=3
@@ -115,76 +175,27 @@ xanmod_detect_package() {
 _kernel_optimize_core() {
     local CONF="${SYSCTL_FILE}"
     local MEM_MB_VAL=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
-    
-    # 动态参数计算
     local RMEM_MAX=8388608 WMEM_MAX=8388608 TCP_RMEM="4096 16384 8388608" TCP_WMEM="4096 16384 8388608"
-    local SOMAXCONN=65535 BACKLOG=100000 SYN_BACKLOG=8192 PORT_RANGE="1024 65535"
-    local SWAPPINESS=10 DIRTY_RATIO=20 DIRTY_BG_RATIO=10 OVERCOMMIT=1 VFS_PRESSURE=50 MIN_FREE_KB=32768
-    local FIN_TIMEOUT=30 KEEPALIVE_TIME=300 KEEPALIVE_INTVL=30 KEEPALIVE_PROBES=5
-    local TCP_FASTOPEN=3 TCP_TW_REUSE=1 TCP_MTU_PROBING=1 TCP_NOTSENT_LOWAT=16384 TCP_SLOW_START_AFTER_IDLE=0 TCP_ECN=0
-    local CC="bbr" QDISC="fq"
-
-    # 内存自适应
-    if [ "$MEM_MB_VAL" -ge 16384 ]; then MIN_FREE_KB=131072; SWAPPINESS=5
-    elif [ "$MEM_MB_VAL" -ge 4096 ]; then MIN_FREE_KB=65536
+    local SOMAXCONN=65535 BACKLOG=100000
+    if [ "$MEM_MB_VAL" -ge 4096 ]; then MIN_FREE_KB=65536
     elif [ "$MEM_MB_VAL" -ge 1024 ]; then RMEM_MAX=16777216; WMEM_MAX=16777216; TCP_RMEM="4096 32768 16777216"; TCP_WMEM="4096 32768 16777216"
-    else MIN_FREE_KB=16384; OVERCOMMIT=0; SWAPPINESS=10; RMEM_MAX=4194304; WMEM_MAX=4194304; SOMAXCONN=1024; BACKLOG=1000; TCP_RMEM="4096 32768 4194304"; TCP_WMEM="4096 32768 4194304"; fi
-
-    # XanMod 强制 fq_pie
+    else MIN_FREE_KB=16384; RMEM_MAX=4194304; WMEM_MAX=4194304; SOMAXCONN=1024; BACKLOG=1000; TCP_RMEM="4096 32768 4194304"; TCP_WMEM="4096 32768 4194304"; fi
+    local QDISC="fq"
     if uname -r | grep -qi "xanmod"; then QDISC="fq_pie"; fi
-
-    local TCP_MEM_MIN=$((MEM_MB_VAL * 256)) TCP_MEM_DEF=$((MEM_MB_VAL * 512)) TCP_MEM_MAX=$((MEM_MB_VAL * 1024))
-    [ "$TCP_MEM_MIN" -lt 8192 ] && TCP_MEM_MIN=8192; [ "$TCP_MEM_DEF" -lt 16384 ] && TCP_MEM_DEF=16384; [ "$TCP_MEM_MAX" -lt 32768 ] && TCP_MEM_MAX=32768
-    local TW_BUCKETS=$((SOMAXCONN * 4)) MAX_ORPHANS=$((SOMAXCONN * 2))
-    [ "$TW_BUCKETS" -gt 524288 ] && TW_BUCKETS=524288; [ "$MAX_ORPHANS" -gt 131072 ] && MAX_ORPHANS=131072
-
     cat > "$CONF" << EOF
-# YW 极限网关调优 (内存: ${MEM_MB_VAL}MB)
 net.core.default_qdisc = $QDISC
-net.ipv4.tcp_congestion_control = $CC
+net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = $RMEM_MAX
-net.core.wmem_max = $WMEM_MAX
 net.ipv4.tcp_rmem = $TCP_RMEM
 net.ipv4.tcp_wmem = $TCP_WMEM
 net.core.somaxconn = $SOMAXCONN
 net.core.netdev_max_backlog = $BACKLOG
-net.ipv4.tcp_max_syn_backlog = $SYN_BACKLOG
-net.ipv4.tcp_fastopen = $TCP_FASTOPEN
-net.ipv4.tcp_tw_reuse = $TCP_TW_REUSE
-net.ipv4.tcp_fin_timeout = $FIN_TIMEOUT
-net.ipv4.tcp_keepalive_time = $KEEPALIVE_TIME
-net.ipv4.tcp_keepalive_intvl = $KEEPALIVE_INTVL
-net.ipv4.tcp_keepalive_probes = $KEEPALIVE_PROBES
-net.ipv4.tcp_max_tw_buckets = $TW_BUCKETS
-net.ipv4.tcp_max_orphans = $MAX_ORPHANS
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_synack_retries = 2
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_mtu_probing = $TCP_MTU_PROBING
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_notsent_lowat = $TCP_NOTSENT_LOWAT
-net.ipv4.tcp_slow_start_after_idle = $TCP_SLOW_START_AFTER_IDLE
-net.ipv4.tcp_ecn = $TCP_ECN
-net.ipv4.ip_local_port_range = $PORT_RANGE
-net.ipv4.tcp_mem = $TCP_MEM_MIN $TCP_MEM_DEF $TCP_MEM_MAX
-vm.swappiness = $SWAPPINESS
-vm.dirty_ratio = $DIRTY_RATIO
-vm.dirty_background_ratio = $DIRTY_BG_RATIO
-vm.overcommit_memory = $OVERCOMMIT
-vm.min_free_kbytes = $MIN_FREE_KB
-vm.vfs_cache_pressure = $VFS_PRESSURE
+net.ipv4.tcp_fastopen = 3
 net.ipv4.ip_forward = 1
-fs.file-max = 1048576
-fs.nr_open = 1048576
-net.netfilter.nf_conntrack_max = $((SOMAXCONN * 32))
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
-net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
-net.core.optmem_max = 20480
+net.netfilter.nf_conntrack_max = 1048576
+vm.swappiness = 10
 EOF
     sysctl -p "$CONF" > /dev/null 2>&1
-    # RPS 软中断多核优化
     for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
 }
 
@@ -192,44 +203,29 @@ tune_system() {
     clear
     echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
     if uname -r | grep -qi "xanmod"; then
-        echo -e "${GREEN}✓ 已是 XanMod 内核，直接应用极限调优...${NC}"
+        echo -e "${GREEN}✓ 已是 XanMod 内核，应用极限调优...${NC}"
         _kernel_optimize_core
-        echo -e "${GREEN}✓ 极限调优完成！${NC}"
     else
-        echo -e "${YELLOW}未检测到 XanMod 内核。${NC}"
-        echo -e "  ${GRAY}1${NC} 安装 XanMod BBRv3 内核 (智能CPU检测，需重启)"
-        echo -e "  ${GRAY}2${NC} 跳过安装，直接应用普通 BBR 极限调优"
-        read -p "请选择 [1/2]: " c
-        case $c in
-            1) 
-                if xanmod_add_repo; then
-                    echo -e "${YELLOW}正在检测 CPU 支持的内核版本...${NC}"
-                    local pkg_name=$(xanmod_detect_package)
-                    if [ -n "$pkg_name" ]; then
-                        echo -e "${GREEN}✓ 检测到适合: ${pkg_name}${NC}"
-                        echo -e "${YELLOW}开始安装 (过程可能较慢)...${NC}"
-                        if apt install -y ${pkg_name}; then
-                            _kernel_optimize_core
-                            echo -e "${GREEN}✓ 内核安装并调优成功！请重启服务器以加载新内核。${NC}"
-                            read -p "按回车键重启..." && reboot
-                        else
-                            echo -e "${RED}✘ XanMod 内核安装失败。${NC}"
-                            echo -e "${YELLOW}自动回退到普通 BBR 调优模式...${NC}"
-                            _kernel_optimize_core
-                        fi
-                    else
-                        echo -e "${RED}✘ 无法找到适合的 XanMod 内核包！${NC}"
-                        echo -e "${YELLOW}自动回退到普通 BBR 调优模式...${NC}"
-                        _kernel_optimize_core
-                    fi
-                else
-                    echo -e "${YELLOW}自动回退到普通 BBR 调优模式...${NC}"
+        echo -e "${YELLOW}尝试安装 XanMod BBRv3 内核...${NC}"
+        if xanmod_add_repo; then
+            local pkg_name=$(xanmod_detect_package)
+            if [ -n "$pkg_name" ]; then
+                echo -e "${GREEN}✓ 检测到适合: ${pkg_name}${NC}"
+                if apt install -y ${pkg_name}; then
                     _kernel_optimize_core
+                    echo -e "${GREEN}✓ 安装成功！请重启服务器后再次运行本脚本应用调优。${NC}"
+                    read -p "按回车键重启..." && reboot
+                else
+                    echo -e "${RED}✘ 安装失败，回退普通调优。${NC}"; _kernel_optimize_core
                 fi
-                ;;
-            2) _kernel_optimize_core; echo -e "${GREEN}✓ 极限调优完成！${NC}" ;;
-        esac
+            else
+                echo -e "${RED}✘ 找不到适合的内核包，回退普通调优。${NC}"; _kernel_optimize_core
+            fi
+        else
+            echo -e "${YELLOW}密钥源失败，回退普通调优。${NC}"; _kernel_optimize_core
+        fi
     fi
+    echo -e "${GREEN}✓ 优化完成！${NC}"
 }
 
 # ================= 1. 中转机初始化 =================
@@ -282,7 +278,7 @@ gen_landing_code() {
     echo -e "==========================================${NC}"
 }
 
-# ================= 3. 落地机一键部署 =================
+# ================= 3. 落地机一键部署 (军工级 Reality 增强) =================
 deploy_landing() {
     clear
     echo -e "${YELLOW}━━━ 落地机一键部署 ━━━${NC}"
@@ -294,6 +290,9 @@ deploy_landing() {
     
     apt install -y wireguard > /dev/null 2>&1
     if ! install_singbox; then return; fi
+    
+    # 核心1: 强制时间校准
+    force_sync_time
 
     WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey)
     cat > $WG_CONF << EOF
@@ -314,19 +313,24 @@ EOF
     iptables -t nat -A POSTROUTING -o $(ip route show default | awk '/default/ {print $5}') -j MASQUERADE
     netfilter-persistent save > /dev/null 2>&1
 
+    # 核心2: 大厂 SNI 智能测速
+    SNI=$(select_best_domain)
+    echo -e "${GREEN}✓ 选用最优 SNI: ${CYAN}${SNI}${NC}"
+
     REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair)
     SB_PRIV=$(echo "$REALITY_KEYS" | grep PrivateKey | awk '{print $2}'); SB_PUB=$(echo "$REALITY_KEYS" | grep PublicKey | awk '{print $2}')
     UUID=$(/usr/local/bin/sing-box generate uuid); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8)
+    
     cat > /etc/sing-box/config.json << EOF
 {
   "inbounds": [{
     "type": "vless", "listen": "::", "listen_port": 443,
     "users": [{ "name": "u1", "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
     "tls": {
-      "enabled": true, "server_name": "www.microsoft.com",
+      "enabled": true, "server_name": "${SNI}",
       "reality": {
         "enabled": true,
-        "handshake": { "server": "www.microsoft.com", "server_port": 443 },
+        "handshake": { "server": "${SNI}", "server_port": 443 },
         "private_key": "$SB_PRIV", "short_id": ["$SHORT_ID"]
       }
     }
@@ -337,13 +341,15 @@ EOF
     systemctl enable wg-quick@wg0 > /dev/null 2>&1; wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
     
-    SAFE_NAME=$(echo $NODE_NAME | tr ' ' '_')
-    VLESS_LINK="vless://${UUID}@${RELAY_IP}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&type=tcp#WG-${SAFE_NAME}"
+    # 核心3: URL 安全转码生成链接
+    SAFE_NAME=$(url_encode "$NODE_NAME")
+    VLESS_LINK="vless://${UUID}@${RELAY_IP}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&type=tcp#WG-${SAFE_NAME}"
     BIND_CODE=$(echo -n "${WG_PUB}|${LAND_IP}|${MAP_PORT}|${NODE_NAME}" | base64)
+    
     echo -e "${GREEN}=========================================="
     echo -e " 落地机 [${NODE_NAME}] 部署成功！"
     echo -e " ${YELLOW}回传绑定码：${NC}\n ${CYAN}${BIND_CODE}${NC}"
-    echo -e " ${YELLOW}客户端链接：${NC}\n ${GREEN}${VLESS_LINK}${NC}"
+    echo -e " ${YELLOW}客户端链接 (已注入最优SNI)：${NC}\n ${GREEN}${VLESS_LINK}${NC}"
     echo -e "==========================================${NC}"
 }
 
@@ -381,12 +387,12 @@ check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v11.0 (军工级融合版)    ║${NC}"
+    echo -e "${CYAN}║   WireGuard 智能中转 v12.0 (军工级Reality增强版)      ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (智能CPU检测安装BBRv3+极限调优)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}2${NC}  [中转机] 初始化网关                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}3${NC}  [中转机] 生成落地部署码 (可自定义端口)            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}4${NC}  [落地机] 粘贴部署码一键部署 (内置Sing-box下载)    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}4${NC}  [落地机] 粘贴部署码一键部署 (自动测速SNI+校时)    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}5${NC}  [中转机] 粘贴回传码完成绑定                       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}0${NC}  退出                                             ${CYAN}║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════════════╝${NC}"
