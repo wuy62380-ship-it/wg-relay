@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v126.0 (终极实战版)
-# 找回手动修复的核心逻辑：强制时间校准、非对称路由MASQUERADE
+# WireGuard 智能中转部署脚本 v1 (YW版)
+# 新增：原版BBR与XanMod BBRv3自由选择
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -112,24 +112,17 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
-# 核心修复1：找回手动修复时间的强制逻辑
 force_sync_time() {
     echo -e "${YELLOW}[*] 正在强制校准系统时间...${NC}"
-    # 先关闭系统自动时间同步，防止它把改好的时间又改回去
     command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp false >/dev/null 2>&1
-    
     local sys_time=""
-    # 优先尝试 HTTPS (带 -k 忽略证书)
     sys_time=$(curl -k -s --connect-timeout 3 --max-time 5 -I https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
-    # 备用尝试 HTTP
     if [ -z "$sys_time" ]; then
         sys_time=$(curl -s --connect-timeout 3 --max-time 5 -I http://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
     fi
-    
-    # 校验时间格式并强制写入
     if [[ "$sys_time" =~ [A-Za-z]{3},\ [0-9]{2}\ [A-Za-z]{3}\ [0-9]{4}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ (GMT|UTC) ]]; then
         date -s "$sys_time" >/dev/null 2>&1
-        hwclock -w >/dev/null 2>&1 # 写入硬件时钟，重启不丢
+        hwclock -w >/dev/null 2>&1
         echo -e "${GREEN}✅ 时间已强制校准至: $(date)${NC}"
     else
         echo -e "${RED}⚠ 无法获取网络时间！请确保服务器时间正确，否则 Reality 将失败！${NC}"
@@ -138,15 +131,80 @@ force_sync_time() {
 
 url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
 
+# 核心重构：BBR 选择菜单
 tune_system() {
     clear; echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
-    systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
     
     local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local conntrack_max=$((mem_kb / 16384 * 1024))
     [ "$conntrack_max" -lt 65536 ] && conntrack_max=65536
     
-    cat > "$SYSCTL_FILE" << EOF
+    echo -e "当前检测到内存: $((mem_kb/1024))MB, Conntrack表将设置为: ${GREEN}${conntrack_max}${NC}"
+    echo -e "请选择拥塞控制算法方案："
+    echo -e "${GREEN}1${NC}. ${CYAN}原版 BBR${NC} (推荐，安全稳定，即时生效不重启)"
+    echo -e "${GREEN}2${NC}. ${CYAN}XanMod BBRv3${NC} (极限抗丢包，适合晚高峰线路，${RED}需重启生效${NC})"
+    read -p "请输入选项 [1/2] (默认1): " tune_choice < /dev/tty
+
+    case "$tune_choice" in
+        2)
+            echo -e "${YELLOW}[*] 开始安装 XanMod BBRv3 内核...${NC}"
+            # 添加 XanMod 源
+            local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
+            rm -f /etc/apt/sources.list.d/xanmod-release.list
+            wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o "$keyring" --yes 2>/dev/null
+            echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list > /dev/null
+            kill_apt_locks
+            apt-get update -y > /dev/null 2>&1
+            
+            # 检测 CPU 版本
+            local cpu_level=1
+            if grep -o 'avx2' /proc/cpuinfo >/dev/null 2>&1 && grep -o 'bmi2' /proc/cpuinfo >/dev/null 2>&1; then
+                cpu_level=3
+            elif grep -o 'avx' /proc/cpuinfo >/dev/null 2>&1 && grep -o 'aes' /proc/cpuinfo >/dev/null 2>&1; then
+                cpu_level=2
+            fi
+            
+            local pkg_name=""
+            for prefix in linux-xanmod linux-xanmod-lts; do 
+                local l="$cpu_level"
+                while [ "$l" -ge 1 ]; do 
+                    local p="${prefix}-x64v${l}"
+                    if apt-cache policy "$p" 2>/dev/null | grep -q 'Candidate: [0-9]'; then pkg_name="$p"; break 2; fi
+                    l=$((l-1))
+                done
+            done
+            
+            if [ -z "$pkg_name" ]; then
+                echo -e "${RED}❌ 找不到适合的 XanMod 内核包，回退原版 BBR。${NC}"
+                tune_choice=1
+            else
+                echo -e "${GREEN}✓ 检测到适合: ${pkg_name}，开始下载安装 (请耐心等待)...${NC}"
+                if apt-get install -y "$pkg_name"; then
+                    cat > "$SYSCTL_FILE" << EOF
+net.core.default_qdisc = fq_pie
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.ip_forward = 1
+net.netfilter.nf_conntrack_max = $conntrack_max
+EOF
+                    sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
+                    for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
+                    echo -e "${GREEN}✓ BBRv3 安装成功！请务必重启服务器后再进行后续操作。${NC}"
+                    read -p "按回车键重启服务器..." < /dev/tty
+                    reboot
+                else
+                    echo -e "${RED}✘ XanMod 安装失败，回退原版 BBR。${NC}"
+                    tune_choice=1
+                fi
+            fi
+            ;;
+        *)
+            tune_choice=1
+            ;;
+    esac
+
+    if [ "$tune_choice" == "1" ]; then
+        echo -e "${YELLOW}[*] 应用原版 BBR 优化...${NC}"
+        cat > "$SYSCTL_FILE" << EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = 16777216
@@ -159,9 +217,11 @@ net.ipv4.ip_forward = 1
 net.netfilter.nf_conntrack_max = $conntrack_max
 vm.swappiness = 10
 EOF
-    sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
-    for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
-    echo -e "${GREEN}✓ 优化完成 (Conntrack: $conntrack_max)！${NC}"; pause_return
+        sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
+        for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
+        echo -e "${GREEN}✓ 优化完成 (原版 BBR, Conntrack: $conntrack_max)！${NC}"
+    fi
+    pause_return
 }
 
 check_node_name() {
@@ -408,10 +468,7 @@ bind_landing() {
         
         iptables -t nat -A PREROUTING -p tcp --dport '$MAP_PORT' -j DNAT --to-destination '$LAND_IP':'$LAND_PORT'
         iptables -t nat -A PREROUTING -p udp --dport '$MAP_PORT' -j DNAT --to-destination '$LAND_IP':'$LAND_PORT'
-        
-        # 核心修复2：找回手动修复的非对称路由 MASQUERADE
         iptables -t nat -A POSTROUTING -d '$LAND_IP' -j MASQUERADE
-        
         iptables -A FORWARD -d '$LAND_IP' -j ACCEPT; iptables -A FORWARD -s '$LAND_IP' -j ACCEPT
         iptables -A INPUT -p tcp --dport '$MAP_PORT' -j ACCEPT; iptables -A INPUT -p udp --dport '$MAP_PORT' -j ACCEPT
         netfilter-persistent save > /dev/null 2>&1
@@ -749,7 +806,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v126.0 (终极实战版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v1 (YW版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
