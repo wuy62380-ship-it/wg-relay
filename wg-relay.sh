@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v100.0 (终极Reality修复版)
-# 彻底修复：时间校准漏洞、补全ALPN与SPX参数
+# WireGuard 智能中转部署脚本 v101.0 (终极清理版)
+# 修复：Iptables规则堆积冲突、落地机端口校验
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -75,16 +75,15 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
-# 核心修复1：无条件强制校准时间，放弃任何年份判断
 force_sync_time() {
-    echo -e "${YELLOW}[*] 正在强制校准系统时间 (Reality 绝对依赖)...${NC}"
+    echo -e "${YELLOW}[*] 正在强制校准系统时间...${NC}"
     command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
     local sys_time=$(curl -s --connect-timeout 3 --max-time 5 -I https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
     if [ -n "$sys_time" ]; then
         date -s "$sys_time" >/dev/null 2>&1
-        echo -e "${GREEN}✅ 系统时间已强制校准至: $(date)${NC}"
+        echo -e "${GREEN}✅ 时间已校准至: $(date)${NC}"
     else
-        echo -e "${RED}⚠ HTTP 校准失败，请确保服务器时间正确！${NC}"
+        echo -e "${RED}⚠ 校准失败${NC}"
     fi
 }
 
@@ -92,10 +91,7 @@ url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
 
 tune_system() {
     clear; echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
-    echo -e "${YELLOW}[1/2] 停止后台自动更新...${NC}"
     systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
-    
-    echo -e "${YELLOW}[2/2] 应用 BBR 与网关参数...${NC}"
     cat > "$SYSCTL_FILE" << EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -154,7 +150,6 @@ gen_landing_code() {
     done
     
     RELAY_IP=$(get_pub_ip); RELAY_PUB=$(grep "^PrivateKey" $WG_CONF | awk '{print $3}' | wg pubkey)
-    
     DEPLOY_CODE=$(echo -n "${RELAY_IP}|${RELAY_PUB}|${LAND_IP}|${MAP_PORT}|${NODE_NAME}" | base64 -w 0 | tr -d '\n')
     
     echo -e "${GREEN}=========================================="
@@ -171,16 +166,14 @@ deploy_landing() {
     CODE_RAW=$(echo -n "$DEPLOY_CODE" | base64 -d 2>/dev/null)
     
     if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then 
-        echo -e "${RED}❌ 部署码无效！${NC}"
-        pause_return; return
+        echo -e "${RED}❌ 部署码无效！${NC}"; pause_return; return
     fi
 
     RELAY_IP=$(echo $CODE_RAW | cut -d'|' -f1); RELAY_PUB=$(echo $CODE_RAW | cut -d'|' -f2)
     LAND_IP=$(echo $CODE_RAW | cut -d'|' -f3); MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
     
     if [ -z "$RELAY_IP" ] || [ -z "$MAP_PORT" ] || [ -z "$LAND_IP" ]; then
-        echo -e "${RED}❌ 致命错误：IP或端口为空！${NC}"
-        pause_return; return
+        echo -e "${RED}❌ 致命错误：IP或端口为空！${NC}"; pause_return; return
     fi
 
     read -p "落地机监听端口 (默认 443): " LAND_PORT < /dev/tty
@@ -190,7 +183,6 @@ deploy_landing() {
     kill_apt_locks; apt-get install -y wireguard > /dev/null 2>&1
     if ! install_singbox; then echo -e "${RED}Sing-box 安装失败${NC}"; pause_return; return; fi
     
-    # 核心修复1调用：无条件校准时间
     force_sync_time
 
     WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey)
@@ -215,11 +207,9 @@ EOF
     UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
     
     if [ -z "$SB_PUB" ] || [ -z "$UUID" ]; then
-        echo -e "${RED}❌ 密钥生成失败！${NC}"
-        pause_return; return
+        echo -e "${RED}❌ 密钥生成失败！${NC}"; pause_return; return
     fi
 
-    # 核心修复2：加入 alpn 参数增强伪装
     cat > /etc/sing-box/config.json << EOF
 {
   "inbounds": [{
@@ -242,9 +232,7 @@ EOF
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
-    # 核心修复2：加入 spx=%2F 参数
     VLESS_LINK="vless://${UUID}@${RELAY_IP}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
-    
     BIND_CODE=$(echo -n "${WG_PUB}|${LAND_IP}|${MAP_PORT}|${LAND_PORT}|${NODE_NAME}" | base64 -w 0 | tr -d '\n')
     
     touch "$LAND_INFO"
@@ -274,7 +262,6 @@ bind_landing() {
     
     read -p "请粘贴回传码: " BIND_CODE < /dev/tty
     BIND_CODE=$(echo "$BIND_CODE" | tr -d '[:space:]')
-    
     CODE_RAW=$(echo -n "$BIND_CODE" | base64 -d 2>/dev/null)
     if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then echo -e "${RED}绑定码无效${NC}"; pause_return; return; fi
     
@@ -285,15 +272,12 @@ bind_landing() {
     echo -e "\n# ${NODE_NAME}\n[Peer]\nPublicKey = $LANDING_PUB\nAllowedIPs = ${LAND_IP}/32" >> $WG_CONF
     wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
     
-    iptables -t nat -D PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT} 2>/dev/null
-    iptables -t nat -D PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT} 2>/dev/null
-    iptables -t nat -D POSTROUTING -d ${LAND_IP} -j MASQUERADE 2>/dev/null
-    iptables -D FORWARD -d ${LAND_IP} -j ACCEPT 2>/dev/null; iptables -D FORWARD -s ${LAND_IP} -j ACCEPT 2>/dev/null
-    iptables -D INPUT -p tcp --dport $MAP_PORT -j ACCEPT 2>/dev/null; iptables -D INPUT -p udp --dport $MAP_PORT -j ACCEPT 2>/dev/null
+    # 核心修复：使用 while 循环彻底删除该端口的所有旧规则，防止堆积冲突
+    while iptables -t nat -D PREROUTING -p tcp --dport $MAP_PORT 2>/dev/null; do :; done
+    while iptables -t nat -D PREROUTING -p udp --dport $MAP_PORT 2>/dev/null; do :; done
     
     iptables -t nat -A PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
     iptables -t nat -A PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
-    iptables -t nat -A POSTROUTING -d ${LAND_IP} -j MASQUERADE
     iptables -A FORWARD -d ${LAND_IP} -j ACCEPT; iptables -A FORWARD -s ${LAND_IP} -j ACCEPT
     iptables -A INPUT -p tcp --dport $MAP_PORT -j ACCEPT; iptables -A INPUT -p udp --dport $MAP_PORT -j ACCEPT
     netfilter-persistent save > /dev/null 2>&1
@@ -321,7 +305,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v100.0 (终极Reality版)║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v101.0 (终极清理版)   ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表 ${CYAN}║${NC}"
