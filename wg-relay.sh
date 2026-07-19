@@ -1,22 +1,23 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v99.0 (终极纯粹版)
-# 彻底解决：输入流污染、多行粘贴卡死、网络超时
+# WireGuard 智能中转部署脚本 v100.0 (终极Reality修复版)
+# 彻底修复：时间校准漏洞、补全ALPN与SPX参数
 # ==========================================
+
+if [ -t 0 ]; then :; else exec </dev/tty; fi
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 WG_CONF="/etc/wireguard/wg0.conf"
 NODES_INFO="/etc/wireguard/nodes_info.txt"
 LAND_INFO="/etc/wireguard/landing_info.txt"
 WG_PORT="51820"
-SYSCTL_FILE="/etc/sysctl.d/99-wg-tune.conf"
-SNI="www.microsoft.com" # 固定 SNI，不测速，防卡死
+SYSCTL_FILE="/etc/sysctl.d/99-yg-tune.conf"
+SNI="www.microsoft.com"
 
 export DEBIAN_FRONTEND=noninteractive
 
 check_root() { [ "$EUID" -ne 0 ] && echo -e "${RED}请使用root运行${NC}" && exit 1; }
 
-# 极简暂停函数，强制从真实终端读取，杜绝任何缓冲区污染
 pause_return() {
     echo -e "${YELLOW}按 Enter 键返回主菜单...${NC}"
     read -r < /dev/tty
@@ -52,7 +53,6 @@ install_singbox() {
     SB_VER="1.8.7"
     URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
     
-    # 双重保险：原生超时 + timeout 命令强制死刑
     timeout 30 wget -q -T 15 -t 2 -O /tmp/sb.tar.gz "$URL" 2>/dev/null || timeout 30 wget -q -T 15 -t 2 -O /tmp/sb.tar.gz "https://ghproxy.net/$URL" 2>/dev/null
     if [ ! -s /tmp/sb.tar.gz ]; then echo -e "${RED}下载失败${NC}"; return 1; fi
     
@@ -73,6 +73,19 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
+}
+
+# 核心修复1：无条件强制校准时间，放弃任何年份判断
+force_sync_time() {
+    echo -e "${YELLOW}[*] 正在强制校准系统时间 (Reality 绝对依赖)...${NC}"
+    command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
+    local sys_time=$(curl -s --connect-timeout 3 --max-time 5 -I https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+    if [ -n "$sys_time" ]; then
+        date -s "$sys_time" >/dev/null 2>&1
+        echo -e "${GREEN}✅ 系统时间已强制校准至: $(date)${NC}"
+    else
+        echo -e "${RED}⚠ HTTP 校准失败，请确保服务器时间正确！${NC}"
+    fi
 }
 
 url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
@@ -128,7 +141,6 @@ gen_landing_code() {
     clear; echo -e "${YELLOW}━━━ 生成落地部署码 ━━━${NC}"
     if [ ! -f "$WG_CONF" ]; then echo -e "${RED}请先初始化中转机${NC}"; pause_return; return; fi
     
-    # 核心：所有 read 强制从 /dev/tty 读取，彻底杜绝管道污染
     while true; do read -p "节点名称: " NODE_NAME < /dev/tty; [ -n "$NODE_NAME" ] && break; echo -e "${RED}不能为空${NC}"; done
     
     MAX_IP=1
@@ -143,7 +155,6 @@ gen_landing_code() {
     
     RELAY_IP=$(get_pub_ip); RELAY_PUB=$(grep "^PrivateKey" $WG_CONF | awk '{print $3}' | wg pubkey)
     
-    # 强制绝对单行输出
     DEPLOY_CODE=$(echo -n "${RELAY_IP}|${RELAY_PUB}|${LAND_IP}|${MAP_PORT}|${NODE_NAME}" | base64 -w 0 | tr -d '\n')
     
     echo -e "${GREEN}=========================================="
@@ -156,8 +167,6 @@ deploy_landing() {
     clear; echo -e "${YELLOW}━━━ 落地机一键部署 ━━━${NC}"
     
     read -p "请粘贴部署码: " DEPLOY_CODE < /dev/tty
-    
-    # 物理删除所有空白字符，容忍任何乱码粘贴
     DEPLOY_CODE=$(echo "$DEPLOY_CODE" | tr -d '[:space:]')
     CODE_RAW=$(echo -n "$DEPLOY_CODE" | base64 -d 2>/dev/null)
     
@@ -180,6 +189,9 @@ deploy_landing() {
     echo -e "${YELLOW}[*] 安装 WG 与 Sing-box...${NC}"
     kill_apt_locks; apt-get install -y wireguard > /dev/null 2>&1
     if ! install_singbox; then echo -e "${RED}Sing-box 安装失败${NC}"; pause_return; return; fi
+    
+    # 核心修复1调用：无条件校准时间
+    force_sync_time
 
     WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey)
     cat > $WG_CONF << EOF
@@ -207,6 +219,7 @@ EOF
         pause_return; return
     fi
 
+    # 核心修复2：加入 alpn 参数增强伪装
     cat > /etc/sing-box/config.json << EOF
 {
   "inbounds": [{
@@ -214,6 +227,7 @@ EOF
     "users": [{ "name": "u1", "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
     "tls": {
       "enabled": true, "server_name": "${SNI}",
+      "alpn": ["h2", "http/1.1"],
       "reality": {
         "enabled": true,
         "handshake": { "server": "${SNI}", "server_port": 443 },
@@ -228,7 +242,8 @@ EOF
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
-    VLESS_LINK="vless://${UUID}@${RELAY_IP}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&type=tcp#WG-${SAFE_NAME}"
+    # 核心修复2：加入 spx=%2F 参数
+    VLESS_LINK="vless://${UUID}@${RELAY_IP}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
     
     BIND_CODE=$(echo -n "${WG_PUB}|${LAND_IP}|${MAP_PORT}|${LAND_PORT}|${NODE_NAME}" | base64 -w 0 | tr -d '\n')
     
@@ -306,7 +321,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v99.0 (终极纯粹版)     ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v100.0 (终极Reality版)║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表 ${CYAN}║${NC}"
