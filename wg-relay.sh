@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v9.3 (支持中文节点名)
+# WireGuard 智能中转部署脚本 v9.4 (彻底修复中文支持)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -103,12 +103,16 @@ gen_landing_code() {
     if [ ! -f "$WG_CONF" ]; then echo -e "${RED}请先初始化中转机${NC}"; return; fi
 
     while true; do
-        read -p "请输入节点名称 (支持中英文/数字/_-): " NODE_NAME
-        # 修复: 支持中文字符 一-龥
-        if [[ "$NODE_NAME" =~ ^[a-zA-Z0-9\_\-一-龥]+$ ]]; then
-            break
+        read -p "请输入节点名称 (支持中文，但不能含 / \ | & 等符号): " NODE_NAME
+        if [ -z "$NODE_NAME" ]; then
+            echo -e "${RED}名称不能为空，请重新输入！${NC}"
+            continue
+        fi
+        # 检查是否包含会导致 sed 崩溃的危险字符
+        if [[ "$NODE_NAME" =~ [\/\\\|\&] ]]; then
+            echo -e "${RED}名称包含非法字符（不能有 / \ | & 等），请重新输入！${NC}"
         else
-            echo -e "${RED}名称包含非法字符，请重新输入！${NC}"
+            break
         fi
     done
 
@@ -307,7 +311,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v9.3 (支持中文版)       ║${NC}"
+    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v9.4 (中文修复版)       ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}A${NC}  ⚡ 系统极限优化 (两台机器都要执行一次)           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
