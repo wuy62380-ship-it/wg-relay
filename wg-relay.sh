@@ -601,7 +601,6 @@ add_landing_port() {
     local exist_pub=$(jq -r '.inbounds[0].tls.reality.public_key // empty' /etc/sing-box/config.json 2>/dev/null)
     
     if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
-        # 修复：使用 sed 精准截取 pbk= 后面的内容，避免截断 Base64 末尾的 = 号
         exist_pub=$(grep -oE 'pbk=[a-zA-Z0-9+/=]+' "$LAND_INFO" | head -1 | sed 's/^pbk=//')
         if ! check_pub_key "$exist_pub"; then exist_pub=""; fi
     fi
