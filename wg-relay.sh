@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v1 (YW版)
-# 声明：此版本已完成全量逻辑、安全、并发、容错审查，正式归档。
+# WireGuard 智能中转部署脚本 v126.0 (终极实战版)
+# 找回手动修复的核心逻辑：强制时间校准、非对称路由MASQUERADE
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -112,18 +112,27 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
+# 核心修复1：找回手动修复时间的强制逻辑
 force_sync_time() {
-    command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
+    echo -e "${YELLOW}[*] 正在强制校准系统时间...${NC}"
+    # 先关闭系统自动时间同步，防止它把改好的时间又改回去
+    command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp false >/dev/null 2>&1
+    
     local sys_time=""
+    # 优先尝试 HTTPS (带 -k 忽略证书)
     sys_time=$(curl -k -s --connect-timeout 3 --max-time 5 -I https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+    # 备用尝试 HTTP
     if [ -z "$sys_time" ]; then
         sys_time=$(curl -s --connect-timeout 3 --max-time 5 -I http://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
     fi
+    
+    # 校验时间格式并强制写入
     if [[ "$sys_time" =~ [A-Za-z]{3},\ [0-9]{2}\ [A-Za-z]{3}\ [0-9]{4}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ (GMT|UTC) ]]; then
         date -s "$sys_time" >/dev/null 2>&1
-        echo -e "${GREEN}✅ 时间已校准至: $(date)${NC}"
+        hwclock -w >/dev/null 2>&1 # 写入硬件时钟，重启不丢
+        echo -e "${GREEN}✅ 时间已强制校准至: $(date)${NC}"
     else
-        echo -e "${YELLOW}⚠ 获取到的网络时间格式异常，跳过校准。${NC}"
+        echo -e "${RED}⚠ 无法获取网络时间！请确保服务器时间正确，否则 Reality 将失败！${NC}"
     fi
 }
 
@@ -399,7 +408,10 @@ bind_landing() {
         
         iptables -t nat -A PREROUTING -p tcp --dport '$MAP_PORT' -j DNAT --to-destination '$LAND_IP':'$LAND_PORT'
         iptables -t nat -A PREROUTING -p udp --dport '$MAP_PORT' -j DNAT --to-destination '$LAND_IP':'$LAND_PORT'
+        
+        # 核心修复2：找回手动修复的非对称路由 MASQUERADE
         iptables -t nat -A POSTROUTING -d '$LAND_IP' -j MASQUERADE
+        
         iptables -A FORWARD -d '$LAND_IP' -j ACCEPT; iptables -A FORWARD -s '$LAND_IP' -j ACCEPT
         iptables -A INPUT -p tcp --dport '$MAP_PORT' -j ACCEPT; iptables -A INPUT -p udp --dport '$MAP_PORT' -j ACCEPT
         netfilter-persistent save > /dev/null 2>&1
@@ -737,7 +749,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v1 (YW版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v126.0 (终极实战版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
