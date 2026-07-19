@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v9.2 (修复假死与路径问题)
+# WireGuard 智能中转部署脚本 v9.3 (支持中文节点名)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -29,7 +29,6 @@ prepare_env() {
     modprobe nf_conntrack 2>/dev/null
 }
 
-# 修复1: 增加超时机制，防止获取IP假死
 get_pub_ip() {
     local ip=$(curl -s -m 3 -4 ifconfig.me || curl -s -m 3 -4 ip.sb || curl -s -m 3 -4 api.ipify.org)
     if [ -z "$ip" ]; then
@@ -104,8 +103,9 @@ gen_landing_code() {
     if [ ! -f "$WG_CONF" ]; then echo -e "${RED}请先初始化中转机${NC}"; return; fi
 
     while true; do
-        read -p "请输入节点名称 (仅限中英文/数字/_-): " NODE_NAME
-        if [[ "$NODE_NAME" =~ ^[a-zA-Z0-9\_\-]+$ ]]; then
+        read -p "请输入节点名称 (支持中英文/数字/_-): " NODE_NAME
+        # 修复: 支持中文字符 一-龥
+        if [[ "$NODE_NAME" =~ ^[a-zA-Z0-9\_\-一-龥]+$ ]]; then
             break
         else
             echo -e "${RED}名称包含非法字符，请重新输入！${NC}"
@@ -171,11 +171,10 @@ deploy_landing() {
     echo -e "${YELLOW}正在部署 [${NODE_NAME}]...${NC}"
     apt install -y wireguard > /dev/null 2>&1
     
-    # 修复2: 安装后强制刷新环境变量，防止找不到 sing-box 命令
     if ! command -v sing-box &> /dev/null; then
         echo -e "${YELLOW}正在安装 Sing-box...${NC}"
         bash <(curl -fsSL https://sing-box.app/deb-install.sh) > /dev/null 2>&1
-        hash -r  # 刷新环境变量
+        hash -r
         if ! command -v sing-box &> /dev/null; then echo -e "${RED}Sing-box安装失败${NC}"; return; fi
     fi
 
@@ -265,6 +264,7 @@ bind_landing() {
     MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f3)
     NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f4)
 
+    # 清理可能存在的同名旧节点
     sed -i "/# ${NODE_NAME}/,/AllowedIPs = ${LAND_IP}\/32/d" $WG_CONF
     echo -e "\n# ${NODE_NAME}\n[Peer]\nPublicKey = $LANDING_PUB\nAllowedIPs = ${LAND_IP}/32" >> $WG_CONF
     
@@ -307,7 +307,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v9.2 (修复假死版)       ║${NC}"
+    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v9.3 (支持中文版)       ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}A${NC}  ⚡ 系统极限优化 (两台机器都要执行一次)           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
