@@ -1,15 +1,16 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v10.2 (智能BBRv3+内置Singbox)
+# WireGuard 智能中转部署脚本 v11.0 (融合军工级BBRv3与极限调优)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 WG_CONF="/etc/wireguard/wg0.conf"
 WG_PORT="51820"
-SYSCTL_FILE="/etc/sysctl.d/99-wg-tune.conf"
+SYSCTL_FILE="/etc/sysctl.d/99-yw-optimize.conf"
 
 # ================= 基础检查 =================
 check_root() { [ "$EUID" -ne 0 ] && echo -e "${RED}请使用root运行${NC}" && exit 1; }
+
 check_system() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
@@ -20,16 +21,19 @@ check_system() {
         echo -e "${RED}⚠️ 无法识别操作系统${NC}"; exit 1
     fi
 }
+
 prepare_env() {
-    echo -e "${YELLOW}正在准备基础环境...${NC}"
+    echo -e "${YELLOW}正在准备基础环境 (1分钟)...${NC}"
     apt update -y > /dev/null 2>&1
-    apt install -y curl wget gnupg ca-certificates iptables iptables-persistent tar > /dev/null 2>&1
+    # 安装必要的依赖 (增加了 jq, ethtool, iproute2 等，用于极限优化)
+    apt install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq ethtool iproute2 procps kmod > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
     echo -e "${GREEN}✓ 环境准备完毕！${NC}"
     sleep 1
 }
+
 get_pub_ip() {
-    local ip=$(curl -s -m 3 -4 ifconfig.me || curl -s -m 3 -4 ip.sb || curl -s -m 3 -4 api.ipify.org)
+    local ip=$(curl -s -m 3 -4 ifconfig.me || curl -s -m 3 -4 ip.sb || curl -s -m 3 -4 api.ipify.org || curl -s -m 3 -4 ipv4.icanhazip.com)
     if [ -z "$ip" ]; then echo -e "${RED}无法获取公网IP${NC}"; exit 1; fi
     echo "$ip"
 }
@@ -45,6 +49,7 @@ install_singbox() {
     
     SB_VER="1.8.5"
     URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
+    
     wget -qO /tmp/sb.tar.gz "$URL" || wget -qO /tmp/sb.tar.gz "https://ghproxy.net/$URL"
     if [ ! -s /tmp/sb.tar.gz ]; then echo -e "${RED}Sing-box 下载失败！${NC}"; return 1; fi
     
@@ -61,6 +66,7 @@ After=network.target
 Type=simple
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 Restart=on-failure
+LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -69,79 +75,161 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
-# ================= BBRv3 内核与极限调优 =================
-apply_gateway_tune() {
-    local CONF="${SYSCTL_FILE}"
-    local MEM_MB_VAL=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
-    local RMEM_MAX=8388608; local TCP_RMEM="4096 16384 8388608"
-    if [ "$MEM_MB_VAL" -lt 1024 ]; then RMEM_MAX=4194304; TCP_RMEM="4096 32768 4194304"; fi
-    cat > "$CONF" << EOF
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = $RMEM_MAX
-net.ipv4.tcp_rmem = $TCP_RMEM
-net.core.somaxconn = 65535
-net.ipv4.tcp_fastopen = 3
-net.netfilter.nf_conntrack_max = 1048576
-net.ipv4.ip_forward = 1
-vm.swappiness = 10
-EOF
-    sysctl -p "$CONF" > /dev/null 2>&1
+# ================= 军工级 BBRv3 与极限调优模块 =================
+xanmod_add_repo() {
+    local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg" list_file="/etc/apt/sources.list.d/xanmod-release.list" os_codename=""
+    if command -v lsb_release >/dev/null 2>&1; then os_codename=$(lsb_release -sc); elif [ -r /etc/os-release ]; then os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME"); fi
+    if ! echo "bookworm trixie forky sid noble plucky" | grep -qw "$os_codename"; then os_codename="releases"; fi
+    if echo "jammy focal buster releases" | grep -qw "$os_codename"; then echo -e "${RED}XanMod 已停止对当前系统支持${NC}"; return 1; fi
+    [ -z "$os_codename" ] && { echo "无法获取代号"; return 1; }
+    apt-get install -y wget gnupg ca-certificates >/dev/null 2>&1; mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+    wget -qO - "https://dl.xanmod.org/archive.key" | gpg --dearmor -o "$keyring" --yes 2>/dev/null
+    if [ ! -s "$keyring" ]; then echo -e "${RED}❌ XanMod 密钥下载失败！${NC}"; return 1; fi
+    chmod 644 "$keyring"
+    echo "deb [signed-by=$keyring] http://deb.xanmod.org $os_codename main" > "$list_file"
 }
 
-# 智能检测 CPU 支持的 XanMod 版本
 xanmod_detect_package() {
-    local psabi_level=$(awk 'BEGIN{ while(!/flags/) if(getline<"/proc/cpuinfo"!=1) exit 1; if(/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level=1; if(level==1&&/cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level=2; if(level==2&&/avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level=3; if(level>0){print level;exit}}' /proc/cpuinfo 2>/dev/null) || return 1
+    local arch=$(uname -m)
+    if [ "$arch" = "aarch64" ]; then
+        apt update -y >/dev/null 2>&1
+        if apt-cache policy "linux-xanmod-arm64" 2>/dev/null | grep -q 'Candidate: [0-9]'; then printf '%s\n' "linux-xanmod-arm64"; return 0; fi
+        return 1
+    fi
+    # 智能检测 CPU 支持的内核版本 (v3 > v2 > v1)
+    local psabi_level=$(awk -F: '/^flags/{ if(/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level=1; if(level==1&&/cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level=2; if(level==2&&/avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level=3; if(level>0){print level;exit} }' /proc/cpuinfo 2>/dev/null)
+    if [ -z "$psabi_level" ]; then return 1; fi
     [ "$psabi_level" -gt 3 ] && psabi_level=3
+    apt update -y >/dev/null 2>&1
     for prefix in linux-xanmod linux-xanmod-lts; do 
         local l="$psabi_level"
         while [ "$l" -ge 1 ]; do 
             local p="${prefix}-x64v${l}"
-            if apt-cache policy "$p" 2>/dev/null | grep -q 'Candidate: [^ ]'; then printf '%s\n' "$p"; return 0; fi
+            if apt-cache policy "$p" 2>/dev/null | grep -q 'Candidate: [0-9]'; then printf '%s\n' "$p"; return 0; fi
             l=$((l-1))
         done
     done
     return 1
 }
 
+_kernel_optimize_core() {
+    local CONF="${SYSCTL_FILE}"
+    local MEM_MB_VAL=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    
+    # 动态参数计算
+    local RMEM_MAX=8388608 WMEM_MAX=8388608 TCP_RMEM="4096 16384 8388608" TCP_WMEM="4096 16384 8388608"
+    local SOMAXCONN=65535 BACKLOG=100000 SYN_BACKLOG=8192 PORT_RANGE="1024 65535"
+    local SWAPPINESS=10 DIRTY_RATIO=20 DIRTY_BG_RATIO=10 OVERCOMMIT=1 VFS_PRESSURE=50 MIN_FREE_KB=32768
+    local FIN_TIMEOUT=30 KEEPALIVE_TIME=300 KEEPALIVE_INTVL=30 KEEPALIVE_PROBES=5
+    local TCP_FASTOPEN=3 TCP_TW_REUSE=1 TCP_MTU_PROBING=1 TCP_NOTSENT_LOWAT=16384 TCP_SLOW_START_AFTER_IDLE=0 TCP_ECN=0
+    local CC="bbr" QDISC="fq"
+
+    # 内存自适应
+    if [ "$MEM_MB_VAL" -ge 16384 ]; then MIN_FREE_KB=131072; SWAPPINESS=5
+    elif [ "$MEM_MB_VAL" -ge 4096 ]; then MIN_FREE_KB=65536
+    elif [ "$MEM_MB_VAL" -ge 1024 ]; then RMEM_MAX=16777216; WMEM_MAX=16777216; TCP_RMEM="4096 32768 16777216"; TCP_WMEM="4096 32768 16777216"
+    else MIN_FREE_KB=16384; OVERCOMMIT=0; SWAPPINESS=10; RMEM_MAX=4194304; WMEM_MAX=4194304; SOMAXCONN=1024; BACKLOG=1000; TCP_RMEM="4096 32768 4194304"; TCP_WMEM="4096 32768 4194304"; fi
+
+    # XanMod 强制 fq_pie
+    if uname -r | grep -qi "xanmod"; then QDISC="fq_pie"; fi
+
+    local TCP_MEM_MIN=$((MEM_MB_VAL * 256)) TCP_MEM_DEF=$((MEM_MB_VAL * 512)) TCP_MEM_MAX=$((MEM_MB_VAL * 1024))
+    [ "$TCP_MEM_MIN" -lt 8192 ] && TCP_MEM_MIN=8192; [ "$TCP_MEM_DEF" -lt 16384 ] && TCP_MEM_DEF=16384; [ "$TCP_MEM_MAX" -lt 32768 ] && TCP_MEM_MAX=32768
+    local TW_BUCKETS=$((SOMAXCONN * 4)) MAX_ORPHANS=$((SOMAXCONN * 2))
+    [ "$TW_BUCKETS" -gt 524288 ] && TW_BUCKETS=524288; [ "$MAX_ORPHANS" -gt 131072 ] && MAX_ORPHANS=131072
+
+    cat > "$CONF" << EOF
+# YW 极限网关调优 (内存: ${MEM_MB_VAL}MB)
+net.core.default_qdisc = $QDISC
+net.ipv4.tcp_congestion_control = $CC
+net.core.rmem_max = $RMEM_MAX
+net.core.wmem_max = $WMEM_MAX
+net.ipv4.tcp_rmem = $TCP_RMEM
+net.ipv4.tcp_wmem = $TCP_WMEM
+net.core.somaxconn = $SOMAXCONN
+net.core.netdev_max_backlog = $BACKLOG
+net.ipv4.tcp_max_syn_backlog = $SYN_BACKLOG
+net.ipv4.tcp_fastopen = $TCP_FASTOPEN
+net.ipv4.tcp_tw_reuse = $TCP_TW_REUSE
+net.ipv4.tcp_fin_timeout = $FIN_TIMEOUT
+net.ipv4.tcp_keepalive_time = $KEEPALIVE_TIME
+net.ipv4.tcp_keepalive_intvl = $KEEPALIVE_INTVL
+net.ipv4.tcp_keepalive_probes = $KEEPALIVE_PROBES
+net.ipv4.tcp_max_tw_buckets = $TW_BUCKETS
+net.ipv4.tcp_max_orphans = $MAX_ORPHANS
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_mtu_probing = $TCP_MTU_PROBING
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_notsent_lowat = $TCP_NOTSENT_LOWAT
+net.ipv4.tcp_slow_start_after_idle = $TCP_SLOW_START_AFTER_IDLE
+net.ipv4.tcp_ecn = $TCP_ECN
+net.ipv4.ip_local_port_range = $PORT_RANGE
+net.ipv4.tcp_mem = $TCP_MEM_MIN $TCP_MEM_DEF $TCP_MEM_MAX
+vm.swappiness = $SWAPPINESS
+vm.dirty_ratio = $DIRTY_RATIO
+vm.dirty_background_ratio = $DIRTY_BG_RATIO
+vm.overcommit_memory = $OVERCOMMIT
+vm.min_free_kbytes = $MIN_FREE_KB
+vm.vfs_cache_pressure = $VFS_PRESSURE
+net.ipv4.ip_forward = 1
+fs.file-max = 1048576
+fs.nr_open = 1048576
+net.netfilter.nf_conntrack_max = $((SOMAXCONN * 32))
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.core.optmem_max = 20480
+EOF
+    sysctl -p "$CONF" > /dev/null 2>&1
+    # RPS 软中断多核优化
+    for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
+}
+
 tune_system() {
     clear
     echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
     if uname -r | grep -qi "xanmod"; then
-        echo -e "${GREEN}✓ 已是 XanMod 内核，应用网关调优...${NC}"
-        apply_gateway_tune
+        echo -e "${GREEN}✓ 已是 XanMod 内核，直接应用极限调优...${NC}"
+        _kernel_optimize_core
+        echo -e "${GREEN}✓ 极限调优完成！${NC}"
     else
-        echo -e "${YELLOW}尝试安装 XanMod BBRv3 内核...${NC}"
-        apt install -y wget gnupg ca-certificates > /dev/null 2>&1
-        mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
-        wget -qO - "https://dl.xanmod.org/archive.key" | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes 2>/dev/null
-        echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main" > /etc/apt/sources.list.d/xanmod-release.list
-        
-        echo -e "${YELLOW}正在更新软件源...${NC}"
-        apt update 2>&1 | tail -n 2
-        
-        echo -e "${YELLOW}正在检测 CPU 支持的内核版本...${NC}"
-        local pkg_name=$(xanmod_detect_package)
-        if [ -z "$pkg_name" ]; then
-            echo -e "${RED}✘ 无法找到适合的 XanMod 内核包！${NC}"
-            echo -e "${YELLOW}自动回退到普通 BBR 调优模式...${NC}"
-            apply_gateway_tune
-        else
-            echo -e "${GREEN}✓ 检测到适合: ${pkg_name}${NC}"
-            echo -e "${YELLOW}开始安装 (过程可能较慢)...${NC}"
-            if apt install -y ${pkg_name}; then
-                echo -e "net.core.default_qdisc = fq_pie\nnet.ipv4.tcp_congestion_control = bbr" > ${SYSCTL_FILE}
-                sysctl --system >/dev/null 2>&1
-                echo -e "\n${GREEN}✓ 内核安装成功！请重启服务器后再次运行本脚本，选择选项1应用调优。${NC}"
-                read -p "按回车键重启..." && reboot
-            else
-                echo -e "${RED}✘ XanMod 内核安装失败。${NC}"
-                echo -e "${YELLOW}自动回退到普通 BBR 调优模式...${NC}"
-                apply_gateway_tune
-            fi
-        fi
+        echo -e "${YELLOW}未检测到 XanMod 内核。${NC}"
+        echo -e "  ${GRAY}1${NC} 安装 XanMod BBRv3 内核 (智能CPU检测，需重启)"
+        echo -e "  ${GRAY}2${NC} 跳过安装，直接应用普通 BBR 极限调优"
+        read -p "请选择 [1/2]: " c
+        case $c in
+            1) 
+                if xanmod_add_repo; then
+                    echo -e "${YELLOW}正在检测 CPU 支持的内核版本...${NC}"
+                    local pkg_name=$(xanmod_detect_package)
+                    if [ -n "$pkg_name" ]; then
+                        echo -e "${GREEN}✓ 检测到适合: ${pkg_name}${NC}"
+                        echo -e "${YELLOW}开始安装 (过程可能较慢)...${NC}"
+                        if apt install -y ${pkg_name}; then
+                            _kernel_optimize_core
+                            echo -e "${GREEN}✓ 内核安装并调优成功！请重启服务器以加载新内核。${NC}"
+                            read -p "按回车键重启..." && reboot
+                        else
+                            echo -e "${RED}✘ XanMod 内核安装失败。${NC}"
+                            echo -e "${YELLOW}自动回退到普通 BBR 调优模式...${NC}"
+                            _kernel_optimize_core
+                        fi
+                    else
+                        echo -e "${RED}✘ 无法找到适合的 XanMod 内核包！${NC}"
+                        echo -e "${YELLOW}自动回退到普通 BBR 调优模式...${NC}"
+                        _kernel_optimize_core
+                    fi
+                else
+                    echo -e "${YELLOW}自动回退到普通 BBR 调优模式...${NC}"
+                    _kernel_optimize_core
+                fi
+                ;;
+            2) _kernel_optimize_core; echo -e "${GREEN}✓ 极限调优完成！${NC}" ;;
+        esac
     fi
-    echo -e "${GREEN}✓ 优化完成！${NC}"
 }
 
 # ================= 1. 中转机初始化 =================
@@ -293,9 +381,9 @@ check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v10.2 (智能BBRv3版)     ║${NC}"
+    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v11.0 (军工级融合版)    ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (智能检测CPU安装BBRv3)               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (智能CPU检测安装BBRv3+极限调优)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}2${NC}  [中转机] 初始化网关                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}3${NC}  [中转机] 生成落地部署码 (可自定义端口)            ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}4${NC}  [落地机] 粘贴部署码一键部署 (内置Sing-box下载)    ${CYAN}║${NC}"
