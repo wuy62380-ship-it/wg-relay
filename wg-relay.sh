@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
 # WireGuard 智能中转部署脚本 v1 (YW版)
-# 新增：按端口精准删除节点
+# 新增：单台落地机支持添加多个端口节点
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -76,15 +76,9 @@ EOF
 }
 
 force_sync_time() {
-    echo -e "${YELLOW}[*] 正在强制校准系统时间...${NC}"
     command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
     local sys_time=$(curl -k -s --connect-timeout 3 --max-time 5 -I https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
-    if [ -n "$sys_time" ]; then
-        date -s "$sys_time" >/dev/null 2>&1
-        echo -e "${GREEN}✅ 时间已校准至: $(date)${NC}"
-    else
-        echo -e "${RED}⚠ 校准失败，请确保时间正确${NC}"
-    fi
+    [ -n "$sys_time" ] && date -s "$sys_time" >/dev/null 2>&1
 }
 
 url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
@@ -134,24 +128,20 @@ EOF
 }
 
 gen_landing_code() {
-    clear; echo -e "${YELLOW}━━━ 生成落地部署码 ━━━${NC}"
+    clear; echo -e "${YELLOW}━━━ 生成落地部署码 (新落地机) ━━━${NC}"
     if [ ! -f "$WG_CONF" ]; then echo -e "${RED}请先初始化中转机${NC}"; pause_return; return; fi
     
     while true; do read -p "节点名称: " NODE_NAME < /dev/tty; [ -n "$NODE_NAME" ] && break; echo -e "${RED}不能为空${NC}"; done
-    
     MAX_IP=1
     for ip in $(grep "^AllowedIPs = 10.0.0." $WG_CONF | awk '{print $3}' | cut -d'.' -f4 | cut -d'/' -f1); do [ "$ip" -gt "$MAX_IP" ] && MAX_IP=$ip; done
     LAND_IP="10.0.0.$((MAX_IP + 1))"
-    
     while true; do
         read -p "客户端端口: " MAP_PORT < /dev/tty
         [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && [ "$MAP_PORT" -ge 1 ] && [ "$MAP_PORT" -le 65535 ] && [ "$MAP_PORT" != "$WG_PORT" ] && break
         echo -e "${RED}端口无效${NC}"
     done
-    
     RELAY_IP=$(get_pub_ip); RELAY_PUB=$(grep "^PrivateKey" $WG_CONF | awk '{print $3}' | wg pubkey)
     DEPLOY_CODE=$(echo -n "${RELAY_IP}|${RELAY_PUB}|${LAND_IP}|${MAP_PORT}|${NODE_NAME}" | base64 -w 0 | tr -d '\n')
-    
     echo -e "${GREEN}=========================================="
     echo -e " ${CYAN}${DEPLOY_CODE}${NC}"
     echo -e "=========================================="
@@ -159,37 +149,26 @@ gen_landing_code() {
 }
 
 deploy_landing() {
-    clear; echo -e "${YELLOW}━━━ 落地机一键部署 ━━━${NC}"
-    
+    clear; echo -e "${YELLOW}━━━ 落地机一键部署 (新落地机) ━━━${NC}"
     read -p "请粘贴部署码: " DEPLOY_CODE < /dev/tty
     DEPLOY_CODE=$(echo "$DEPLOY_CODE" | tr -d '[:space:]')
     CODE_RAW=$(echo -n "$DEPLOY_CODE" | base64 -d 2>/dev/null)
-    
-    if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then 
-        echo -e "${RED}❌ 部署码无效！${NC}"; pause_return; return
-    fi
+    if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then echo -e "${RED}❌ 部署码无效！${NC}"; pause_return; return; fi
 
     RELAY_IP=$(echo $CODE_RAW | cut -d'|' -f1); RELAY_PUB=$(echo $CODE_RAW | cut -d'|' -f2)
     LAND_IP=$(echo $CODE_RAW | cut -d'|' -f3); MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
-    
-    if [ -z "$RELAY_IP" ] || [ -z "$MAP_PORT" ] || [ -z "$LAND_IP" ]; then
-        echo -e "${RED}❌ 致命错误：IP或端口为空！${NC}"; pause_return; return
-    fi
+    if [ -z "$RELAY_IP" ] || [ -z "$MAP_PORT" ] || [ -z "$LAND_IP" ]; then echo -e "${RED}❌ 致命错误：IP或端口为空！${NC}"; pause_return; return; fi
 
     while true; do
         read -p "落地机监听端口 (默认 443): " LAND_PORT < /dev/tty
         [ -z "$LAND_PORT" ] && LAND_PORT=443
-        if ss -tlnp | grep -q ":$LAND_PORT "; then
-            echo -e "${RED}❌ 端口 $LAND_PORT 已被占用！请换一个端口：${NC}"
-        else
-            break
-        fi
+        if ss -tlnp | grep -q ":$LAND_PORT "; then echo -e "${RED}❌ 端口 $LAND_PORT 已被占用！请换一个：${NC}"
+        else break; fi
     done
 
     echo -e "${YELLOW}[*] 安装 WG 与 Sing-box...${NC}"
     kill_apt_locks; apt-get install -y wireguard > /dev/null 2>&1
     if ! install_singbox; then echo -e "${RED}Sing-box 安装失败${NC}"; pause_return; return; fi
-    
     force_sync_time
 
     WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey)
@@ -212,10 +191,7 @@ EOF
     REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null)
     SB_PRIV=$(echo "$REALITY_KEYS" | grep PrivateKey | awk '{print $2}'); SB_PUB=$(echo "$REALITY_KEYS" | grep PublicKey | awk '{print $2}')
     UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
-    
-    if [ -z "$SB_PUB" ] || [ -z "$UUID" ]; then
-        echo -e "${RED}❌ 密钥生成失败！${NC}"; pause_return; return
-    fi
+    if [ -z "$SB_PUB" ] || [ -z "$UUID" ]; then echo -e "${RED}❌ 密钥生成失败！${NC}"; pause_return; return; fi
 
     cat > /etc/sing-box/config.json << EOF
 {
@@ -266,7 +242,6 @@ EOF
 
 bind_landing() {
     clear; echo -e "${YELLOW}━━━ 绑定落地机 ━━━${NC}"
-    
     read -p "请粘贴回传码: " BIND_CODE < /dev/tty
     BIND_CODE=$(echo "$BIND_CODE" | tr -d '[:space:]')
     CODE_RAW=$(echo -n "$BIND_CODE" | base64 -d 2>/dev/null)
@@ -293,99 +268,163 @@ bind_landing() {
     netfilter-persistent save > /dev/null 2>&1
     
     touch "$NODES_INFO"; sed -i "/|${NODE_NAME}$/d" "$NODES_INFO"; echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
-    
     echo -e "${GREEN}✓ 节点 [${NODE_NAME}] 绑定成功${NC}"
     echo -e "${YELLOW}⚠️ 提醒：请确保中转机云后台已放行端口 ${MAP_PORT} (TCP/UDP)！${NC}"
     pause_return
 }
 
-# 新增：中转机按端口删除
+# ================= 新增：多端口扩展功能 =================
+
+add_relay_port() {
+    clear; echo -e "${YELLOW}━━━ 中转机-为现有落地机加端口 ━━━${NC}"
+    if [ ! -f "$WG_CONF" ]; then echo -e "${RED}请先初始化中转机${NC}"; pause_return; return; fi
+    
+    echo -e "当前已绑定的落地机内网IP："
+    grep "^AllowedIPs = 10.0.0." $WG_CONF | awk '{print $3}' | cut -d'.' -f4 | cut -d'/' -f1 | while read ip; do echo "  10.0.0.$ip"; done
+    
+    read -p "请输入要加端口的落地机内网IP (如 10.0.0.2): " LAND_IP < /dev/tty
+    if ! grep -q "${LAND_IP}/32" $WG_CONF; then echo -e "${RED}该IP不存在，请重新输入${NC}"; pause_return; return; fi
+    
+    while true; do read -p "请输入新的客户端端口: " MAP_PORT < /dev/tty; [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && [ "$MAP_PORT" -ge 1 ] && [ "$MAP_PORT" -le 65535 ] && break; echo -e "${RED}端口无效${NC}"; done
+    while true; do read -p "请输入落地机对应的监听端口: " LAND_PORT < /dev/tty; [[ "$LAND_PORT" =~ ^[0-9]+$ ]] && [ "$LAND_PORT" -ge 1 ] && [ "$LAND_PORT" -le 65535 ] && break; echo -e "${RED}端口无效${NC}"; done
+    read -p "请输入节点备注名称 (如 香港w-端口2): " NODE_NAME < /dev/tty
+    
+    # 清理可能存在的旧规则
+    while iptables -t nat -D PREROUTING -p tcp --dport $MAP_PORT 2>/dev/null; do :; done
+    while iptables -t nat -D PREROUTING -p udp --dport $MAP_PORT 2>/dev/null; do :; done
+    iptables -D INPUT -p tcp --dport $MAP_PORT -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p udp --dport $MAP_PORT -j ACCEPT 2>/dev/null
+    
+    # 添加新规则
+    iptables -t nat -A PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
+    iptables -t nat -A PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
+    iptables -A INPUT -p tcp --dport $MAP_PORT -j ACCEPT; iptables -A INPUT -p udp --dport $MAP_PORT -j ACCEPT
+    netfilter-persistent save > /dev/null 2>&1
+    
+    touch "$NODES_INFO"; sed -i "/|${NODE_NAME}$/d" "$NODES_INFO"; echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
+    echo -e "${GREEN}✓ 中转机端口添加成功！请确保云后台已放行 ${MAP_PORT} 端口${NC}"
+    pause_return
+}
+
+add_landing_port() {
+    clear; echo -e "${YELLOW}━━━ 落地机-新增端口节点 ━━━${NC}"
+    if [ ! -f "$LAND_INFO" ]; then echo -e "${RED}请先执行选项4部署基础节点${NC}"; pause_return; return; fi
+    
+    # 获取之前部署的中转机IP，用于生成链接
+    local relay_ip=$(grep "中转机IP:" "$LAND_INFO" | head -1 | awk '{print $2}')
+    [ -z "$relay_ip" ] && { echo -e "${RED}无法读取中转机IP，请重新部署${NC}"; pause_return; return; }
+    
+    while true; do read -p "请输入落地机新的监听端口: " LAND_PORT < /dev/tty; [[ "$LAND_PORT" =~ ^[0-9]+$ ]] && [ "$LAND_PORT" -ge 1 ] && [ "$LAND_PORT" -le 65535 ] && break; echo -e "${RED}端口无效${NC}"; done
+    if ss -tlnp | grep -q ":$LAND_PORT "; then echo -e "${RED}❌ 端口 $LAND_PORT 已被占用！${NC}"; pause_return; return; fi
+    
+    while true; do read -p "请输入客户端连接端口 (需与中转机一致): " MAP_PORT < /dev/tty; [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && break; echo -e "${RED}端口无效${NC}"; done
+    read -p "请输入节点备注名称: " NODE_NAME < /dev/tty
+    
+    REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null)
+    SB_PRIV=$(echo "$REALITY_KEYS" | grep PrivateKey | awk '{print $2}'); SB_PUB=$(echo "$REALITY_KEYS" | grep PublicKey | awk '{print $2}')
+    UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
+    
+    # 使用 jq 将新节点追加到 inbounds 数组中
+    jq --arg p "$LAND_PORT" --arg u "$UUID" --arg s "$SNI" --arg pk "$SB_PRIV" --arg sid "$SHORT_ID" \
+       '.inbounds += [{
+           "type": "vless", "listen": "::", "listen_port": ($p|tonumber),
+           "users": [{"name": "ext", "uuid": $u, "flow": "xtls-rprx-vision"}],
+           "tls": {
+               "enabled": true, "server_name": $s,
+               "alpn": ["h2", "http/1.1"],
+               "reality": {
+                   "enabled": true,
+                   "handshake": {"server": $s, "server_port": 443},
+                   "private_key": $pk, "short_id": [$sid]
+               }
+           }
+       }]' /etc/sing-box/config.json > /tmp/sb_new.json && mv /tmp/sb_new.json /etc/sing-box/config.json
+    systemctl restart sing-box
+    
+    SAFE_NAME=$(url_encode "$NODE_NAME")
+    VLESS_LINK="vless://${UUID}@${relay_ip}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
+    
+    sed -i "/# ${NODE_NAME} START/,/# ${NODE_NAME} END/d" "$LAND_INFO"
+    cat >> "$LAND_INFO" << EOF
+# ${NODE_NAME} START
+节点名称: $NODE_NAME
+中转机IP: $relay_ip
+客户端端口: $MAP_PORT
+落地机端口: $LAND_PORT
+SNI: $SNI
+链接:
+ $VLESS_LINK
+# ${NODE_NAME} END
+EOF
+    
+    echo -e "${GREEN}=========================================="
+    echo -e " 落地机新端口节点 [${NODE_NAME}] 添加成功！"
+    echo -e " ${YELLOW}链接：${NC}\n ${GREEN}${VLESS_LINK}${NC}"
+    echo -e "=========================================="
+    pause_return
+}
+
+# ================= 删除功能 =================
 delete_relay_by_port() {
     clear; echo -e "${YELLOW}━━━ 中转机按端口删除 ━━━${NC}"
-    if [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ]; then
-        echo -e "${RED}暂无节点可删除${NC}"; pause_return; return
-    fi
-    
+    if [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ]; then echo -e "${RED}暂无节点可删除${NC}"; pause_return; return; fi
     printf "${GREEN}%-10s | %-15s | %-8s | %-15s\n${NC}" "端口" "落地IP" "落地端口" "名称"
-    echo "-------------------------------------------------------------------------"
     while IFS='|' read -r p lip lp n; do printf "%-10s | %-15s | %-8s | %-15s\n" "$p" "$lip" "$lp" "$n"; done < "$NODES_INFO"
-    echo "-------------------------------------------------------------------------"
     
-    read -p "请输入要删除的客户端端口 (如 443): " DEL_PORT < /dev/tty
-    [ -z "$DEL_PORT" ] && { pause_return; return; }
-    
+    read -p "请输入要删除的客户端端口: " DEL_PORT < /dev/tty
     local line=$(grep "^${DEL_PORT}|" "$NODES_INFO")
-    if [ -z "$line" ]; then
-        echo -e "${RED}未找到端口为 ${DEL_PORT} 的节点${NC}"; pause_return; return
-    fi
+    if [ -z "$line" ]; then echo -e "${RED}未找到端口 ${DEL_PORT}${NC}"; pause_return; return; fi
     
-    local d_ip=$(echo "$line" | cut -d'|' -f2)
-    local d_name=$(echo "$line" | cut -d'|' -f4)
+    local d_ip=$(echo "$line" | cut -d'|' -f2); local d_name=$(echo "$line" | cut -d'|' -f4)
     
-    # 1. 清理 wg0.conf
-    sed -i "/# ${d_name}/,/AllowedIPs = ${d_ip}\/32/d" $WG_CONF
-    wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
-    
-    # 2. 彻底清理 iptables 规则
     while iptables -t nat -D PREROUTING -p tcp --dport $DEL_PORT 2>/dev/null; do :; done
     while iptables -t nat -D PREROUTING -p udp --dport $DEL_PORT 2>/dev/null; do :; done
-    while iptables -t nat -D POSTROUTING -d ${d_ip} -j MASQUERADE 2>/dev/null; do :; done
-    iptables -D FORWARD -d ${d_ip} -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -s ${d_ip} -j ACCEPT 2>/dev/null
     iptables -D INPUT -p tcp --dport $DEL_PORT -j ACCEPT 2>/dev/null
     iptables -D INPUT -p udp --dport $DEL_PORT -j ACCEPT 2>/dev/null
     netfilter-persistent save > /dev/null 2>&1
     
-    # 3. 清理记录文件
-    sed -i "/^${DEL_PORT}|/d" "$NODES_INFO"
+    # 检查该IP是否还有其他端口在用，如果没了就清理 WG Peer
+    if ! grep -q "|${d_ip}|" "$NODES_INFO"; then
+        sed -i "/# ${d_name}/,/AllowedIPs = ${d_ip}\/32/d" $WG_CONF
+        wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
+        while iptables -t nat -D POSTROUTING -d ${d_ip} -j MASQUERADE 2>/dev/null; do :; done
+        iptables -D FORWARD -d ${d_ip} -j ACCEPT 2>/dev/null; iptables -D FORWARD -s ${d_ip} -j ACCEPT 2>/dev/null
+        netfilter-persistent save > /dev/null 2>&1
+    fi
     
-    echo -e "${GREEN}✓ 端口 ${DEL_PORT} (节点: ${d_name}) 已彻底删除，规则已清理${NC}"
+    sed -i "/^${DEL_PORT}|/d" "$NODES_INFO"
+    echo -e "${GREEN}✓ 端口 ${DEL_PORT} 已彻底删除${NC}"
     pause_return
 }
 
-# 新增：落地机按端口删除
 delete_landing_by_port() {
     clear; echo -e "${YELLOW}━━━ 落地机按端口删除 ━━━${NC}"
-    if [ ! -f "$LAND_INFO" ] || [ ! -s "$LAND_INFO" ]; then
-        echo -e "${RED}无节点记录${NC}"; pause_return; return
-    fi
+    if [ ! -f "$LAND_INFO" ] || [ ! -s "$LAND_INFO" ]; then echo -e "${RED}无节点记录${NC}"; pause_return; return; fi
     
     grep "落地机端口:" "$LAND_INFO" | awk '{print $2}' | sort -u
+    read -p "请输入要删除的落地机监听端口: " DEL_PORT < /dev/tty
     
-    read -p "请输入要删除的落地机监听端口 (如 443): " DEL_PORT < /dev/tty
-    [ -z "$DEL_PORT" ] && { pause_return; return; }
-    
-    # 1. 清理配置文件中的对应 inbound (使用 jq)
     jq 'del(.inbounds[] | select(.listen_port == '"$DEL_PORT"'))' /etc/sing-box/config.json > /tmp/sb_cfg.tmp && mv /tmp/sb_cfg.tmp /etc/sing-box/config.json
     systemctl restart sing-box >/dev/null 2>&1
     
-    # 2. 清理记录文件中对应的块
-    # 找到对应端口的节点名称
     local node_name=$(grep -B 3 "落地机端口: $DEL_PORT$" "$LAND_INFO" | grep "节点名称:" | awk '{print $2}')
-    if [ -n "$node_name" ]; then
-        sed -i "/# ${node_name} START/,/# ${node_name} END/d" "$LAND_INFO"
-    fi
+    [ -n "$node_name" ] && sed -i "/# ${node_name} START/,/# ${node_name} END/d" "$LAND_INFO"
     
-    echo -e "${GREEN}✓ 落地机端口 ${DEL_PORT} 的配置已删除并重启服务${NC}"
+    echo -e "${GREEN}✓ 落地机端口 ${DEL_PORT} 已删除${NC}"
     pause_return
 }
 
 list_relay_nodes() {
     clear; echo -e "${YELLOW}━━━ 中转机节点列表 ━━━${NC}"
-    if [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ]; then
-        echo -e "${RED}暂无节点${NC}"; pause_return; return
-    fi
+    if [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ]; then echo -e "${RED}暂无节点${NC}"; pause_return; return; fi
     printf "${GREEN}%-10s | %-15s | %-8s | %-15s\n${NC}" "端口" "落地IP" "落地端口" "名称"
-    echo "-------------------------------------------------------------------------"
     while IFS='|' read -r p lip lp n; do printf "%-10s | %-15s | %-8s | %-15s\n" "$p" "$lip" "$lp" "$n"; done < "$NODES_INFO"
     pause_return
 }
 
 list_landing_nodes() {
     clear; echo -e "${YELLOW}━━━ 落地机节点信息 ━━━${NC}"
-    if [ ! -f "$LAND_INFO" ] || [ ! -s "$LAND_INFO" ]; then
-        echo -e "${RED}无记录${NC}"; pause_return; return
-    fi
+    if [ ! -f "$LAND_INFO" ] || [ ! -s "$LAND_INFO" ]; then echo -e "${RED}无记录${NC}"; pause_return; return; fi
     cat "$LAND_INFO"; pause_return
 }
 
@@ -393,17 +432,17 @@ check_root
 prepare_env
 while true; do
     clear
-    echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║ WG 智能中转 v1 (YW版)   ║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}7${NC} 落地-看信息  ${GREEN}8${NC} 中转-删端口    ${GREEN}9${NC} 落地-删端口 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}0${NC} 退出                                ${CYAN}║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v1 (YW版)        ║${NC}"
+    echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}7${NC} 落地-看信息  ${GREEN}8${NC} 中转-加端口    ${GREEN}9${NC} 落地-加端口    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}a${NC} 中转-删端口  ${GREEN}b${NC} 落地-删端口    ${GREEN}0${NC} 退出            ${CYAN}║${NC}"
+    echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
     
     read -p "选: " c < /dev/tty
     case $c in
-        1) tune_system;; 2) init_relay;; 3) gen_landing_code;; 4) deploy_landing;; 5) bind_landing;; 6) list_relay_nodes;; 7) list_landing_nodes;; 8) delete_relay_by_port;; 9) delete_landing_by_port;; 0) exit 0;; *) echo "错误"; sleep 1;;
+        1) tune_system;; 2) init_relay;; 3) gen_landing_code;; 4) deploy_landing;; 5) bind_landing;; 6) list_relay_nodes;; 7) list_landing_nodes;; 8) add_relay_port;; 9) add_landing_port;; a|A) delete_relay_by_port;; b|B) delete_landing_by_port;; 0) exit 0;; *) echo "错误"; sleep 1;;
     esac
 done
