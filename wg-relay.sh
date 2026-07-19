@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v1 (YW版)
-# 新增：原版BBR与XanMod BBRv3自由选择
+# WireGuard 智能中转部署脚本 v128.0 (完美选择版)
+# 修复：reboot后退出机制、卸载清理XanMod源
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -131,7 +131,6 @@ force_sync_time() {
 
 url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
 
-# 核心重构：BBR 选择菜单
 tune_system() {
     clear; echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
     
@@ -148,7 +147,6 @@ tune_system() {
     case "$tune_choice" in
         2)
             echo -e "${YELLOW}[*] 开始安装 XanMod BBRv3 内核...${NC}"
-            # 添加 XanMod 源
             local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
             rm -f /etc/apt/sources.list.d/xanmod-release.list
             wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o "$keyring" --yes 2>/dev/null
@@ -156,7 +154,6 @@ tune_system() {
             kill_apt_locks
             apt-get update -y > /dev/null 2>&1
             
-            # 检测 CPU 版本
             local cpu_level=1
             if grep -o 'avx2' /proc/cpuinfo >/dev/null 2>&1 && grep -o 'bmi2' /proc/cpuinfo >/dev/null 2>&1; then
                 cpu_level=3
@@ -191,6 +188,7 @@ EOF
                     echo -e "${GREEN}✓ BBRv3 安装成功！请务必重启服务器后再进行后续操作。${NC}"
                     read -p "按回车键重启服务器..." < /dev/tty
                     reboot
+                    exit 0 # 修复1：防止重启过程中继续执行脚本
                 else
                     echo -e "${RED}✘ XanMod 安装失败，回退原版 BBR。${NC}"
                     tune_choice=1
@@ -778,9 +776,16 @@ uninstall_all() {
     
     echo -e "${YELLOW}[*] 删除文件...${NC}"
     rm -rf /etc/wireguard /etc/sing-box /usr/local/bin/sing-box /etc/systemd/system/sing-box.service "$NODES_INFO" "$LAND_INFO" "$SYSCTL_FILE" "$IP_FORWARD_FILE" "$LOCK_FILE"
+    
+    # 修复2：清理 XanMod 源和密钥
+    echo -e "${YELLOW}[*] 清理 XanMod 内核源...${NC}"
+    rm -f /etc/apt/sources.list.d/xanmod-release.list
+    rm -f /usr/share/keyrings/xanmod-archive-keyring.gpg
+    
     systemctl daemon-reload
     
     echo -e "${GREEN}✓ 卸载完成！${NC}"
+    echo -e "${YELLOW}⚠️ 提示：如果之前安装过 BBRv3 内核，需手动执行 'apt purge linux-*xanmod*' 卸载内核并重启。${NC}"
     pause_return
 }
 
@@ -806,7 +811,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v1 (YW版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v128.0 (完美选择版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
