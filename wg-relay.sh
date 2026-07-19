@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v102.0 (终极时间修复版)
-# 彻底解决：NTP被墙导致时间校准失败
+# WireGuard 智能中转部署脚本 v103.0 (终极路由修复版)
+# 找回丢失的 MASQUERADE 规则，彻底解决非对称路由
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -75,33 +75,17 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
-# 核心修复：多重时间校准机制
 force_sync_time() {
-    echo -e "${YELLOW}[*] 正在强制校准系统时间 (Reality 绝对依赖)...${NC}"
-    local current_year=$(date +%Y)
-    # 如果年份不是 2024，说明时间肯定不对
-    if [ "$current_year" -ne "2024" ]; then
-        echo -e "${RED}检测到系统时间异常 ($current_year 年)，正在尝试修复...${NC}"
-        
-        # 方案1: 尝试阿里云 NTP
-        command -v ntpdate >/dev/null 2>&1 && ntpdate ntp.aliyun.com >/dev/null 2>&1
-        
-        # 方案2: 尝试写入系统时间同步服务
-        command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
-        
-        # 检查是否修复成功
-        local new_year=$(date +%Y)
-        if [ "$new_year" -ne "2024" ]; then
-            echo -e "${RED}❌ 自动校准失败！请手动执行以下命令修改时间：${NC}"
-            echo -e "${YELLOW}date -s \"2024-07-19 20:30:00\"${NC}"
-            echo -e "${YELLOW}hwclock -w${NC}"
-            echo -e "${RED}修改完成后再重新运行本脚本的选项 4。${NC}"
-            pause_return
-            return 1
-        fi
+    echo -e "${YELLOW}[*] 正在强制校准系统时间...${NC}"
+    command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
+    # 修复：使用 -k 跳过证书验证，防止因时间不对导致拿不到时间
+    local sys_time=$(curl -k -s --connect-timeout 3 --max-time 5 -I https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+    if [ -n "$sys_time" ]; then
+        date -s "$sys_time" >/dev/null 2>&1
+        echo -e "${GREEN}✅ 时间已校准至: $(date)${NC}"
+    else
+        echo -e "${RED}⚠ 校准失败，请确保时间正确${NC}"
     fi
-    echo -e "${GREEN}✅ 系统时间正常: $(date)${NC}"
-    return 0
 }
 
 url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
@@ -200,10 +184,7 @@ deploy_landing() {
     kill_apt_locks; apt-get install -y wireguard > /dev/null 2>&1
     if ! install_singbox; then echo -e "${RED}Sing-box 安装失败${NC}"; pause_return; return; fi
     
-    # 核心修复：如果时间校准失败，直接终止部署，防止生成无效节点
-    if ! force_sync_time; then
-        return
-    fi
+    force_sync_time
 
     WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey)
     cat > $WG_CONF << EOF
@@ -297,6 +278,11 @@ bind_landing() {
     
     iptables -t nat -A PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
     iptables -t nat -A PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
+    
+    # 核心修复：找回丢失的 MASQUERADE 规则，解决非对称路由导致的不通
+    while iptables -t nat -D POSTROUTING -d ${LAND_IP} -j MASQUERADE 2>/dev/null; do :; done
+    iptables -t nat -A POSTROUTING -d ${LAND_IP} -j MASQUERADE
+    
     iptables -A FORWARD -d ${LAND_IP} -j ACCEPT; iptables -A FORWARD -s ${LAND_IP} -j ACCEPT
     iptables -A INPUT -p tcp --dport $MAP_PORT -j ACCEPT; iptables -A INPUT -p udp --dport $MAP_PORT -j ACCEPT
     netfilter-persistent save > /dev/null 2>&1
@@ -324,7 +310,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v102.0 (终极时间修复)║${NC}"
+    echo -e "${CYAN}║ WG 智能中转 v103.0 (终极路由修复)  ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表 ${CYAN}║${NC}"
