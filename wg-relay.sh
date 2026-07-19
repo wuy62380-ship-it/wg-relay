@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v104.0 (最终实战版)
-# 整合：时间死循环修复、端口冲突检测、路由强制修复
+# WireGuard 智能中转部署脚本 v105.0 (完整运维版)
+# 新增：节点删除功能、规则彻底清理
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -75,7 +75,6 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
-# 核心修复1：使用 -k 跳过证书校验，防止时间不对导致拿不到时间
 force_sync_time() {
     echo -e "${YELLOW}[*] 正在强制校准系统时间...${NC}"
     command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
@@ -145,7 +144,7 @@ gen_landing_code() {
     LAND_IP="10.0.0.$((MAX_IP + 1))"
     
     while true; do
-        read -p "客户端连接端口: " MAP_PORT < /dev/tty
+        read -p "客户端端口: " MAP_PORT < /dev/tty
         [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && [ "$MAP_PORT" -ge 1 ] && [ "$MAP_PORT" -le 65535 ] && [ "$MAP_PORT" != "$WG_PORT" ] && break
         echo -e "${RED}端口无效${NC}"
     done
@@ -177,7 +176,6 @@ deploy_landing() {
         echo -e "${RED}❌ 致命错误：IP或端口为空！${NC}"; pause_return; return
     fi
 
-    # 核心修复2：端口冲突检测，防止生成起不来的死节点
     while true; do
         read -p "落地机监听端口 (默认 443): " LAND_PORT < /dev/tty
         [ -z "$LAND_PORT" ] && LAND_PORT=443
@@ -281,16 +279,17 @@ bind_landing() {
     echo -e "\n# ${NODE_NAME}\n[Peer]\nPublicKey = $LANDING_PUB\nAllowedIPs = ${LAND_IP}/32" >> $WG_CONF
     wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
     
+    # 彻底清理旧规则
     while iptables -t nat -D PREROUTING -p tcp --dport $MAP_PORT 2>/dev/null; do :; done
     while iptables -t nat -D PREROUTING -p udp --dport $MAP_PORT 2>/dev/null; do :; done
+    while iptables -t nat -D POSTROUTING -d ${LAND_IP} -j MASQUERADE 2>/dev/null; do :; done
+    iptables -D FORWARD -d ${LAND_IP} -j ACCEPT 2>/dev/null; iptables -D FORWARD -s ${LAND_IP} -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p tcp --dport $MAP_PORT -j ACCEPT 2>/dev/null; iptables -D INPUT -p udp --dport $MAP_PORT -j ACCEPT 2>/dev/null
     
+    # 添加新规则
     iptables -t nat -A PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
     iptables -t nat -A PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
-    
-    # 核心修复3：强制确保 MASQUERADE 规则存在，解决非对称路由
-    while iptables -t nat -D POSTROUTING -d ${LAND_IP} -j MASQUERADE 2>/dev/null; do :; done
     iptables -t nat -A POSTROUTING -d ${LAND_IP} -j MASQUERADE
-    
     iptables -A FORWARD -d ${LAND_IP} -j ACCEPT; iptables -A FORWARD -s ${LAND_IP} -j ACCEPT
     iptables -A INPUT -p tcp --dport $MAP_PORT -j ACCEPT; iptables -A INPUT -p udp --dport $MAP_PORT -j ACCEPT
     netfilter-persistent save > /dev/null 2>&1
@@ -302,17 +301,80 @@ bind_landing() {
     pause_return
 }
 
+# 新增：中转机删除节点
+delete_relay_node() {
+    clear; echo -e "${YELLOW}━━━ 中转机删除节点 ━━━${NC}"
+    if [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ]; then
+        echo -e "${RED}暂无节点可删除${NC}"; pause_return; return
+    fi
+    printf "${GREEN}%-10s | %-15s | %-8s | %-15s\n${NC}" "端口" "落地IP" "落地端口" "名称"
+    echo "-------------------------------------------------------------------------"
+    while IFS='|' read -r p lip lp n; do printf "%-10s | %-15s | %-8s | %-15s\n" "$p" "$lip" "$lp" "$n"; done < "$NODES_INFO"
+    echo "-------------------------------------------------------------------------"
+    
+    read -p "请输入要删除的节点名称: " DEL_NAME < /dev/tty
+    [ -z "$DEL_NAME" ] && { pause_return; return; }
+    
+    # 提取该节点的信息用于清理 iptables
+    local line=$(grep "|${DEL_NAME}$" "$NODES_INFO")
+    if [ -z "$line" ]; then
+        echo -e "${RED}未找到节点 [${DEL_NAME}]${NC}"; pause_return; return
+    fi
+    local d_port=$(echo "$line" | cut -d'|' -f1)
+    local d_ip=$(echo "$line" | cut -d'|' -f2)
+    
+    # 1. 清理 wg0.conf
+    sed -i "/# ${DEL_NAME}/,/AllowedIPs = ${d_ip}\/32/d" $WG_CONF
+    wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
+    
+    # 2. 彻底清理 iptables 规则
+    while iptables -t nat -D PREROUTING -p tcp --dport $d_port 2>/dev/null; do :; done
+    while iptables -t nat -D PREROUTING -p udp --dport $d_port 2>/dev/null; do :; done
+    while iptables -t nat -D POSTROUTING -d ${d_ip} -j MASQUERADE 2>/dev/null; do :; done
+    iptables -D FORWARD -d ${d_ip} -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -s ${d_ip} -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p tcp --dport $d_port -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p udp --dport $d_port -j ACCEPT 2>/dev/null
+    netfilter-persistent save > /dev/null 2>&1
+    
+    # 3. 清理记录文件
+    sed -i "/|${DEL_NAME}$/d" "$NODES_INFO"
+    
+    echo -e "${GREEN}✓ 节点 [${DEL_NAME}] 已彻底删除，规则已清理${NC}"
+    pause_return
+}
+
+# 新增：落地机清空节点
+delete_landing_node() {
+    clear; echo -e "${YELLOW}━━━ 落地机清空节点 ━━━${NC}"
+    read -p "${RED}确定要清空本机所有节点配置并停止服务吗？[y/N]: ${NC}" c < /dev/tty
+    [[ ! "$c" =~ ^[Yy]$ ]] && { pause_return; return; }
+    
+    > "$LAND_INFO"
+    echo '{"log":{"level":"error"},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' > /etc/sing-box/config.json
+    systemctl stop sing-box >/dev/null 2>&1
+    systemctl disable sing-box >/dev/null 2>&1
+    
+    echo -e "${GREEN}✓ 已清空落地机记录并停止 Sing-box 服务${NC}"
+    pause_return
+}
+
 list_relay_nodes() {
     clear; echo -e "${YELLOW}━━━ 中转机节点列表 ━━━${NC}"
-    if [ ! -f "$NODES_INFO" ]; then echo -e "${RED}暂无节点${NC}"; pause_return; return; fi
+    if [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ]; then
+        echo -e "${RED}暂无节点${NC}"; pause_return; return
+    fi
     printf "${GREEN}%-10s | %-15s | %-8s | %-15s\n${NC}" "端口" "落地IP" "落地端口" "名称"
+    echo "-------------------------------------------------------------------------"
     while IFS='|' read -r p lip lp n; do printf "%-10s | %-15s | %-8s | %-15s\n" "$p" "$lip" "$lp" "$n"; done < "$NODES_INFO"
     pause_return
 }
 
 list_landing_nodes() {
     clear; echo -e "${YELLOW}━━━ 落地机节点信息 ━━━${NC}"
-    if [ ! -f "$LAND_INFO" ]; then echo -e "${RED}无记录${NC}"; pause_return; return; fi
+    if [ ! -f "$LAND_INFO" ] || [ ! -s "$LAND_INFO" ]; then
+        echo -e "${RED}无记录${NC}"; pause_return; return
+    fi
     cat "$LAND_INFO"; pause_return
 }
 
@@ -321,15 +383,16 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║ WG 智能中转 v104.0 (最终实战版)   ║${NC}"
+    echo -e "${CYAN}║ WG 智能中转 v105.0 (完整运维版)   ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}7${NC} 落地-看信息  ${GREEN}0${NC} 退出                      ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}7${NC} 落地-看信息  ${GREEN}8${NC} 中转-删节点    ${GREEN}9${NC} 落地-清节点 ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}0${NC} 退出                                ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
     
     read -p "选: " c < /dev/tty
     case $c in
-        1) tune_system;; 2) init_relay;; 3) gen_landing_code;; 4) deploy_landing;; 5) bind_landing;; 6) list_relay_nodes;; 7) list_landing_nodes;; 0) exit 0;; *) echo "错误"; sleep 1;;
+        1) tune_system;; 2) init_relay;; 3) gen_landing_code;; 4) deploy_landing;; 5) bind_landing;; 6) list_relay_nodes;; 7) list_landing_nodes;; 8) delete_relay_node;; 9) delete_landing_node;; 0) exit 0;; *) echo "错误"; sleep 1;;
     esac
 done
