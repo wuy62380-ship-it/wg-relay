@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v128.0 (完美选择版)
-# 修复：reboot后退出机制、卸载清理XanMod源
+# WireGuard 智能中转部署脚本 v130.0 (终极完美版)
+# 整合：内核选择、非对称路由、时间强制校准、并发文件锁、全防错机制
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -178,17 +178,25 @@ tune_system() {
                 echo -e "${GREEN}✓ 检测到适合: ${pkg_name}，开始下载安装 (请耐心等待)...${NC}"
                 if apt-get install -y "$pkg_name"; then
                     cat > "$SYSCTL_FILE" << EOF
+# XanMod BBRv3 专属优化
 net.core.default_qdisc = fq_pie
 net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 32768 16777216
+net.ipv4.tcp_wmem = 4096 32768 16777216
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 100000
+net.ipv4.tcp_fastopen = 3
 net.ipv4.ip_forward = 1
 net.netfilter.nf_conntrack_max = $conntrack_max
+vm.swappiness = 10
 EOF
                     sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
                     for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
                     echo -e "${GREEN}✓ BBRv3 安装成功！请务必重启服务器后再进行后续操作。${NC}"
                     read -p "按回车键重启服务器..." < /dev/tty
                     reboot
-                    exit 0 # 修复1：防止重启过程中继续执行脚本
+                    exit 0
                 else
                     echo -e "${RED}✘ XanMod 安装失败，回退原版 BBR。${NC}"
                     tune_choice=1
@@ -203,6 +211,7 @@ EOF
     if [ "$tune_choice" == "1" ]; then
         echo -e "${YELLOW}[*] 应用原版 BBR 优化...${NC}"
         cat > "$SYSCTL_FILE" << EOF
+# 原版 BBR 优化
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = 16777216
@@ -777,7 +786,6 @@ uninstall_all() {
     echo -e "${YELLOW}[*] 删除文件...${NC}"
     rm -rf /etc/wireguard /etc/sing-box /usr/local/bin/sing-box /etc/systemd/system/sing-box.service "$NODES_INFO" "$LAND_INFO" "$SYSCTL_FILE" "$IP_FORWARD_FILE" "$LOCK_FILE"
     
-    # 修复2：清理 XanMod 源和密钥
     echo -e "${YELLOW}[*] 清理 XanMod 内核源...${NC}"
     rm -f /etc/apt/sources.list.d/xanmod-release.list
     rm -f /usr/share/keyrings/xanmod-archive-keyring.gpg
@@ -811,7 +819,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v128.0 (完美选择版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v130.0 (终极完美版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
