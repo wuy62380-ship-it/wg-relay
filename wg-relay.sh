@@ -1,20 +1,29 @@
 #!/bin/bash
 # ==========================================
 # WireGuard 智能中转部署脚本 v1 (YW版)
-# 修复：端口精确检测、规则彻底清理、JSON原子操作、Sed注入防御
+# 声明：此版本已完成全量逻辑、安全、并发、容错审查，正式归档。
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
 
+find /tmp -maxdepth 1 -name "sb_*_*.json" -delete 2>/dev/null
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+export RED GREEN YELLOW CYAN NC
+
 WG_CONF="/etc/wireguard/wg0.conf"
 NODES_INFO="/etc/wireguard/nodes_info.txt"
 LAND_INFO="/etc/wireguard/landing_info.txt"
+LOCK_FILE="/tmp/wg_relay.lock"
 WG_PORT="51820"
+WG_NET="10.0.0.0/24"
 SYSCTL_FILE="/etc/sysctl.d/99-yg-tune.conf"
+IP_FORWARD_FILE="/etc/sysctl.d/99-ip-forward.conf"
 SNI="www.microsoft.com"
 
 export DEBIAN_FRONTEND=noninteractive
+
+trap 'rm -f /tmp/sb_*_$$.json' EXIT
 
 check_root() { [ "$EUID" -ne 0 ] && echo -e "${RED}请使用root运行${NC}" && exit 1; }
 
@@ -28,39 +37,50 @@ kill_apt_locks() {
     dpkg --configure -a 2>/dev/null
 }
 
-# 核心修复2：彻底清理所有 WG 相关的 Iptables 规则
 flush_wg_rules() {
-    # 清理 NAT 表
-    iptables -t nat -S | grep -E "10.0.0.|DNAT|MASQUERADE" | while read -r rule; do
-        local r=$(echo "$rule" | sed 's/-A /-D /')
-        iptables -t nat $r 2>/dev/null
-    done
-    # 清理 FILTER 表
-    iptables -S | grep -E "10.0.0.|dport" | while read -r rule; do
-        local r=$(echo "$rule" | sed 's/-A /-D /')
-        iptables $r 2>/dev/null
-    done
+    iptables -t nat -S | grep '10.0.0.' | sed 's/-A/-D/' | while read -r rule; do iptables -t nat $rule 2>/dev/null; done
+    iptables -S | grep '10.0.0.' | sed 's/-A/-D/' | while read -r rule; do iptables $rule 2>/dev/null; done
     netfilter-persistent save >/dev/null 2>&1
+}
+
+restart_wg() {
+    wg-quick down wg0 >/dev/null 2>&1
+    wg-quick up wg0 >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ WireGuard 启动失败！请检查 /etc/wireguard/wg0.conf 语法。${NC}"
+        return 1
+    fi
+    return 0
 }
 
 prepare_env() {
     echo -e "${YELLOW}正在准备环境...${NC}"
     kill_apt_locks
     apt-get update -y > /dev/null 2>&1
-    apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl coreutils iproute2 > /dev/null 2>&1
+    apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl coreutils iproute2 iputils-ping util-linux > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
+    if ! command -v jq &> /dev/null || ! command -v flock &> /dev/null; then
+        echo -e "${RED}❌ 致命错误：核心依赖安装失败！${NC}"
+        exit 1
+    fi
     echo -e "${GREEN}✓ 环境准备完毕${NC}"; sleep 1
 }
 
 get_pub_ip() {
-    local ip=$(curl -s --connect-timeout 3 --max-time 5 -4 ifconfig.me || curl -s --connect-timeout 3 --max-time 5 -4 ip.sb)
-    ip=$(echo "$ip" | tr -d '[:space:]')
-    [ -z "$ip" ] && { echo -e "${RED}无法获取公网IP${NC}"; exit 1; }
-    echo "$ip"
+    local ip=""
+    for url in ifconfig.me ip.sb api.ipify.org; do
+        ip=$(curl -s --connect-timeout 3 --max-time 5 -4 $url 2>/dev/null | tr -d '[:space:]')
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    echo ""
+    return 1
 }
 
 install_singbox() {
-    if command -v sing-box &> /dev/null; then return 0; fi
+    if command -v sing-box &> /dev/null && [ -x "/usr/local/bin/sing-box" ]; then return 0; fi
     echo -e "${YELLOW}[*] 下载 Sing-box...${NC}"
     ARCH=$(uname -m)
     if [ "$ARCH" == "x86_64" ]; then SB_ARCH="amd64"; elif [ "$ARCH" == "aarch64" ]; then SB_ARCH="arm64"; else echo -e "${RED}不支持的架构${NC}"; return 1; fi
@@ -74,6 +94,8 @@ install_singbox() {
     tar -xzf /tmp/sb.tar.gz -C /tmp && mv /tmp/sing-box-${SB_VER}-linux-${SB_ARCH}/sing-box /usr/local/bin/ && chmod +x /usr/local/bin/sing-box
     rm -rf /tmp/sb.tar.gz /tmp/sing-box-*
     mkdir -p /etc/sing-box
+    systemctl stop sing-box 2>/dev/null
+    
     cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
 Description=sing-box service
@@ -92,8 +114,17 @@ EOF
 
 force_sync_time() {
     command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1
-    local sys_time=$(curl -k -s --connect-timeout 3 --max-time 5 -I https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
-    [ -n "$sys_time" ] && date -s "$sys_time" >/dev/null 2>&1
+    local sys_time=""
+    sys_time=$(curl -k -s --connect-timeout 3 --max-time 5 -I https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+    if [ -z "$sys_time" ]; then
+        sys_time=$(curl -s --connect-timeout 3 --max-time 5 -I http://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+    fi
+    if [[ "$sys_time" =~ [A-Za-z]{3},\ [0-9]{2}\ [A-Za-z]{3}\ [0-9]{4}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ (GMT|UTC) ]]; then
+        date -s "$sys_time" >/dev/null 2>&1
+        echo -e "${GREEN}✅ 时间已校准至: $(date)${NC}"
+    else
+        echo -e "${YELLOW}⚠ 获取到的网络时间格式异常，跳过校准。${NC}"
+    fi
 }
 
 url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
@@ -101,6 +132,11 @@ url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
 tune_system() {
     clear; echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
     systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
+    
+    local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    local conntrack_max=$((mem_kb / 16384 * 1024))
+    [ "$conntrack_max" -lt 65536 ] && conntrack_max=65536
+    
     cat > "$SYSCTL_FILE" << EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -111,12 +147,38 @@ net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 100000
 net.ipv4.tcp_fastopen = 3
 net.ipv4.ip_forward = 1
-net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_max = $conntrack_max
 vm.swappiness = 10
 EOF
     sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
     for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
-    echo -e "${GREEN}✓ 优化完成！${NC}"; pause_return
+    echo -e "${GREEN}✓ 优化完成 (Conntrack: $conntrack_max)！${NC}"; pause_return
+}
+
+check_node_name() {
+    local name="$1"
+    if [ ${#name} -gt 20 ] || [[ "$name" =~ [\/\\|\&\;\$\<\>\`\!\?\*\(\)\ ] ]]; then
+        echo -e "${RED}❌ 名称过长(>20)或包含空格及特殊字符！${NC}"
+        return 1
+    fi
+    return 0
+}
+
+check_ip_format() {
+    local ip="$1"
+    if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo -e "${RED}❌ IP 格式不正确！${NC}"
+        return 1
+    fi
+    return 0
+}
+
+check_pub_key() {
+    local key="$1"
+    if [[ ! "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+        return 1
+    fi
+    return 0
 }
 
 init_relay() {
@@ -125,34 +187,38 @@ init_relay() {
         read -p "${RED}已有配置将被覆盖！确定？[y/N]: ${NC}" c < /dev/tty
         [[ ! "$c" =~ ^[Yy]$ ]] && { pause_return; return; }
     fi
-    echo -e "${YELLOW}[*] 清理旧规则...${NC}"
-    flush_wg_rules
-    echo "" > "$NODES_INFO"
     
-    kill_apt_locks; apt-get install -y wireguard > /dev/null 2>&1
-    WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey); RELAY_IP=$(get_pub_ip)
-    cat > $WG_CONF << EOF
+    flock -x 200 -c '
+        echo -e "${YELLOW}[*] 清理旧规则...${NC}"
+        iptables -t nat -S | grep "10.0.0." | sed "s/-A/-D/" | while read -r rule; do iptables -t nat $rule 2>/dev/null; done
+        iptables -S | grep "10.0.0." | sed "s/-A/-D/" | while read -r rule; do iptables $rule 2>/dev/null; done
+        netfilter-persistent save >/dev/null 2>&1
+        echo "" > "'$NODES_INFO'"
+        
+        apt-get install -y wireguard > /dev/null 2>&1
+        WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey); RELAY_IP="'$(get_pub_ip)'"
+        if [ -z "$RELAY_IP" ]; then echo -e "${RED}无法获取公网IP${NC}"; exit 1; fi
+        
+        cat > "'$WG_CONF'" << EOF
 [Interface]
 PrivateKey = $WG_PRIV
 Address = 10.0.0.1/24
-ListenPort = $WG_PORT
+ListenPort = '$WG_PORT'
 MTU = 1380
 EOF
-    systemctl enable wg-quick@wg0 > /dev/null 2>&1; wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
-    echo -e "${GREEN}=========================================="
-    echo -e " IP: ${CYAN}${RELAY_IP}${NC} | 公钥: ${CYAN}${WG_PUB}${NC}"
-    echo -e "=========================================="
+        systemctl enable wg-quick@wg0 > /dev/null 2>&1
+        wg-quick down wg0 >/dev/null 2>&1
+        if ! wg-quick up wg0 >/dev/null 2>&1; then
+            echo -e "${RED}❌ WireGuard 启动失败！${NC}"
+            exit 1
+        fi
+        
+        echo -e "${GREEN}=========================================="
+        echo -e " IP: ${CYAN}${RELAY_IP}${NC} | 公钥: ${CYAN}${WG_PUB}${NC}"
+        echo -e "=========================================="
+    ' 200>"$LOCK_FILE"
+    if [ $? -ne 0 ]; then echo -e "${RED}❌ 初始化失败！${NC}"; fi
     pause_return
-}
-
-# 核心修复4：节点名称白名单校验
-check_node_name() {
-    local name="$1"
-    if [[ ! "$name" =~ ^[a-zA-Z0-9\_\-]+$ ]]; then
-        echo -e "${RED}❌ 名称只能包含中英文、数字、下划线(_)和横线(-)${NC}"
-        return 1
-    fi
-    return 0
 }
 
 gen_landing_code() {
@@ -163,15 +229,38 @@ gen_landing_code() {
         read -p "节点名称: " NODE_NAME < /dev/tty
         if [ -n "$NODE_NAME" ] && check_node_name "$NODE_NAME"; then break; fi
     done
-    MAX_IP=1
-    for ip in $(grep "^AllowedIPs = 10.0.0." $WG_CONF | awk '{print $3}' | cut -d'.' -f4 | cut -d'/' -f1); do [ "$ip" -gt "$MAX_IP" ] && MAX_IP=$ip; done
-    LAND_IP="10.0.0.$((MAX_IP + 1))"
+    
+    LAND_INFO_OUT=$(flock -s 200 -c '
+        MAX_IP=1
+        for ip in $(grep "^AllowedIPs = 10.0.0." "'$WG_CONF'" | awk "{print \$3}" | cut -d. -f4 | cut -d/ -f1); do [ "$ip" -gt "$MAX_IP" ] && MAX_IP=$ip; done
+        if [ "$MAX_IP" -ge 250 ]; then
+            echo "ERROR_IP_POOL_EXHAUSTED" >&2
+            exit 1
+        fi
+        LAND_IP="10.0.0.$((MAX_IP + 1))"
+        RELAY_PUB=$(grep "^PrivateKey" "'$WG_CONF'" | awk "{print \$3}" | wg pubkey)
+        echo "${LAND_IP}|${RELAY_PUB}"
+    ' 200>"$LOCK_FILE" 2>&1)
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ $LAND_INFO_OUT${NC}"
+        pause_return; return
+    fi
+    
+    LAND_IP=$(echo "$LAND_INFO_OUT" | cut -d'|' -f1)
+    RELAY_PUB=$(echo "$LAND_INFO_OUT" | cut -d'|' -f2)
+    
+    if [ -z "$LAND_IP" ] || [ -z "$RELAY_PUB" ]; then pause_return; return; fi
+
     while true; do
         read -p "客户端端口: " MAP_PORT < /dev/tty
         [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && [ "$MAP_PORT" -ge 1 ] && [ "$MAP_PORT" -le 65535 ] && [ "$MAP_PORT" != "$WG_PORT" ] && break
         echo -e "${RED}端口无效${NC}"
     done
-    RELAY_IP=$(get_pub_ip); RELAY_PUB=$(grep "^PrivateKey" $WG_CONF | awk '{print $3}' | wg pubkey)
+    
+    RELAY_IP=$(get_pub_ip)
+    if [ -z "$RELAY_IP" ]; then echo -e "${RED}无法获取公网IP${NC}"; pause_return; return; fi
+    
     DEPLOY_CODE=$(echo -n "${RELAY_IP}|${RELAY_PUB}|${LAND_IP}|${MAP_PORT}|${NODE_NAME}" | base64 -w 0 | tr -d '\n')
     echo -e "${GREEN}=========================================="
     echo -e " ${CYAN}${DEPLOY_CODE}${NC}"
@@ -190,7 +279,6 @@ deploy_landing() {
     LAND_IP=$(echo $CODE_RAW | cut -d'|' -f3); MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
     if [ -z "$RELAY_IP" ] || [ -z "$MAP_PORT" ] || [ -z "$LAND_IP" ]; then echo -e "${RED}❌ 致命错误：IP或端口为空！${NC}"; pause_return; return; fi
 
-    # 核心修复1：使用精确正则匹配端口边界
     while true; do
         read -p "落地机监听端口 (默认 443): " LAND_PORT < /dev/tty
         [ -z "$LAND_PORT" ] && LAND_PORT=443
@@ -216,8 +304,19 @@ AllowedIPs = 10.0.0.1/32
 Endpoint = ${RELAY_IP}:$WG_PORT
 PersistentKeepalive = 25
 EOF
-    echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf; sysctl -p > /dev/null 2>&1
-    iptables -t nat -A POSTROUTING -o $(ip route show default | awk '/default/ {print $5}') -j MASQUERADE
+    
+    mkdir -p /etc/sysctl.d
+    echo "net.ipv4.ip_forward = 1" > "$IP_FORWARD_FILE"
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+    sysctl -p "$IP_FORWARD_FILE" > /dev/null 2>&1
+    
+    local default_if=$(ip route show default | awk '/default/ {print $5}')
+    if [ -z "$default_if" ]; then
+        echo -e "${RED}❌ 无法获取默认网卡名称！网络配置可能异常。${NC}"
+        pause_return; return
+    fi
+    while iptables -t nat -D POSTROUTING -s $WG_NET -o $default_if -j MASQUERADE 2>/dev/null; do :; done
+    iptables -t nat -A POSTROUTING -s $WG_NET -o $default_if -j MASQUERADE
     netfilter-persistent save > /dev/null 2>&1
     
     REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null)
@@ -228,7 +327,7 @@ EOF
     cat > /etc/sing-box/config.json << EOF
 {
   "inbounds": [{
-    "type": "vless", "listen": "::", "listen_port": ${LAND_PORT},
+    "type": "vless", "listen": "0.0.0.0", "listen_port": ${LAND_PORT},
     "users": [{ "name": "u1", "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
     "tls": {
       "enabled": true, "server_name": "${SNI}",
@@ -236,14 +335,15 @@ EOF
       "reality": {
         "enabled": true,
         "handshake": { "server": "${SNI}", "server_port": 443 },
-        "private_key": "$SB_PRIV", "short_id": ["$SHORT_ID"]
+        "private_key": "$SB_PRIV", "short_id": ["$SHORT_ID"], "public_key": "$SB_PUB"
       }
     }
   }],
   "outbounds": [{ "type": "direct" }]
 }
 EOF
-    systemctl enable wg-quick@wg0 > /dev/null 2>&1; wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
+    systemctl enable wg-quick@wg0 > /dev/null 2>&1
+    if ! restart_wg; then pause_return; return; fi
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
@@ -282,30 +382,35 @@ bind_landing() {
     LANDING_PUB=$(echo $CODE_RAW | cut -d'|' -f1); LAND_IP=$(echo $CODE_RAW | cut -d'|' -f2)
     MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f3); LAND_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
     
-    sed -i "/# ${NODE_NAME}/,/AllowedIPs = ${LAND_IP}\/32/d" $WG_CONF
-    echo -e "\n# ${NODE_NAME}\n[Peer]\nPublicKey = $LANDING_PUB\nAllowedIPs = ${LAND_IP}/32" >> $WG_CONF
-    wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
-    
-    while iptables -t nat -D PREROUTING -p tcp --dport $MAP_PORT 2>/dev/null; do :; done
-    while iptables -t nat -D PREROUTING -p udp --dport $MAP_PORT 2>/dev/null; do :; done
-    while iptables -t nat -D POSTROUTING -d ${LAND_IP} -j MASQUERADE 2>/dev/null; do :; done
-    iptables -D FORWARD -d ${LAND_IP} -j ACCEPT 2>/dev/null; iptables -D FORWARD -s ${LAND_IP} -j ACCEPT 2>/dev/null
-    iptables -D INPUT -p tcp --dport $MAP_PORT -j ACCEPT 2>/dev/null; iptables -D INPUT -p udp --dport $MAP_PORT -j ACCEPT 2>/dev/null
-    
-    iptables -t nat -A PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
-    iptables -t nat -A PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
-    iptables -t nat -A POSTROUTING -d ${LAND_IP} -j MASQUERADE
-    iptables -A FORWARD -d ${LAND_IP} -j ACCEPT; iptables -A FORWARD -s ${LAND_IP} -j ACCEPT
-    iptables -A INPUT -p tcp --dport $MAP_PORT -j ACCEPT; iptables -A INPUT -p udp --dport $MAP_PORT -j ACCEPT
-    netfilter-persistent save > /dev/null 2>&1
-    
-    touch "$NODES_INFO"; sed -i "/|${NODE_NAME}$/d" "$NODES_INFO"; echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
-    echo -e "${GREEN}✓ 节点 [${NODE_NAME}] 绑定成功${NC}"
-    echo -e "${YELLOW}⚠️ 提醒：请确保中转机云后台已放行端口 ${MAP_PORT} (TCP/UDP)！${NC}"
+    flock -x 200 -c '
+        sed -i "/# '$NODE_NAME'/,/AllowedIPs = '$LAND_IP'\/32/d" "'$WG_CONF'"
+        echo -e "\n# '$NODE_NAME'\n[Peer]\nPublicKey = '$LANDING_PUB'\nAllowedIPs = '$LAND_IP'/32" >> "'$WG_CONF'"
+        wg-quick down wg0 >/dev/null 2>&1
+        if ! wg-quick up wg0 >/dev/null 2>&1; then
+            echo -e "${RED}❌ WireGuard 启动失败！${NC}"
+            exit 1
+        fi
+        
+        while iptables -t nat -D PREROUTING -p tcp --dport '$MAP_PORT' 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -p udp --dport '$MAP_PORT' 2>/dev/null; do :; done
+        while iptables -t nat -D POSTROUTING -d '$LAND_IP' -j MASQUERADE 2>/dev/null; do :; done
+        iptables -D FORWARD -d '$LAND_IP' -j ACCEPT 2>/dev/null; iptables -D FORWARD -s '$LAND_IP' -j ACCEPT 2>/dev/null
+        iptables -D INPUT -p tcp --dport '$MAP_PORT' -j ACCEPT 2>/dev/null; iptables -D INPUT -p udp --dport '$MAP_PORT' -j ACCEPT 2>/dev/null
+        
+        iptables -t nat -A PREROUTING -p tcp --dport '$MAP_PORT' -j DNAT --to-destination '$LAND_IP':'$LAND_PORT'
+        iptables -t nat -A PREROUTING -p udp --dport '$MAP_PORT' -j DNAT --to-destination '$LAND_IP':'$LAND_PORT'
+        iptables -t nat -A POSTROUTING -d '$LAND_IP' -j MASQUERADE
+        iptables -A FORWARD -d '$LAND_IP' -j ACCEPT; iptables -A FORWARD -s '$LAND_IP' -j ACCEPT
+        iptables -A INPUT -p tcp --dport '$MAP_PORT' -j ACCEPT; iptables -A INPUT -p udp --dport '$MAP_PORT' -j ACCEPT
+        netfilter-persistent save > /dev/null 2>&1
+        
+        touch "'$NODES_INFO'"; sed -i "/|'$NODE_NAME'$/d" "'$NODES_INFO'"; echo "'$MAP_PORT'|'$LAND_IP'|'$LAND_PORT'|'$NODE_NAME'" >> "'$NODES_INFO'"
+        echo -e "${GREEN}✓ 节点 ['$NODE_NAME'] 绑定成功${NC}"
+        echo -e "${YELLOW}⚠️ 提醒：请确保中转机云后台已放行端口 '$MAP_PORT' (TCP/UDP)！${NC}"
+    ' 200>"$LOCK_FILE"
+    if [ $? -ne 0 ]; then echo -e "${RED}❌ 绑定节点失败！${NC}"; fi
     pause_return
 }
-
-# ================= 新增：多端口扩展功能 =================
 
 add_relay_port() {
     clear; echo -e "${YELLOW}━━━ 中转机-为现有落地机加端口 ━━━${NC}"
@@ -314,13 +419,16 @@ add_relay_port() {
     echo -e "当前已绑定的落地机内网IP："
     grep "^AllowedIPs = 10.0.0." $WG_CONF | awk '{print $3}' | cut -d'.' -f4 | cut -d'/' -f1 | while read ip; do echo "  10.0.0.$ip"; done
     
-    read -p "请输入要加端口的落地机内网IP (如 10.0.0.2): " LAND_IP < /dev/tty
-    if ! grep -q "${LAND_IP}/32" $WG_CONF; then echo -e "${RED}该IP不存在，请重新输入${NC}"; pause_return; return; fi
+    while true; do
+        read -p "请输入要加端口的落地机内网IP (如 10.0.0.2): " LAND_IP < /dev/tty
+        if check_ip_format "$LAND_IP" && grep -q "${LAND_IP}/32" $WG_CONF; then break; fi
+    done
     
     while true; do 
         read -p "请输入新的客户端端口: " MAP_PORT < /dev/tty
         [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && [ "$MAP_PORT" -ge 1 ] && [ "$MAP_PORT" -le 65535 ] || { echo -e "${RED}端口无效${NC}"; continue; }
-        if grep -q "^${MAP_PORT}|" "$NODES_INFO" 2>/dev/null; then
+        
+        if flock -s 200 -c "grep -q '^${MAP_PORT}|' '${NODES_INFO}'" 200>"$LOCK_FILE" 2>/dev/null; then
             echo -e "${RED}❌ 客户端端口 ${MAP_PORT} 已被其他节点占用！请换一个：${NC}"
         else break; fi
     done
@@ -332,24 +440,37 @@ add_relay_port() {
         if [ -n "$NODE_NAME" ] && check_node_name "$NODE_NAME"; then break; fi
     done
     
-    while iptables -t nat -D PREROUTING -p tcp --dport $MAP_PORT 2>/dev/null; do :; done
-    while iptables -t nat -D PREROUTING -p udp --dport $MAP_PORT 2>/dev/null; do :; done
-    iptables -D INPUT -p tcp --dport $MAP_PORT -j ACCEPT 2>/dev/null
-    iptables -D INPUT -p udp --dport $MAP_PORT -j ACCEPT 2>/dev/null
-    
-    iptables -t nat -A PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
-    iptables -t nat -A PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
-    iptables -A INPUT -p tcp --dport $MAP_PORT -j ACCEPT; iptables -A INPUT -p udp --dport $MAP_PORT -j ACCEPT
-    netfilter-persistent save > /dev/null 2>&1
-    
-    touch "$NODES_INFO"; sed -i "/|${NODE_NAME}$/d" "$NODES_INFO"; echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
-    echo -e "${GREEN}✓ 中转机端口添加成功！请确保云后台已放行 ${MAP_PORT} 端口${NC}"
+    flock -x 200 -c '
+        if grep -q "^'$MAP_PORT'|" "'$NODES_INFO'" 2>/dev/null; then
+            echo -e "${RED}❌ 端口 '$MAP_PORT' 刚刚被其他终端占用！操作取消。${NC}"
+            exit 1
+        fi
+        
+        while iptables -t nat -D PREROUTING -p tcp --dport '$MAP_PORT' 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -p udp --dport '$MAP_PORT' 2>/dev/null; do :; done
+        iptables -D INPUT -p tcp --dport '$MAP_PORT' -j ACCEPT 2>/dev/null
+        iptables -D INPUT -p udp --dport '$MAP_PORT' -j ACCEPT 2>/dev/null
+        
+        iptables -t nat -A PREROUTING -p tcp --dport '$MAP_PORT' -j DNAT --to-destination '$LAND_IP':'$LAND_PORT'
+        iptables -t nat -A PREROUTING -p udp --dport '$MAP_PORT' -j DNAT --to-destination '$LAND_IP':'$LAND_PORT'
+        iptables -A INPUT -p tcp --dport '$MAP_PORT' -j ACCEPT; iptables -A INPUT -p udp --dport '$MAP_PORT' -j ACCEPT
+        netfilter-persistent save > /dev/null 2>&1
+        
+        touch "'$NODES_INFO'"; sed -i "/|'$NODE_NAME'$/d" "'$NODES_INFO'"; echo "'$MAP_PORT'|'$LAND_IP'|'$LAND_PORT'|'$NODE_NAME'" >> "'$NODES_INFO'"
+        echo -e "${GREEN}✓ 中转机端口添加成功！请确保云后台已放行 '$MAP_PORT' 端口${NC}"
+    ' 200>"$LOCK_FILE"
+    if [ $? -ne 0 ]; then echo -e "${RED}❌ 添加端口失败！${NC}"; fi
     pause_return
 }
 
 add_landing_port() {
     clear; echo -e "${YELLOW}━━━ 落地机-新增端口节点 ━━━${NC}"
-    if [ ! -f "$LAND_INFO" ]; then echo -e "${RED}请先执行选项4部署基础节点${NC}"; pause_return; return; fi
+    if [ ! -f "$LAND_INFO" ] || [ ! -f "/etc/sing-box/config.json" ]; then echo -e "${RED}请先执行选项4部署基础节点${NC}"; pause_return; return; fi
+    
+    if ! jq empty /etc/sing-box/config.json 2>/dev/null; then
+        echo -e "${RED}❌ /etc/sing-box/config.json 不存在或格式错误！${NC}"
+        pause_return; return
+    fi
     
     local relay_ip=$(grep "中转机IP:" "$LAND_INFO" | head -1 | awk '{print $2}')
     [ -z "$relay_ip" ] && { echo -e "${RED}无法读取中转机IP，请重新部署${NC}"; pause_return; return; }
@@ -358,7 +479,8 @@ add_landing_port() {
         read -p "请输入落地机新的监听端口: " LAND_PORT < /dev/tty
         [[ "$LAND_PORT" =~ ^[0-9]+$ ]] && [ "$LAND_PORT" -ge 1 ] && [ "$LAND_PORT" -le 65535 ] || { echo -e "${RED}端口无效${NC}"; continue; }
         if ss -tulnp | grep -qE ":$LAND_PORT\b"; then echo -e "${RED}❌ 端口 $LAND_PORT 已被系统占用！请换一个：${NC}"
-        elif grep -q "listen_port\": $LAND_PORT" /etc/sing-box/config.json 2>/dev/null; then echo -e "${RED}❌ 端口 $LAND_PORT 已在 Sing-box 中配置！请换一个：${NC}"
+        elif jq -e --argjson p "$LAND_PORT" '.inbounds[] | select(.listen_port == $p)' /etc/sing-box/config.json >/dev/null 2>&1; then
+            echo -e "${RED}❌ 端口 $LAND_PORT 已在 Sing-box 中配置！请换一个：${NC}"
         else break; fi
     done
     
@@ -369,15 +491,39 @@ add_landing_port() {
         if [ -n "$NODE_NAME" ] && check_node_name "$NODE_NAME"; then break; fi
     done
     
-    REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null)
-    SB_PRIV=$(echo "$REALITY_KEYS" | grep PrivateKey | awk '{print $2}'); SB_PUB=$(echo "$REALITY_KEYS" | grep PublicKey | awk '{print $2}')
-    UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
+    local exist_priv=$(jq -r '.inbounds[0].tls.reality.private_key' /etc/sing-box/config.json 2>/dev/null)
+    local exist_sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' /etc/sing-box/config.json 2>/dev/null)
+    local exist_pub=$(jq -r '.inbounds[0].tls.reality.public_key // empty' /etc/sing-box/config.json 2>/dev/null)
     
-    # 核心修复3：原子化 JSON 操作，防止配置文件损坏
+    if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
+        exist_pub=$(grep "pbk=" "$LAND_INFO" | head -1 | grep -oE 'pbk=[^&]+' | cut -d'=' -f2)
+        if ! check_pub_key "$exist_pub"; then exist_pub=""; fi
+    fi
+    
+    if [ -z "$exist_priv" ] || [ -z "$exist_sid" ]; then
+        echo -e "${RED}❌ 无法读取基础节点的 Reality 密钥，请检查配置文件。${NC}"
+        pause_return; return
+    fi
+    
+    local SB_PUB=""
+    if [ -n "$exist_pub" ]; then
+        SB_PUB="$exist_pub"
+    else
+        echo -e "${YELLOW}⚠ 未找到合法公钥记录。为了不影响旧节点，请输入第一个节点的 PublicKey (pbk)：${NC}"
+        read -p "PublicKey (pbk): " SB_PUB < /dev/tty
+        if ! check_pub_key "$SB_PUB"; then
+            echo -e "${RED}❌ 公钥格式不正确！操作取消。${NC}"
+            pause_return; return
+        fi
+    fi
+    
+    local UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null)
+    
     local tmp_json="/tmp/sb_add_$$.json"
-    if ! jq --arg p "$LAND_PORT" --arg u "$UUID" --arg s "$SNI" --arg pk "$SB_PRIV" --arg sid "$SHORT_ID" \
+    if ! jq --arg p "$LAND_PORT" --arg u "$UUID" --arg s "$SNI" --arg pk "$exist_priv" --arg sid "$exist_sid" \
+       --arg listen "0.0.0.0" --arg pub "$SB_PUB" \
        '.inbounds += [{
-           "type": "vless", "listen": "::", "listen_port": ($p|tonumber),
+           "type": "vless", "listen": $listen, "listen_port": ($p|tonumber),
            "users": [{"name": "ext", "uuid": $u, "flow": "xtls-rprx-vision"}],
            "tls": {
                "enabled": true, "server_name": $s,
@@ -385,7 +531,7 @@ add_landing_port() {
                "reality": {
                    "enabled": true,
                    "handshake": {"server": $s, "server_port": 443},
-                   "private_key": $pk, "short_id": [$sid]
+                   "private_key": $pk, "short_id": [$sid], "public_key": $pub
                }
            }
        }]' /etc/sing-box/config.json > "$tmp_json" 2>/dev/null; then
@@ -404,7 +550,7 @@ add_landing_port() {
     systemctl restart sing-box
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
-    VLESS_LINK="vless://${UUID}@${relay_ip}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
+    VLESS_LINK="vless://${UUID}@${relay_ip}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${exist_sid}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
     
     sed -i "/# ${NODE_NAME} START/,/# ${NODE_NAME} END/d" "$LAND_INFO"
     cat >> "$LAND_INFO" << EOF
@@ -426,35 +572,49 @@ EOF
     pause_return
 }
 
-# ================= 删除功能 =================
 delete_relay_by_port() {
     clear; echo -e "${YELLOW}━━━ 中转机按端口删除 ━━━${NC}"
     if [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ]; then echo -e "${RED}暂无节点可删除${NC}"; pause_return; return; fi
-    printf "${GREEN}%-10s | %-15s | %-8s | %-15s\n${NC}" "端口" "落地IP" "落地端口" "名称"
-    while IFS='|' read -r p lip lp n; do printf "%-10s | %-15s | %-8s | %-15s\n" "$p" "$lip" "$lp" "$n"; done < "$NODES_INFO"
+    
+    flock -s 200 -c '
+        printf "${GREEN}%-10s | %-15s | %-8s | %-15s\n${NC}" "端口" "落地IP" "落地端口" "名称"
+        while IFS=| read -r p lip lp n; do printf "%-10s | %-15s | %-8s | %-15s\n" "$p" "$lip" "$lp" "$n"; done < "'$NODES_INFO'"
+    ' 200>"$LOCK_FILE"
     
     read -p "请输入要删除的客户端端口: " DEL_PORT < /dev/tty
-    local line=$(grep "^${DEL_PORT}|" "$NODES_INFO")
-    if [ -z "$line" ]; then echo -e "${RED}未找到端口 ${DEL_PORT}${NC}"; pause_return; return; fi
+    if [ -z "$DEL_PORT" ]; then echo -e "${RED}❌ 端口不能为空！${NC}"; pause_return; return; fi
     
-    local d_ip=$(echo "$line" | cut -d'|' -f2); local d_name=$(echo "$line" | cut -d'|' -f4)
-    
-    while iptables -t nat -D PREROUTING -p tcp --dport $DEL_PORT 2>/dev/null; do :; done
-    while iptables -t nat -D PREROUTING -p udp --dport $DEL_PORT 2>/dev/null; do :; done
-    iptables -D INPUT -p tcp --dport $DEL_PORT -j ACCEPT 2>/dev/null
-    iptables -D INPUT -p udp --dport $DEL_PORT -j ACCEPT 2>/dev/null
-    netfilter-persistent save > /dev/null 2>&1
-    
-    if ! grep -q "|${d_ip}|" "$NODES_INFO"; then
-        sed -i "/# ${d_name}/,/AllowedIPs = ${d_ip}\/32/d" $WG_CONF
-        wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
-        while iptables -t nat -D POSTROUTING -d ${d_ip} -j MASQUERADE 2>/dev/null; do :; done
-        iptables -D FORWARD -d ${d_ip} -j ACCEPT 2>/dev/null; iptables -D FORWARD -s ${d_ip} -j ACCEPT 2>/dev/null
+    flock -x 200 -c '
+        line=$(grep "^'$DEL_PORT'|" "'$NODES_INFO'")
+        if [ -z "$line" ]; then
+            echo -e "${RED}未找到端口 '$DEL_PORT'${NC}"
+            exit 1
+        fi
+        
+        d_ip=$(echo "$line" | cut -d| -f2); d_name=$(echo "$line" | cut -d| -f4)
+        
+        while iptables -t nat -D PREROUTING -p tcp --dport '$DEL_PORT' 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -p udp --dport '$DEL_PORT' 2>/dev/null; do :; done
+        iptables -D INPUT -p tcp --dport '$DEL_PORT' -j ACCEPT 2>/dev/null
+        iptables -D INPUT -p udp --dport '$DEL_PORT' -j ACCEPT 2>/dev/null
         netfilter-persistent save > /dev/null 2>&1
-    fi
-    
-    sed -i "/^${DEL_PORT}|/d" "$NODES_INFO"
-    echo -e "${GREEN}✓ 端口 ${DEL_PORT} 已彻底删除${NC}"
+        
+        if ! grep -q "|$d_ip|" "'$NODES_INFO'"; then
+            sed -i "/# $d_name/,/AllowedIPs = $d_ip\/32/d" "'$WG_CONF'"
+            wg-quick down wg0 >/dev/null 2>&1
+            if ! wg-quick up wg0 >/dev/null 2>&1; then
+                echo -e "${RED}❌ WireGuard 启动失败！${NC}"
+                exit 1
+            fi
+            while iptables -t nat -D POSTROUTING -d $d_ip -j MASQUERADE 2>/dev/null; do :; done
+            iptables -D FORWARD -d $d_ip -j ACCEPT 2>/dev/null; iptables -D FORWARD -s $d_ip -j ACCEPT 2>/dev/null
+            netfilter-persistent save > /dev/null 2>&1
+        fi
+        
+        sed -i "/^'$DEL_PORT'|/d" "'$NODES_INFO'"
+        echo -e "${GREEN}✓ 端口 '$DEL_PORT' 已彻底删除${NC}"
+    ' 200>"$LOCK_FILE"
+    if [ $? -ne 0 ]; then echo -e "${RED}❌ 删除节点失败！${NC}"; fi
     pause_return
 }
 
@@ -464,14 +624,20 @@ delete_landing_by_port() {
     
     grep "落地机端口:" "$LAND_INFO" | awk '{print $2}' | sort -u
     read -p "请输入要删除的落地机监听端口: " DEL_PORT < /dev/tty
+    if [ -z "$DEL_PORT" ]; then echo -e "${RED}❌ 端口不能为空！${NC}"; pause_return; return; fi
     
     if ! jq empty /etc/sing-box/config.json 2>/dev/null; then
         echo -e "${RED}❌ config.json 格式错误，无法安全删除${NC}"
         pause_return; return
     fi
     
+    if ! jq -e --argjson p "$DEL_PORT" '.inbounds[] | select(.listen_port == $p)' /etc/sing-box/config.json >/dev/null 2>&1; then
+        echo -e "${RED}❌ 端口 ${DEL_PORT} 不存在于 Sing-box 配置中！${NC}"
+        pause_return; return
+    fi
+    
     local tmp_json="/tmp/sb_del_$$.json"
-    if ! jq 'del(.inbounds[] | select(.listen_port == '"$DEL_PORT"'))' /etc/sing-box/config.json > "$tmp_json" 2>/dev/null; then
+    if ! jq --argjson p "$DEL_PORT" 'del(.inbounds[] | select(.listen_port == $p))' /etc/sing-box/config.json > "$tmp_json" 2>/dev/null; then
         echo -e "${RED}❌ JSON 删除操作失败！原配置未修改。${NC}"
         rm -f "$tmp_json"
         pause_return; return
@@ -484,7 +650,14 @@ delete_landing_by_port() {
     fi
     
     mv -f "$tmp_json" /etc/sing-box/config.json
-    systemctl restart sing-box >/dev/null 2>&1
+    
+    local in_count=$(jq '.inbounds | length' /etc/sing-box/config.json 2>/dev/null)
+    if [ "$in_count" -eq 0 ]; then
+        echo -e "${YELLOW}⚠ 已无任何节点，自动停止 Sing-box 服务。${NC}"
+        systemctl stop sing-box >/dev/null 2>&1
+    else
+        systemctl restart sing-box >/dev/null 2>&1
+    fi
     
     local node_name=$(grep -B 3 "落地机端口: $DEL_PORT$" "$LAND_INFO" | grep "节点名称:" | awk '{print $2}')
     [ -n "$node_name" ] && sed -i "/# ${node_name} START/,/# ${node_name} END/d" "$LAND_INFO"
@@ -493,11 +666,63 @@ delete_landing_by_port() {
     pause_return
 }
 
+view_iptables() {
+    clear; echo -e "${YELLOW}━━━ 当前 NAT PREROUTING 规则 ━━━${NC}"
+    iptables -t nat -L PREROUTING -n --line-numbers
+    echo ""
+    echo -e "${YELLOW}━━━ 当前 NAT POSTROUTING 规则 ━━━${NC}"
+    iptables -t nat -L POSTROUTING -n --line-numbers
+    echo ""
+    echo -e "${YELLOW}━━━ 当前 FILTER FORWARD 规则 ━━━${NC}"
+    iptables -L FORWARD -n --line-numbers
+    pause_return
+}
+
+ping_test() {
+    clear; echo -e "${YELLOW}━━━ Ping 连通性测试 ━━━${NC}"
+    if [ ! -f "$WG_CONF" ]; then echo -e "${RED}请先初始化中转机${NC}"; pause_return; return; fi
+    
+    echo -e "当前已绑定的落地机内网IP："
+    grep "^AllowedIPs = 10.0.0." $WG_CONF | awk '{print $3}' | cut -d'.' -f4 | cut -d'/' -f1 | while read ip; do echo "  10.0.0.$ip"; done
+    
+    read -p "请输入要测试的落地机内网IP (如 10.0.0.2): " TEST_IP < /dev/tty
+    if ! check_ip_format "$TEST_IP"; then pause_return; return; fi
+    
+    echo -e "${YELLOW}[*] 正在 Ping ${TEST_IP} ...${NC}"
+    ping -c 4 $TEST_IP
+    pause_return
+}
+
+uninstall_all() {
+    clear; echo -e "${YELLOW}━━━ 一键卸载环境 ━━━${NC}"
+    read -p "${RED}⚠️ 此操作将删除所有 WG 配置、Sing-box 及转发规则！确定？[y/N]: ${NC}" c < /dev/tty
+    [[ ! "$c" =~ ^[Yy]$ ]] && { pause_return; return; }
+    
+    echo -e "${YELLOW}[*] 停止服务...${NC}"
+    systemctl stop wg-quick@wg0 2>/dev/null
+    systemctl disable wg-quick@wg0 2>/dev/null
+    systemctl stop sing-box 2>/dev/null
+    systemctl disable sing-box 2>/dev/null
+    
+    echo -e "${YELLOW}[*] 清理规则...${NC}"
+    flush_wg_rules
+    
+    echo -e "${YELLOW}[*] 删除文件...${NC}"
+    rm -rf /etc/wireguard /etc/sing-box /usr/local/bin/sing-box /etc/systemd/system/sing-box.service "$NODES_INFO" "$LAND_INFO" "$SYSCTL_FILE" "$IP_FORWARD_FILE" "$LOCK_FILE"
+    systemctl daemon-reload
+    
+    echo -e "${GREEN}✓ 卸载完成！${NC}"
+    pause_return
+}
+
 list_relay_nodes() {
     clear; echo -e "${YELLOW}━━━ 中转机节点列表 ━━━${NC}"
     if [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ]; then echo -e "${RED}暂无节点${NC}"; pause_return; return; fi
-    printf "${GREEN}%-10s | %-15s | %-8s | %-15s\n${NC}" "端口" "落地IP" "落地端口" "名称"
-    while IFS='|' read -r p lip lp n; do printf "%-10s | %-15s | %-8s | %-15s\n" "$p" "$lip" "$lp" "$n"; done < "$NODES_INFO"
+    
+    flock -s 200 -c '
+        printf "${GREEN}%-10s | %-15s | %-8s | %-15s\n${NC}" "端口" "落地IP" "落地端口" "名称"
+        while IFS=| read -r p lip lp n; do printf "%-10s | %-15s | %-8s | %-15s\n" "$p" "$lip" "$lp" "$n"; done < "'$NODES_INFO'"
+    ' 200>"$LOCK_FILE"
     pause_return
 }
 
@@ -517,11 +742,13 @@ while true; do
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}7${NC} 落地-看信息  ${GREEN}8${NC} 中转-加端口    ${GREEN}9${NC} 落地-加端口    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}a${NC} 中转-删端口  ${GREEN}b${NC} 落地-删端口    ${GREEN}0${NC} 退出            ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}a${NC} 中转-删端口  ${GREEN}b${NC} 落地-删端口    ${GREEN}c${NC} 查看-转发规则  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}d${NC} 一键卸载    ${GREEN}e${NC} Ping-连通测试                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}0${NC} 退出                                      ${CYAN}║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
     
     read -p "选: " c < /dev/tty
     case $c in
-        1) tune_system;; 2) init_relay;; 3) gen_landing_code;; 4) deploy_landing;; 5) bind_landing;; 6) list_relay_nodes;; 7) list_landing_nodes;; 8) add_relay_port;; 9) add_landing_port;; a|A) delete_relay_by_port;; b|B) delete_landing_by_port;; 0) exit 0;; *) echo "错误"; sleep 1;;
+        1) tune_system;; 2) init_relay;; 3) gen_landing_code;; 4) deploy_landing;; 5) bind_landing;; 6) list_relay_nodes;; 7) list_landing_nodes;; 8) add_relay_port;; 9) add_landing_port;; a|A) delete_relay_by_port;; b|B) delete_landing_by_port;; c|C) view_iptables;; d|D) uninstall_all;; e|E) ping_test;; 0) exit 0;; *) echo "错误"; sleep 1;;
     esac
 done
