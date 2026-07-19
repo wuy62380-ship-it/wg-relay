@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v132.0 (极简安装版)
-# 修复：简化 XanMod 安装逻辑，去除复杂正则，直接尝试安装
+# WireGuard 智能中转部署脚本 v132.1 (极简安装版)
+# 修复：融合高阶 XanMod BBRv3 安装逻辑，支持精准指令集检测与架构适配
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -131,6 +131,49 @@ force_sync_time() {
 
 url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
 
+# ================= 高阶 XanMod BBRv3 安装支持函数 =================
+xanmod_add_repo() {
+    local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg" list_file="/etc/apt/sources.list.d/xanmod-release.list" os_codename=""
+    if command -v lsb_release >/dev/null 2>&1; then os_codename=$(lsb_release -sc); elif [ -r /etc/os-release ]; then os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME"); fi
+    if ! echo "bookworm trixie forky sid noble plucky" | grep -qw "$os_codename"; then os_codename="releases"; fi
+    if echo "jammy focal buster releases" | grep -qw "$os_codename"; then echo -e "${RED}❌ XanMod 已停止支持当前系统版本${NC}"; return 1; fi
+    [ -z "$os_codename" ] && { echo -e "${RED}无法获取系统代号${NC}"; return 1; }
+    
+    rm -f "$list_file"
+    wget -qO - "https://dl.xanmod.org/archive.key" | gpg --dearmor -o "$keyring" --yes 2>/dev/null
+    if [ ! -s "$keyring" ]; then
+        echo -e "${RED}❌ XanMod 密钥下载失败！请检查网络或代理设置。${NC}"
+        return 1
+    fi
+    chmod 644 "$keyring"
+    echo "deb [signed-by=$keyring] http://deb.xanmod.org $os_codename main" > "$list_file"
+}
+
+xanmod_detect_package() {
+    local arch=$(uname -m)
+    if [ "$arch" = "aarch64" ]; then
+        if apt-cache policy "linux-xanmod-arm64" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+            printf '%s\n' "linux-xanmod-arm64"; return 0
+        fi
+        return 1
+    fi
+
+    local psabi_level=$(awk -F: '/^flags/{ if(/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level=1; if(level==1&&/cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level=2; if(level==2&&/avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level=3; if(level>0){print level;exit} }' /proc/cpuinfo 2>/dev/null)
+    if [ -z "$psabi_level" ]; then return 1; fi
+    [ "$psabi_level" -gt 3 ] && psabi_level=3
+    for prefix in linux-xanmod linux-xanmod-lts; do 
+        local l="$psabi_level"
+        while [ "$l" -ge 1 ]; do 
+            local p="${prefix}-x64v${l}"
+            if apt-cache policy "$p" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+                printf '%s\n' "$p"; return 0
+            fi
+            l=$((l-1))
+        done
+    done
+    return 1
+}
+
 tune_system() {
     clear; echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
     
@@ -147,29 +190,22 @@ tune_system() {
     case "$tune_choice" in
         2)
             echo -e "${YELLOW}[*] 开始安装 XanMod BBRv3 内核...${NC}"
-            local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
-            rm -f /etc/apt/sources.list.d/xanmod-release.list
-            wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o "$keyring" --yes 2>/dev/null
-            echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list > /dev/null
-            kill_apt_locks
-            apt-get update -y > /dev/null 2>&1
             
-            # 极简安装逻辑：直接尝试安装，不搞复杂的正则
-            local pkg_name=""
-            for p in linux-xanmod-x64v3 linux-xanmod-x64v2 linux-xanmod-x64v1 linux-xanmod-lts-x64v3 linux-xanmod-lts-x64v2 linux-xanmod-lts-x64v1; do
-                if apt-cache show "$p" 2>/dev/null | grep -q 'Package:'; then
-                    pkg_name="$p"
-                    break
-                fi
-            done
-            
-            if [ -z "$pkg_name" ]; then
-                echo -e "${RED}❌ 找不到适合的 XanMod 内核包，回退原版 BBR。${NC}"
+            if ! xanmod_add_repo; then
+                echo -e "${RED}❌ XanMod 源添加失败，回退原版 BBR。${NC}"
                 tune_choice=1
             else
-                echo -e "${GREEN}✓ 检测到适合: ${pkg_name}，开始下载安装 (请耐心等待)...${NC}"
-                if apt-get install -y "$pkg_name"; then
-                    cat > "$SYSCTL_FILE" << EOF
+                kill_apt_locks
+                apt-get update -y > /dev/null 2>&1
+                local pkg_name=$(xanmod_detect_package)
+                
+                if [ -z "$pkg_name" ]; then
+                    echo -e "${RED}❌ 找不到适合当前架构/CPU指令集的 XanMod 内核包，回退原版 BBR。${NC}"
+                    tune_choice=1
+                else
+                    echo -e "${GREEN}✓ 检测到适合: ${pkg_name}，开始下载安装 (请耐心等待)...${NC}"
+                    if apt-get install -y "$pkg_name"; then
+                        cat > "$SYSCTL_FILE" << EOF
 # XanMod BBRv3 专属优化
 net.core.default_qdisc = fq_pie
 net.ipv4.tcp_congestion_control = bbr
@@ -183,15 +219,16 @@ net.ipv4.ip_forward = 1
 net.netfilter.nf_conntrack_max = $conntrack_max
 vm.swappiness = 10
 EOF
-                    sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
-                    for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
-                    echo -e "${GREEN}✓ BBRv3 安装成功！请务必重启服务器后再进行后续操作。${NC}"
-                    read -p "按回车键重启服务器..." < /dev/tty
-                    reboot
-                    exit 0
-                else
-                    echo -e "${RED}✘ XanMod 安装失败，回退原版 BBR。${NC}"
-                    tune_choice=1
+                        sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
+                        for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
+                        echo -e "${GREEN}✓ BBRv3 安装成功！请务必重启服务器后再进行后续操作。${NC}"
+                        read -p "按回车键重启服务器..." < /dev/tty
+                        reboot
+                        exit 0
+                    else
+                        echo -e "${RED}✘ XanMod 安装失败，回退原版 BBR。${NC}"
+                        tune_choice=1
+                    fi
                 fi
             fi
             ;;
@@ -564,7 +601,7 @@ add_landing_port() {
     local exist_pub=$(jq -r '.inbounds[0].tls.reality.public_key // empty' /etc/sing-box/config.json 2>/dev/null)
     
     if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
-        exist_pub=$(grep "pbk=" "$LAND_INFO" | head -1 | grep -oE 'pbk=[^&]+' | cut -d'=' -f2)
+        exist_pub=$(grep -oE 'pbk=[a-zA-Z0-9+/]+=?' "$LAND_INFO" | head -1 | cut -d'=' -f2)
         if ! check_pub_key "$exist_pub"; then exist_pub=""; fi
     fi
     
@@ -811,7 +848,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v132.0 (极简安装版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v132.1 (极简安装版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
