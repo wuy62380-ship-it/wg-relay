@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v18.0 (绝对纯净防卡版)
+# WireGuard 智能中转部署脚本 v19.0 (彻底解决网络卡死版)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -10,7 +10,6 @@ LAND_INFO="/etc/wireguard/landing_info.txt"
 WG_PORT="51820"
 SYSCTL_FILE="/etc/sysctl.d/99-yw-optimize.conf"
 
-# 强制设为非交互模式，防止 apt 弹出配置提示卡死
 export DEBIAN_FRONTEND=noninteractive
 
 # ================= 基础检查 =================
@@ -36,9 +35,9 @@ prepare_env() {
     echo -e "${YELLOW}正在准备基础环境...${NC}"
     systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
     kill_apt_locks
-    # 移除 timeout 命令依赖，直接执行，apt 会自动处理
-    apt-get update -y > /dev/null 2>&1
-    apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl > /dev/null 2>&1
+    # 增加 APT 超时参数，防止下载卡死
+    apt-get -o Acquire::http::Timeout="15" -o Acquire::https::Timeout="15" update -y > /dev/null 2>&1
+    apt-get -o Acquire::http::Timeout="15" -o Acquire::https::Timeout="15" install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
     echo -e "${GREEN}✓ 环境准备完毕！${NC}"
     sleep 1
@@ -53,7 +52,7 @@ get_pub_ip() {
 # ================= 内置 Sing-box 安装 =================
 install_singbox() {
     if command -v sing-box &> /dev/null; then return 0; fi
-    echo -e "${YELLOW}[*] 正在内置下载 Sing-box...${NC}"
+    echo -e "${YELLOW}[*] 正在内置下载 Sing-box (最多等待30秒)...${NC}"
     ARCH=$(uname -m)
     if [ "$ARCH" == "x86_64" ]; then SB_ARCH="amd64";
     elif [ "$ARCH" == "aarch64" ]; then SB_ARCH="arm64";
@@ -62,7 +61,8 @@ install_singbox() {
     SB_VER="1.8.5"
     URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
     
-    wget -qO /tmp/sb.tar.gz "$URL" || wget -qO /tmp/sb.tar.gz "https://ghproxy.net/$URL"
+    # 修复: wget 增加 -T 15 (超时15秒) -t 2 (重试2次)
+    wget -T 15 -t 2 -qO /tmp/sb.tar.gz "$URL" || wget -T 15 -t 2 -qO /tmp/sb.tar.gz "https://ghproxy.net/$URL"
     if [ ! -s /tmp/sb.tar.gz ]; then echo -e "${RED}Sing-box 下载失败！请检查网络。${NC}"; return 1; fi
     
     tar -xzf /tmp/sb.tar.gz -C /tmp
@@ -120,7 +120,9 @@ select_best_domain() {
         local t1 t2 ms
         t1=$(date +%s%3N 2>/dev/null)
         [[ ! "$t1" =~ ^[0-9]+$ ]] && t1=$(date +%s)000
-        if timeout 2 openssl s_client -connect "${domain}:443" -servername "${domain}" </dev/null &>/dev/null; then
+        
+        # 修复: 放弃 timeout openssl，改用 curl -m 2 测速，兼容所有精简系统
+        if curl -m 2 -sI -o /dev/null -w "%{http_code}" "https://${domain}" >/dev/null 2>&1; then
             t2=$(date +%s%3N 2>/dev/null)
             [[ ! "$t2" =~ ^[0-9]+$ ]] && t2=$(date +%s)000
             ms=$((t2 - t1))
@@ -154,6 +156,7 @@ xanmod_add_repo() {
     apt-get install -y wget gnupg ca-certificates >/dev/null 2>&1; mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
     
     echo -e "${YELLOW}  - 下载 XanMod 密钥...${NC}"
+    # 修复: wget 增加超时
     if ! wget -T 15 -t 2 -qO /tmp/xanmod.key "https://dl.xanmod.org/archive.key"; then
         echo -e "${RED}❌ 密钥下载失败！${NC}"; return 1
     fi
@@ -495,7 +498,7 @@ check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   WireGuard 智能中转 v18.0 (YW版)           ║${NC}"
+    echo -e "${CYAN}║   WireGuard 智能中转 v19.0 (彻底解决网络卡死版)       ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (智能CPU检测安装BBRv3+极限调优)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
