@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v10.1 (终极一体化完整版)
+# WireGuard 智能中转部署脚本 v10.2 (智能BBRv3+内置Singbox)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -10,7 +10,6 @@ SYSCTL_FILE="/etc/sysctl.d/99-wg-tune.conf"
 
 # ================= 基础检查 =================
 check_root() { [ "$EUID" -ne 0 ] && echo -e "${RED}请使用root运行${NC}" && exit 1; }
-
 check_system() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
@@ -21,16 +20,14 @@ check_system() {
         echo -e "${RED}⚠️ 无法识别操作系统${NC}"; exit 1
     fi
 }
-
 prepare_env() {
-    echo -e "${YELLOW}正在准备基础环境 (1分钟)...${NC}"
+    echo -e "${YELLOW}正在准备基础环境...${NC}"
     apt update -y > /dev/null 2>&1
     apt install -y curl wget gnupg ca-certificates iptables iptables-persistent tar > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
     echo -e "${GREEN}✓ 环境准备完毕！${NC}"
     sleep 1
 }
-
 get_pub_ip() {
     local ip=$(curl -s -m 3 -4 ifconfig.me || curl -s -m 3 -4 ip.sb || curl -s -m 3 -4 api.ipify.org)
     if [ -z "$ip" ]; then echo -e "${RED}无法获取公网IP${NC}"; exit 1; fi
@@ -48,13 +45,8 @@ install_singbox() {
     
     SB_VER="1.8.5"
     URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
-    
-    # 优先直连，失败走加速
     wget -qO /tmp/sb.tar.gz "$URL" || wget -qO /tmp/sb.tar.gz "https://ghproxy.net/$URL"
-    if [ ! -s /tmp/sb.tar.gz ]; then
-        echo -e "${RED}Sing-box 下载失败！请检查网络。${NC}"
-        return 1
-    fi
+    if [ ! -s /tmp/sb.tar.gz ]; then echo -e "${RED}Sing-box 下载失败！${NC}"; return 1; fi
     
     tar -xzf /tmp/sb.tar.gz -C /tmp
     mv /tmp/sing-box-${SB_VER}-linux-${SB_ARCH}/sing-box /usr/local/bin/
@@ -97,6 +89,21 @@ EOF
     sysctl -p "$CONF" > /dev/null 2>&1
 }
 
+# 智能检测 CPU 支持的 XanMod 版本
+xanmod_detect_package() {
+    local psabi_level=$(awk 'BEGIN{ while(!/flags/) if(getline<"/proc/cpuinfo"!=1) exit 1; if(/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level=1; if(level==1&&/cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level=2; if(level==2&&/avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level=3; if(level>0){print level;exit}}' /proc/cpuinfo 2>/dev/null) || return 1
+    [ "$psabi_level" -gt 3 ] && psabi_level=3
+    for prefix in linux-xanmod linux-xanmod-lts; do 
+        local l="$psabi_level"
+        while [ "$l" -ge 1 ]; do 
+            local p="${prefix}-x64v${l}"
+            if apt-cache policy "$p" 2>/dev/null | grep -q 'Candidate: [^ ]'; then printf '%s\n' "$p"; return 0; fi
+            l=$((l-1))
+        done
+    done
+    return 1
+}
+
 tune_system() {
     clear
     echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
@@ -111,20 +118,27 @@ tune_system() {
         echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main" > /etc/apt/sources.list.d/xanmod-release.list
         
         echo -e "${YELLOW}正在更新软件源...${NC}"
-        apt update 2>&1 | tail -n 1
+        apt update 2>&1 | tail -n 2
         
-        # 自动检测 CPU 支持的内核版本
-        CPU_LEVEL=$(awk 'BEGIN{ while(!/flags/) if(getline<"/proc/cpuinfo"!=1) exit 1; if(/avx2/&&/bmi1/&&/bmi2/&&/fma/) level=3; else if(/avx/&&/aes/) level=2; else level=1; print level }')
-        XANMOD_PKG="linux-xanmod-x64v${CPU_LEVEL}"
-        echo -e "${YELLOW}检测到 CPU 级别 v${CPU_LEVEL}，正在安装 ${XANMOD_PKG}...${NC}"
-        
-        if apt install -y ${XANMOD_PKG}; then
-            echo -e "${GREEN}✓ XanMod 内核安装成功！请重启服务器后再次运行本脚本，选择选项1应用调优。${NC}"
-            read -p "按回车键重启..." && reboot
-        else
-            echo -e "${RED}✘ XanMod 内核安装失败（可能是 CPU 不支持或网络问题）。${NC}"
+        echo -e "${YELLOW}正在检测 CPU 支持的内核版本...${NC}"
+        local pkg_name=$(xanmod_detect_package)
+        if [ -z "$pkg_name" ]; then
+            echo -e "${RED}✘ 无法找到适合的 XanMod 内核包！${NC}"
             echo -e "${YELLOW}自动回退到普通 BBR 调优模式...${NC}"
             apply_gateway_tune
+        else
+            echo -e "${GREEN}✓ 检测到适合: ${pkg_name}${NC}"
+            echo -e "${YELLOW}开始安装 (过程可能较慢)...${NC}"
+            if apt install -y ${pkg_name}; then
+                echo -e "net.core.default_qdisc = fq_pie\nnet.ipv4.tcp_congestion_control = bbr" > ${SYSCTL_FILE}
+                sysctl --system >/dev/null 2>&1
+                echo -e "\n${GREEN}✓ 内核安装成功！请重启服务器后再次运行本脚本，选择选项1应用调优。${NC}"
+                read -p "按回车键重启..." && reboot
+            else
+                echo -e "${RED}✘ XanMod 内核安装失败。${NC}"
+                echo -e "${YELLOW}自动回退到普通 BBR 调优模式...${NC}"
+                apply_gateway_tune
+            fi
         fi
     fi
     echo -e "${GREEN}✓ 优化完成！${NC}"
@@ -279,9 +293,9 @@ check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v10.1 (终极完整版)      ║${NC}"
+    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v10.2 (智能BBRv3版)     ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (内置BBRv3内核安装+网关调优)        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (智能检测CPU安装BBRv3)               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}2${NC}  [中转机] 初始化网关                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}3${NC}  [中转机] 生成落地部署码 (可自定义端口)            ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}4${NC}  [落地机] 粘贴部署码一键部署 (内置Sing-box下载)    ${CYAN}║${NC}"
