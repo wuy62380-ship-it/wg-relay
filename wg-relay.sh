@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v10.0 (终极一体化版)
+# WireGuard 智能中转部署脚本 v10.1 (终极一体化完整版)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -27,6 +27,8 @@ prepare_env() {
     apt update -y > /dev/null 2>&1
     apt install -y curl wget gnupg ca-certificates iptables iptables-persistent tar > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
+    echo -e "${GREEN}✓ 环境准备完毕！${NC}"
+    sleep 1
 }
 
 get_pub_ip() {
@@ -102,29 +104,28 @@ tune_system() {
         echo -e "${GREEN}✓ 已是 XanMod 内核，应用网关调优...${NC}"
         apply_gateway_tune
     else
-        echo -e "${YELLOW}未检测到 XanMod 内核。${NC}"
-        echo -e "  ${GRAY}1${NC} 安装 XanMod BBRv3 内核 (需重启)"
-        echo -e "  ${GRAY}2${NC} 跳过安装，直接应用普通 BBR 调优"
-        read -p "请选择 [1/2]: " c
-        case $c in
-            1) 
-                apt install -y wget gnupg ca-certificates > /dev/null 2>&1
-                mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
-                wget -qO - "https://dl.xanmod.org/archive.key" | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes 2>/dev/null
-                echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main" > /etc/apt/sources.list.d/xanmod-release.list
-                apt update > /dev/null 2>&1
-                echo -e "${YELLOW}正在安装 XanMod 内核 (可能需要几分钟)...${NC}"
-                apt install -y linux-xanmod-x64v3 > /dev/null 2>&1
-                if [ $? -eq 0 ]; then
-                    echo -e "${GREEN}✓ 内核安装成功！请重启服务器后再次运行本脚本，选择选项1应用调优。${NC}"
-                    read -p "按回车键重启..." && reboot
-                else
-                    echo -e "${RED}内核安装失败，改用普通调优。${NC}"
-                    apply_gateway_tune
-                fi
-                ;;
-            2) apply_gateway_tune ;;
-        esac
+        echo -e "${YELLOW}尝试安装 XanMod BBRv3 内核...${NC}"
+        apt install -y wget gnupg ca-certificates > /dev/null 2>&1
+        mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+        wget -qO - "https://dl.xanmod.org/archive.key" | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes 2>/dev/null
+        echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main" > /etc/apt/sources.list.d/xanmod-release.list
+        
+        echo -e "${YELLOW}正在更新软件源...${NC}"
+        apt update 2>&1 | tail -n 1
+        
+        # 自动检测 CPU 支持的内核版本
+        CPU_LEVEL=$(awk 'BEGIN{ while(!/flags/) if(getline<"/proc/cpuinfo"!=1) exit 1; if(/avx2/&&/bmi1/&&/bmi2/&&/fma/) level=3; else if(/avx/&&/aes/) level=2; else level=1; print level }')
+        XANMOD_PKG="linux-xanmod-x64v${CPU_LEVEL}"
+        echo -e "${YELLOW}检测到 CPU 级别 v${CPU_LEVEL}，正在安装 ${XANMOD_PKG}...${NC}"
+        
+        if apt install -y ${XANMOD_PKG}; then
+            echo -e "${GREEN}✓ XanMod 内核安装成功！请重启服务器后再次运行本脚本，选择选项1应用调优。${NC}"
+            read -p "按回车键重启..." && reboot
+        else
+            echo -e "${RED}✘ XanMod 内核安装失败（可能是 CPU 不支持或网络问题）。${NC}"
+            echo -e "${YELLOW}自动回退到普通 BBR 调优模式...${NC}"
+            apply_gateway_tune
+        fi
     fi
     echo -e "${GREEN}✓ 优化完成！${NC}"
 }
@@ -278,7 +279,7 @@ check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v10.0 (终极一体化版)    ║${NC}"
+    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v10.1 (终极完整版)      ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}1${NC}  ⚡ 系统极限优化 (内置BBRv3内核安装+网关调优)        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}2${NC}  [中转机] 初始化网关                               ${CYAN}║${NC}"
