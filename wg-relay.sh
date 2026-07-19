@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
 # WireGuard 智能中转部署脚本 v1 (YW版)
-# 新增：单台落地机支持添加多个端口节点
+# 修复：端口冲突检测、JSON损坏防护
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -285,7 +285,17 @@ add_relay_port() {
     read -p "请输入要加端口的落地机内网IP (如 10.0.0.2): " LAND_IP < /dev/tty
     if ! grep -q "${LAND_IP}/32" $WG_CONF; then echo -e "${RED}该IP不存在，请重新输入${NC}"; pause_return; return; fi
     
-    while true; do read -p "请输入新的客户端端口: " MAP_PORT < /dev/tty; [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && [ "$MAP_PORT" -ge 1 ] && [ "$MAP_PORT" -le 65535 ] && break; echo -e "${RED}端口无效${NC}"; done
+    while true; do 
+        read -p "请输入新的客户端端口: " MAP_PORT < /dev/tty
+        [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && [ "$MAP_PORT" -ge 1 ] && [ "$MAP_PORT" -le 65535 ] || { echo -e "${RED}端口无效${NC}"; continue; }
+        # 修复1：检查端口是否已被占用
+        if grep -q "^${MAP_PORT}|" "$NODES_INFO" 2>/dev/null; then
+            echo -e "${RED}❌ 客户端端口 ${MAP_PORT} 已被其他节点占用！请换一个：${NC}"
+        else
+            break
+        fi
+    done
+    
     while true; do read -p "请输入落地机对应的监听端口: " LAND_PORT < /dev/tty; [[ "$LAND_PORT" =~ ^[0-9]+$ ]] && [ "$LAND_PORT" -ge 1 ] && [ "$LAND_PORT" -le 65535 ] && break; echo -e "${RED}端口无效${NC}"; done
     read -p "请输入节点备注名称 (如 香港w-端口2): " NODE_NAME < /dev/tty
     
@@ -314,8 +324,14 @@ add_landing_port() {
     local relay_ip=$(grep "中转机IP:" "$LAND_INFO" | head -1 | awk '{print $2}')
     [ -z "$relay_ip" ] && { echo -e "${RED}无法读取中转机IP，请重新部署${NC}"; pause_return; return; }
     
-    while true; do read -p "请输入落地机新的监听端口: " LAND_PORT < /dev/tty; [[ "$LAND_PORT" =~ ^[0-9]+$ ]] && [ "$LAND_PORT" -ge 1 ] && [ "$LAND_PORT" -le 65535 ] && break; echo -e "${RED}端口无效${NC}"; done
-    if ss -tlnp | grep -q ":$LAND_PORT "; then echo -e "${RED}❌ 端口 $LAND_PORT 已被占用！${NC}"; pause_return; return; fi
+    while true; do 
+        read -p "请输入落地机新的监听端口: " LAND_PORT < /dev/tty
+        [[ "$LAND_PORT" =~ ^[0-9]+$ ]] && [ "$LAND_PORT" -ge 1 ] && [ "$LAND_PORT" -le 65535 ] || { echo -e "${RED}端口无效${NC}"; continue; }
+        # 修复2：检查端口是否被系统占用或已被配置
+        if ss -tlnp | grep -q ":$LAND_PORT "; then echo -e "${RED}❌ 端口 $LAND_PORT 已被系统占用！请换一个：${NC}"
+        elif grep -q "listen_port\": $LAND_PORT" /etc/sing-box/config.json 2>/dev/null; then echo -e "${RED}❌ 端口 $LAND_PORT 已在 Sing-box 中配置！请换一个：${NC}"
+        else break; fi
+    done
     
     while true; do read -p "请输入客户端连接端口 (需与中转机一致): " MAP_PORT < /dev/tty; [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && break; echo -e "${RED}端口无效${NC}"; done
     read -p "请输入节点备注名称: " NODE_NAME < /dev/tty
@@ -404,6 +420,12 @@ delete_landing_by_port() {
     grep "落地机端口:" "$LAND_INFO" | awk '{print $2}' | sort -u
     read -p "请输入要删除的落地机监听端口: " DEL_PORT < /dev/tty
     
+    # 修复3：检查 JSON 合法性，防止 jq 失败导致配置丢失
+    if ! jq empty /etc/sing-box/config.json 2>/dev/null; then
+        echo -e "${RED}❌ config.json 格式错误，无法安全删除${NC}"
+        pause_return; return
+    fi
+    
     jq 'del(.inbounds[] | select(.listen_port == '"$DEL_PORT"'))' /etc/sing-box/config.json > /tmp/sb_cfg.tmp && mv /tmp/sb_cfg.tmp /etc/sing-box/config.json
     systemctl restart sing-box >/dev/null 2>&1
     
@@ -433,7 +455,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v1 (YW版)        ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v1 (YW版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
