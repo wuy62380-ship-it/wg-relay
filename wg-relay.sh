@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v22.0 (绝对防错版)
+# WireGuard 智能中转部署脚本 v23.0 (终极粘贴容错版)
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -79,7 +79,6 @@ force_sync_time() {
     fi
 }
 
-# 简化测速，防止卡死
 select_best_domain() {
     for d in www.microsoft.com www.cloudflare.com www.apple.com www.amazon.com; do
         if curl -m 2 -sI -o /dev/null "https://${d}" 2>/dev/null; then echo "$d"; return; fi
@@ -144,10 +143,15 @@ gen_landing_code() {
 deploy_landing() {
     clear; echo -e "${YELLOW}━━━ 落地机一键部署 ━━━${NC}"
     read -p "请粘贴部署码: " DEPLOY_CODE
+    
+    # 修复：自动读取并拼接后续行，防止粘贴换行导致截断
+    while read -t 0.1 -r extra; do
+        DEPLOY_CODE="${DEPLOY_CODE}${extra}"
+    done
     DEPLOY_CODE=$(echo "$DEPLOY_CODE" | tr -d '[:space:]')
+    
     CODE_RAW=$(echo -n "$DEPLOY_CODE" | base64 -d 2>/dev/null)
     
-    # 修复1: 严格检查部署码解析结果
     if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then 
         echo -e "${RED}❌ 部署码无效或损坏！${NC}"; pause_return; return
     fi
@@ -155,9 +159,8 @@ deploy_landing() {
     RELAY_IP=$(echo $CODE_RAW | cut -d'|' -f1); RELAY_PUB=$(echo $CODE_RAW | cut -d'|' -f2)
     LAND_IP=$(echo $CODE_RAW | cut -d'|' -f3); MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f4); NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f5)
     
-    # 修复2: 如果端口或IP为空，立刻报错终止
     if [ -z "$RELAY_IP" ] || [ -z "$MAP_PORT" ] || [ -z "$LAND_IP" ]; then
-        echo -e "${RED}❌ 致命错误：解析出的中转IP或端口为空！请重新生成部署码。${NC}"
+        echo -e "${RED}❌ 致命错误：解析出的中转IP或端口为空！${NC}"
         pause_return; return
     fi
 
@@ -188,7 +191,6 @@ EOF
 
     SNI=$(select_best_domain)
     
-    # 修复3: 严格检查密钥生成结果
     REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null)
     SB_PRIV=$(echo "$REALITY_KEYS" | grep PrivateKey | awk '{print $2}'); SB_PUB=$(echo "$REALITY_KEYS" | grep PublicKey | awk '{print $2}')
     UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
@@ -219,7 +221,6 @@ EOF
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
-    # 修复4: 确保链接拼接完整
     VLESS_LINK="vless://${UUID}@${RELAY_IP}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&type=tcp#WG-${SAFE_NAME}"
     BIND_CODE=$(echo -n "${WG_PUB}|${LAND_IP}|${MAP_PORT}|${LAND_PORT}|${NODE_NAME}" | base64)
     
@@ -248,6 +249,13 @@ EOF
 bind_landing() {
     clear; echo -e "${YELLOW}━━━ 绑定落地机 ━━━${NC}"
     read -p "请粘贴回传码: " BIND_CODE
+    
+    # 修复：自动读取并拼接后续行，防止粘贴换行导致截断
+    while read -t 0.1 -r extra; do
+        BIND_CODE="${BIND_CODE}${extra}"
+    done
+    BIND_CODE=$(echo "$BIND_CODE" | tr -d '[:space:]')
+    
     CODE_RAW=$(echo -n "$BIND_CODE" | base64 -d 2>/dev/null)
     if [ -z "$CODE_RAW" ] || ! echo "$CODE_RAW" | grep -q "|"; then echo -e "${RED}绑定码无效${NC}"; pause_return; return; fi
     
@@ -293,7 +301,7 @@ check_root; check_system; prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v22.0 (绝对防错版)      ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v23.0 (终极粘贴容错版)  ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表 ${CYAN}║${NC}"
