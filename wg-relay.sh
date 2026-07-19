@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v9.4 (彻底修复中文支持)
+# WireGuard 智能中转部署脚本 v9.5 (优化安装进度显示)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -23,10 +23,14 @@ check_system() {
 }
 
 prepare_env() {
-    echo -e "${YELLOW}正在初始化环境...${NC}"
-    apt update > /dev/null 2>&1
-    apt install -y curl wget gnupg ca-certificates iptables iptables-persistent > /dev/null 2>&1
+    echo -e "${YELLOW}正在更新软件源 (这可能需要1-2分钟，请勿中断)...${NC}"
+    apt update -y
+    echo -e "${YELLOW}正在安装基础依赖 (curl/wireguard等)...${NC}"
+    apt install -y curl wget gnupg ca-certificates iptables iptables-persistent
+    echo -e "${YELLOW}正在加载内核模块...${NC}"
     modprobe nf_conntrack 2>/dev/null
+    echo -e "${GREEN}✓ 环境准备完毕！${NC}"
+    sleep 1
 }
 
 get_pub_ip() {
@@ -108,7 +112,6 @@ gen_landing_code() {
             echo -e "${RED}名称不能为空，请重新输入！${NC}"
             continue
         fi
-        # 检查是否包含会导致 sed 崩溃的危险字符
         if [[ "$NODE_NAME" =~ [\/\\\|\&] ]]; then
             echo -e "${RED}名称包含非法字符（不能有 / \ | & 等），请重新输入！${NC}"
         else
@@ -176,8 +179,8 @@ deploy_landing() {
     apt install -y wireguard > /dev/null 2>&1
     
     if ! command -v sing-box &> /dev/null; then
-        echo -e "${YELLOW}正在安装 Sing-box...${NC}"
-        bash <(curl -fsSL https://sing-box.app/deb-install.sh) > /dev/null 2>&1
+        echo -e "${YELLOW}正在安装 Sing-box (可能需要几十秒，请耐心等待)...${NC}"
+        bash <(curl -fsSL https://sing-box.app/deb-install.sh)
         hash -r
         if ! command -v sing-box &> /dev/null; then echo -e "${RED}Sing-box安装失败${NC}"; return; fi
     fi
@@ -268,7 +271,6 @@ bind_landing() {
     MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f3)
     NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f4)
 
-    # 清理可能存在的同名旧节点
     sed -i "/# ${NODE_NAME}/,/AllowedIPs = ${LAND_IP}\/32/d" $WG_CONF
     echo -e "\n# ${NODE_NAME}\n[Peer]\nPublicKey = $LANDING_PUB\nAllowedIPs = ${LAND_IP}/32" >> $WG_CONF
     
@@ -311,7 +313,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v9.4 (中文修复版)       ║${NC}"
+    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v9.5 (进度显示版)       ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}A${NC}  ⚡ 系统极限优化 (两台机器都要执行一次)           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
