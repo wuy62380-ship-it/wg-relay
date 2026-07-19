@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v9.1 (终极修复版)
+# WireGuard 智能中转部署脚本 v9.2 (修复假死与路径问题)
 # ==========================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -23,12 +23,21 @@ check_system() {
 }
 
 prepare_env() {
+    echo -e "${YELLOW}正在初始化环境...${NC}"
     apt update > /dev/null 2>&1
     apt install -y curl wget gnupg ca-certificates iptables iptables-persistent > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
 }
 
-get_pub_ip() { curl -s -4 ifconfig.me || curl -s -4 ip.sb; }
+# 修复1: 增加超时机制，防止获取IP假死
+get_pub_ip() {
+    local ip=$(curl -s -m 3 -4 ifconfig.me || curl -s -m 3 -4 ip.sb || curl -s -m 3 -4 api.ipify.org)
+    if [ -z "$ip" ]; then
+        echo -e "${RED}无法自动获取公网IP，请检查网络！${NC}"
+        exit 1
+    fi
+    echo "$ip"
+}
 
 # ================= 系统极限调优 =================
 tune_system() {
@@ -64,6 +73,7 @@ init_relay() {
         [[ ! "$confirm" =~ ^[Yy]$ ]] && return
     fi
 
+    echo -e "${YELLOW}正在安装 WireGuard...${NC}"
     apt install -y wireguard > /dev/null 2>&1
     WG_PRIV=$(wg genkey)
     WG_PUB=$(echo "$WG_PRIV" | wg pubkey)
@@ -93,7 +103,6 @@ gen_landing_code() {
     echo -e "${YELLOW}━━━ 生成落地部署码 ━━━${NC}"
     if [ ! -f "$WG_CONF" ]; then echo -e "${RED}请先初始化中转机${NC}"; return; fi
 
-    # 修复1: 节点名称白名单过滤，防止特殊字符弄坏 sed
     while true; do
         read -p "请输入节点名称 (仅限中英文/数字/_-): " NODE_NAME
         if [[ "$NODE_NAME" =~ ^[a-zA-Z0-9\_\-]+$ ]]; then
@@ -103,7 +112,6 @@ gen_landing_code() {
         fi
     done
 
-    # 修复3: 精确匹配行首，防止误读注释
     MAX_IP=1
     for ip in $(grep "^AllowedIPs = 10.0.0." $WG_CONF | awk '{print $3}' | cut -d'.' -f4 | cut -d'/' -f1); do
         [ "$ip" -gt "$MAX_IP" ] && MAX_IP=$ip
@@ -129,7 +137,6 @@ gen_landing_code() {
     done
 
     RELAY_IP=$(get_pub_ip)
-    # 修复2: 精确匹配行首 PrivateKey，防止误读注释
     RELAY_PUB=$(grep "^PrivateKey" $WG_CONF | awk '{print $3}' | wg pubkey)
     
     CODE_RAW="${RELAY_IP}|${RELAY_PUB}|${LAND_IP}|${MAP_PORT}|${NODE_NAME}"
@@ -163,8 +170,12 @@ deploy_landing() {
 
     echo -e "${YELLOW}正在部署 [${NODE_NAME}]...${NC}"
     apt install -y wireguard > /dev/null 2>&1
+    
+    # 修复2: 安装后强制刷新环境变量，防止找不到 sing-box 命令
     if ! command -v sing-box &> /dev/null; then
+        echo -e "${YELLOW}正在安装 Sing-box...${NC}"
         bash <(curl -fsSL https://sing-box.app/deb-install.sh) > /dev/null 2>&1
+        hash -r  # 刷新环境变量
         if ! command -v sing-box &> /dev/null; then echo -e "${RED}Sing-box安装失败${NC}"; return; fi
     fi
 
@@ -254,14 +265,12 @@ bind_landing() {
     MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f3)
     NODE_NAME=$(echo $CODE_RAW | cut -d'|' -f4)
 
-    # 清理 wg0.conf 中可能存在的同名旧节点 (此时 NODE_NAME 已确保无特殊字符)
     sed -i "/# ${NODE_NAME}/,/AllowedIPs = ${LAND_IP}\/32/d" $WG_CONF
     echo -e "\n# ${NODE_NAME}\n[Peer]\nPublicKey = $LANDING_PUB\nAllowedIPs = ${LAND_IP}/32" >> $WG_CONF
     
     echo -e "${YELLOW}⚠️ 重启 WG 隧道 (瞬断1秒)...${NC}"
     wg-quick down wg0 > /dev/null 2>&1; wg-quick up wg0 > /dev/null 2>&1
 
-    # 清理旧规则
     iptables -t nat -D PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:443 2>/dev/null
     iptables -t nat -D PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:443 2>/dev/null
     iptables -t nat -D POSTROUTING -d ${LAND_IP} -j MASQUERADE 2>/dev/null
@@ -270,16 +279,13 @@ bind_landing() {
     iptables -D INPUT -p tcp --dport $MAP_PORT -j ACCEPT 2>/dev/null
     iptables -D INPUT -p udp --dport $MAP_PORT -j ACCEPT 2>/dev/null
     
-    # 添加 NAT 规则
     iptables -t nat -A PREROUTING -p tcp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:443
     iptables -t nat -A PREROUTING -p udp --dport $MAP_PORT -j DNAT --to-destination ${LAND_IP}:443
     iptables -t nat -A POSTROUTING -d ${LAND_IP} -j MASQUERADE
     
-    # 放行 FORWARD 链
     iptables -A FORWARD -d ${LAND_IP} -j ACCEPT
     iptables -A FORWARD -s ${LAND_IP} -j ACCEPT
     
-    # 放行 INPUT 链
     iptables -A INPUT -p tcp --dport $MAP_PORT -j ACCEPT
     iptables -A INPUT -p udp --dport $MAP_PORT -j ACCEPT
     
@@ -301,7 +307,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v9.1 (终极修复版)       ║${NC}"
+    echo -e "${CYAN}║    WireGuard 智能中转部署工具 v9.2 (修复假死版)       ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${GREEN}A${NC}  ⚡ 系统极限优化 (两台机器都要执行一次)           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                       ${CYAN}║${NC}"
