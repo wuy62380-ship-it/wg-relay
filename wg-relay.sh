@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v138.0 (SNI自动优选版)
-# 融合：引入37个大厂域名自动测速优选，彻底解决 SNI 被拦截导致的不通
+# WireGuard 智能中转部署脚本 v138.1 (完整功能版)
+# 修复：补全所有菜单选项，恢复 BBR/BBRv3 选择与 SNI 自动优选
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -73,7 +73,6 @@ prepare_env() {
     apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl coreutils iproute2 iputils-ping util-linux > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
     command -v jq &> /dev/null || { echo -e "${RED}❌ jq 安装失败${NC}"; exit 1; }
-    command -v openssl &> /dev/null || { echo -e "${RED}❌ openssl 安装失败${NC}"; exit 1; }
     echo -e "${GREEN}✓ 环境准备完毕${NC}"; sleep 1
 }
 
@@ -135,6 +134,135 @@ force_sync_time() {
 }
 
 url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
+
+# ================= 高阶 XanMod BBRv3 安装支持函数 =================
+xanmod_add_repo() {
+    local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg" list_file="/etc/apt/sources.list.d/xanmod-release.list" os_codename=""
+    if command -v lsb_release >/dev/null 2>&1; then os_codename=$(lsb_release -sc); elif [ -r /etc/os-release ]; then os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME"); fi
+    if ! echo "bookworm trixie forky sid noble plucky" | grep -qw "$os_codename"; then os_codename="releases"; fi
+    if echo "jammy focal buster releases" | grep -qw "$os_codename"; then echo -e "${RED}❌ XanMod 已停止支持当前系统版本${NC}"; return 1; fi
+    [ -z "$os_codename" ] && { echo -e "${RED}无法获取系统代号${NC}"; return 1; }
+    
+    rm -f "$list_file"
+    wget -qO - "https://dl.xanmod.org/archive.key" | gpg --dearmor -o "$keyring" --yes 2>/dev/null
+    if [ ! -s "$keyring" ]; then
+        echo -e "${RED}❌ XanMod 密钥下载失败！请检查网络或代理设置。${NC}"
+        return 1
+    fi
+    chmod 644 "$keyring"
+    echo "deb [signed-by=$keyring] http://deb.xanmod.org $os_codename main" > "$list_file"
+}
+
+xanmod_detect_package() {
+    local arch=$(uname -m)
+    if [ "$arch" = "aarch64" ]; then
+        if apt-cache policy "linux-xanmod-arm64" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+            printf '%s\n' "linux-xanmod-arm64"; return 0
+        fi
+        return 1
+    fi
+
+    local psabi_level=$(awk -F: '/^flags/{ if(/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level=1; if(level==1&&/cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level=2; if(level==2&&/avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level=3; if(level>0){print level;exit} }' /proc/cpuinfo 2>/dev/null)
+    if [ -z "$psabi_level" ]; then return 1; fi
+    [ "$psabi_level" -gt 3 ] && psabi_level=3
+    for prefix in linux-xanmod linux-xanmod-lts; do 
+        local l="$psabi_level"
+        while [ "$l" -ge 1 ]; do 
+            local p="${prefix}-x64v${l}"
+            if apt-cache policy "$p" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+                printf '%s\n' "$p"; return 0
+            fi
+            l=$((l-1))
+        done
+    done
+    return 1
+}
+
+tune_system() {
+    clear; echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
+    
+    local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    local conntrack_max=$((mem_kb / 16384 * 1024))
+    [ "$conntrack_max" -lt 65536 ] && conntrack_max=65536
+    
+    echo -e "当前检测到内存: $((mem_kb/1024))MB, Conntrack表将设置为: ${GREEN}${conntrack_max}${NC}"
+    echo -e "请选择拥塞控制算法方案："
+    echo -e "${GREEN}1${NC}. ${CYAN}原版 BBR${NC} (推荐，安全稳定，即时生效不重启)"
+    echo -e "${GREEN}2${NC}. ${CYAN}XanMod BBRv3${NC} (极限抗丢包，适合晚高峰线路，${RED}需重启生效${NC})"
+    read -p "请输入选项 [1/2] (默认1): " tune_choice < /dev/tty
+
+    case "$tune_choice" in
+        2)
+            echo -e "${YELLOW}[*] 开始安装 XanMod BBRv3 内核...${NC}"
+            
+            if ! xanmod_add_repo; then
+                echo -e "${RED}❌ XanMod 源添加失败，回退原版 BBR。${NC}"
+                tune_choice=1
+            else
+                kill_apt_locks
+                apt-get update -y > /dev/null 2>&1
+                local pkg_name=$(xanmod_detect_package)
+                
+                if [ -z "$pkg_name" ]; then
+                    echo -e "${RED}❌ 找不到适合当前架构/CPU指令集的 XanMod 内核包，回退原版 BBR。${NC}"
+                    tune_choice=1
+                else
+                    echo -e "${GREEN}✓ 检测到适合: ${pkg_name}，开始下载安装 (请耐心等待)...${NC}"
+                    if apt-get install -y "$pkg_name"; then
+                        cat > "$SYSCTL_FILE" << EOF
+# XanMod BBRv3 专属优化
+net.core.default_qdisc = fq_pie
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 32768 16777216
+net.ipv4.tcp_wmem = 4096 32768 16777216
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 100000
+net.ipv4.tcp_fastopen = 3
+net.ipv4.ip_forward = 1
+net.netfilter.nf_conntrack_max = $conntrack_max
+vm.swappiness = 10
+EOF
+                        sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
+                        for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
+                        echo -e "${GREEN}✓ BBRv3 安装成功！请务必重启服务器后再进行后续操作。${NC}"
+                        read -p "按回车键重启服务器..." < /dev/tty
+                        reboot
+                        exit 0
+                    else
+                        echo -e "${RED}✘ XanMod 安装失败，回退原版 BBR。${NC}"
+                        tune_choice=1
+                    fi
+                fi
+            fi
+            ;;
+        *)
+            tune_choice=1
+            ;;
+    esac
+
+    if [ "$tune_choice" == "1" ]; then
+        echo -e "${YELLOW}[*] 应用原版 BBR 优化...${NC}"
+        cat > "$SYSCTL_FILE" << EOF
+# 原版 BBR 优化
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 32768 16777216
+net.ipv4.tcp_wmem = 4096 32768 16777216
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 100000
+net.ipv4.tcp_fastopen = 3
+net.ipv4.ip_forward = 1
+net.netfilter.nf_conntrack_max = $conntrack_max
+vm.swappiness = 10
+EOF
+        sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
+        for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
+        echo -e "${GREEN}✓ 优化完成 (原版 BBR, Conntrack: $conntrack_max)！${NC}"
+    fi
+    pause_return
+}
 
 # ================= 顶级大厂域名优选模块 =================
 SNI_DOMAINS=(
@@ -199,31 +327,6 @@ select_best_sni() {
 }
 
 # ================= 核心部署逻辑 =================
-tune_system() {
-    clear; echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
-    systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
-    local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    local conntrack_max=$((mem_kb / 16384 * 1024))
-    [ "$conntrack_max" -lt 65536 ] && conntrack_max=65536
-    
-    cat > "$SYSCTL_FILE" << EOF
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 32768 16777216
-net.ipv4.tcp_wmem = 4096 32768 16777216
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 100000
-net.ipv4.tcp_fastopen = 3
-net.ipv4.ip_forward = 1
-net.netfilter.nf_conntrack_max = $conntrack_max
-vm.swappiness = 10
-EOF
-    sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
-    for dir in /sys/class/net/*/queues/rx-*; do [ -f "$dir/rps_cpus" ] && echo ff > "$dir/rps_cpus" 2>/dev/null; done
-    echo -e "${GREEN}✓ 优化完成！${NC}"; pause_return
-}
-
 check_node_name() {
     [ ${#1} -gt 20 ] || [[ "$1" =~ [\/\\|\&\;\$\<\>\`\!\?\*\(\)\ ] ]] && echo -e "${RED}❌ 名称无效！${NC}" && return 1
     return 0
@@ -334,7 +437,6 @@ deploy_landing() {
     install_singbox || { echo -e "${RED}Sing-box 安装失败${NC}"; pause_return; return; }
     force_sync_time
 
-    # 核心融合：自动优选大厂 SNI 域名
     SNI=$(select_best_sni)
 
     mkdir -p /etc/wireguard
@@ -455,6 +557,47 @@ bind_landing() {
     pause_return
 }
 
+add_relay_port() {
+    clear; echo -e "${YELLOW}━━━ 中转机-为现有落地机加端口 ━━━${NC}"
+    [ ! -f "$WG_CONF" ] && echo -e "${RED}请先初始化中转机${NC}" && pause_return && return
+    
+    echo -e "当前已绑定的落地机内网IP："
+    grep "^AllowedIPs = 10.0.0." $WG_CONF | awk '{print $3}' | cut -d'.' -f4 | cut -d'/' -f1 | while read ip; do echo "  10.0.0.$ip"; done
+    
+    while true; do
+        read -p "请输入要加端口的落地机内网IP (如 10.0.0.2): " LAND_IP < /dev/tty
+        check_ip_format "$LAND_IP" && grep -q "${LAND_IP}/32" $WG_CONF && break
+    done
+    
+    while true; do 
+        read -p "请输入新的客户端端口: " MAP_PORT < /dev/tty
+        [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && [ "$MAP_PORT" -ge 1 ] && [ "$MAP_PORT" -le 65535 ] || { echo -e "${RED}端口无效${NC}"; continue; }
+        grep -q "^${MAP_PORT}|" "$NODES_INFO" 2>/dev/null && echo -e "${RED}❌ 端口 ${MAP_PORT} 已被占用！请换一个：${NC}" || break
+    done
+    
+    while true; do read -p "请输入落地机对应的监听端口: " LAND_PORT < /dev/tty; [[ "$LAND_PORT" =~ ^[0-9]+$ ]] && [ "$LAND_PORT" -ge 1 ] && [ "$LAND_PORT" -le 65535 ] && break; echo -e "${RED}端口无效${NC}"; done
+    
+    while true; do 
+        read -p "请输入节点备注名称 (如 HK-Port2): " NODE_NAME < /dev/tty
+        [ -n "$NODE_NAME" ] && check_node_name "$NODE_NAME" && break
+    done
+    
+    grep -q "^${MAP_PORT}|" "$NODES_INFO" 2>/dev/null && echo -e "${RED}❌ 端口 ${MAP_PORT} 刚刚被占用！操作取消。${NC}" && pause_return && return
+    
+    while iptables -t nat -D PREROUTING -p tcp --dport "$MAP_PORT" 2>/dev/null; do :; done
+    while iptables -t nat -D PREROUTING -p udp --dport "$MAP_PORT" 2>/dev/null; do :; done
+    
+    iptables -t nat -I PREROUTING 1 -p tcp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
+    iptables -t nat -I PREROUTING 1 -p udp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
+    
+    allow_port "$MAP_PORT"
+    netfilter-persistent save > /dev/null 2>&1
+    
+    touch "$NODES_INFO"; sed -i "/|${NODE_NAME}$/d" "$NODES_INFO"; echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
+    echo -e "${GREEN}✓ 中转机端口添加成功！请确保云后台已放行 ${MAP_PORT} 端口${NC}"
+    pause_return
+}
+
 add_landing_port() {
     clear; echo -e "${YELLOW}━━━ 落地机-新增端口节点 ━━━${NC}"
     [ ! -f "$LAND_INFO" ] || [ ! -f "/etc/sing-box/config.json" ] && echo -e "${RED}请先执行选项4部署基础节点${NC}" && pause_return && return
@@ -472,7 +615,6 @@ add_landing_port() {
     while true; do read -p "客户端连接端口: " MAP_PORT < /dev/tty; [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && break; echo -e "${RED}端口无效${NC}"; done
     while true; do read -p "节点备注名称: " NODE_NAME < /dev/tty; [ -n "$NODE_NAME" ] && check_node_name "$NODE_NAME" && break; done
     
-    # 读取基础节点的密钥和 SNI
     local exist_priv=$(jq -r '.inbounds[0].tls.reality.private_key' /etc/sing-box/config.json)
     local exist_sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' /etc/sing-box/config.json)
     local exist_sni=$(jq -r '.inbounds[0].tls.server_name' /etc/sing-box/config.json)
@@ -529,12 +671,129 @@ EOF
     pause_return
 }
 
+delete_relay_by_port() {
+    clear; echo -e "${YELLOW}━━━ 中转机按端口删除 ━━━${NC}"
+    [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ] && echo -e "${RED}暂无节点可删除${NC}" && pause_return && return
+    
+    printf "${GREEN}%-10s | %-15s | %-8s | %-15s\n${NC}" "端口" "落地IP" "落地端口" "名称"
+    while IFS='|' read -r p lip lp n; do printf "%-10s | %-15s | %-8s | %-15s\n" "$p" "$lip" "$lp" "$n"; done < "$NODES_INFO"
+    
+    read -p "请输入要删除的客户端端口: " DEL_PORT < /dev/tty
+    [ -z "$DEL_PORT" ] && echo -e "${RED}❌ 端口不能为空！${NC}" && pause_return && return
+    
+    line=$(grep "^${DEL_PORT}|" "$NODES_INFO")
+    [ -z "$line" ] && echo -e "${RED}未找到端口 ${DEL_PORT}${NC}" && pause_return && return
+    
+    d_ip=$(echo "$line" | cut -d'|' -f2); d_name=$(echo "$line" | cut -d'|' -f4)
+    
+    while iptables -t nat -D PREROUTING -p tcp --dport "$DEL_PORT" 2>/dev/null; do :; done
+    while iptables -t nat -D PREROUTING -p udp --dport "$DEL_PORT" 2>/dev/null; do :; done
+    netfilter-persistent save > /dev/null 2>&1
+    
+    if ! grep -q "|${d_ip}|" "$NODES_INFO"; then
+        sed -i "/# ${d_name}/,/AllowedIPs = ${d_ip}\/32/d" "$WG_CONF"
+        wg-quick down wg0 >/dev/null 2>&1
+        restart_wg || { pause_return; return; }
+        while iptables -t nat -D POSTROUTING -d "$d_ip" -j MASQUERADE 2>/dev/null; do :; done
+        iptables -D FORWARD -d "$d_ip" -j ACCEPT 2>/dev/null; iptables -D FORWARD -s "$d_ip" -j ACCEPT 2>/dev/null
+        netfilter-persistent save > /dev/null 2>&1
+    fi
+    
+    sed -i "/^${DEL_PORT}|/d" "$NODES_INFO"
+    echo -e "${GREEN}✓ 端口 ${DEL_PORT} 已彻底删除${NC}"
+    pause_return
+}
+
+delete_landing_by_port() {
+    clear; echo -e "${YELLOW}━━━ 落地机按端口删除 ━━━${NC}"
+    [ ! -f "$LAND_INFO" ] || [ ! -s "$LAND_INFO" ] && echo -e "${RED}无节点记录${NC}" && pause_return && return
+    
+    grep "落地机端口:" "$LAND_INFO" | awk '{print $2}' | sort -u
+    read -p "请输入要删除的落地机监听端口: " DEL_PORT < /dev/tty
+    [ -z "$DEL_PORT" ] && echo -e "${RED}❌ 端口不能为空！${NC}" && pause_return && return
+    
+    ! jq empty /etc/sing-box/config.json 2>/dev/null && echo -e "${RED}❌ config.json 错误${NC}" && pause_return && return
+    ! jq -e --argjson p "$DEL_PORT" '.inbounds[] | select(.listen_port == $p)' /etc/sing-box/config.json >/dev/null 2>&1 && echo -e "${RED}❌ 端口不存在${NC}" && pause_return && return
+    
+    local tmp_json="/tmp/sb_del_$$.json"
+    jq --argjson p "$DEL_PORT" 'del(.inbounds[] | select(.listen_port == $p))' /etc/sing-box/config.json > "$tmp_json" 2>/dev/null
+    ! jq empty "$tmp_json" 2>/dev/null && echo -e "${RED}❌ JSON 删除失败${NC}" && rm -f "$tmp_json" && pause_return && return
+    mv -f "$tmp_json" /etc/sing-box/config.json
+    
+    local in_count=$(jq '.inbounds | length' /etc/sing-box/config.json 2>/dev/null)
+    [ "$in_count" -eq 0 ] && systemctl stop sing-box >/dev/null 2>&1 || systemctl restart sing-box >/dev/null 2>&1
+    
+    local node_name=$(grep -B 3 "落地机端口: $DEL_PORT$" "$LAND_INFO" | grep "节点名称:" | awk '{print $2}')
+    [ -n "$node_name" ] && sed -i "/# ${node_name} START/,/# ${node_name} END/d" "$LAND_INFO"
+    
+    echo -e "${GREEN}✓ 落地机端口 ${DEL_PORT} 已删除${NC}"
+    pause_return
+}
+
+view_iptables() {
+    clear; echo -e "${YELLOW}━━━ 当前 NAT PREROUTING 规则 ━━━${NC}"
+    iptables -t nat -L PREROUTING -n --line-numbers
+    echo ""
+    echo -e "${YELLOW}━━━ 当前 NAT POSTROUTING 规则 ━━━${NC}"
+    iptables -t nat -L POSTROUTING -n --line-numbers
+    echo ""
+    echo -e "${YELLOW}━━━ 当前 FILTER FORWARD 规则 ━━━${NC}"
+    iptables -L FORWARD -n --line-numbers
+    pause_return
+}
+
+ping_test() {
+    clear; echo -e "${YELLOW}━━━ Ping 连通性测试 ━━━${NC}"
+    [ ! -f "$WG_CONF" ] && echo -e "${RED}请先初始化中转机${NC}" && pause_return && return
+    
+    echo -e "当前已绑定的落地机内网IP："
+    grep "^AllowedIPs = 10.0.0." $WG_CONF | awk '{print $3}' | cut -d'.' -f4 | cut -d'/' -f1 | while read ip; do echo "  10.0.0.$ip"; done
+    
+    read -p "请输入要测试的落地机内网IP (如 10.0.0.2): " TEST_IP < /dev/tty
+    ! check_ip_format "$TEST_IP" && pause_return && return
+    
+    echo -e "${YELLOW}[*] 正在 Ping ${TEST_IP} ...${NC}"
+    ping -c 4 $TEST_IP
+    pause_return
+}
+
+uninstall_all() {
+    clear; echo -e "${YELLOW}━━━ 一键卸载环境 ━━━${NC}"
+    read -p "${RED}⚠️ 此操作将删除所有 WG 配置、Sing-box 及转发规则！确定？[y/N]: ${NC}" c < /dev/tty
+    [[ ! "$c" =~ ^[Yy]$ ]] && { pause_return; return; }
+    
+    systemctl stop wg-quick@wg0 2>/dev/null; systemctl disable wg-quick@wg0 2>/dev/null
+    systemctl stop sing-box 2>/dev/null; systemctl disable sing-box 2>/dev/null
+    
+    flush_wg_rules
+    rm -rf /etc/wireguard /etc/sing-box /usr/local/bin/sing-box /etc/systemd/system/sing-box.service "$NODES_INFO" "$LAND_INFO" "$SYSCTL_FILE" "$IP_FORWARD_FILE"
+    systemctl daemon-reload
+    
+    echo -e "${GREEN}✓ 卸载完成！${NC}"
+    pause_return
+}
+
+list_relay_nodes() {
+    clear; echo -e "${YELLOW}━━━ 中转机节点列表 ━━━${NC}"
+    [ ! -f "$NODES_INFO" ] || [ ! -s "$NODES_INFO" ] && echo -e "${RED}暂无节点${NC}" && pause_return && return
+    
+    printf "${GREEN}%-10s | %-15s | %-8s | %-15s\n${NC}" "端口" "落地IP" "落地端口" "名称"
+    while IFS='|' read -r p lip lp n; do printf "%-10s | %-15s | %-8s | %-15s\n" "$p" "$lip" "$lp" "$n"; done < "$NODES_INFO"
+    pause_return
+}
+
+list_landing_nodes() {
+    clear; echo -e "${YELLOW}━━━ 落地机节点信息 ━━━${NC}"
+    [ ! -f "$LAND_INFO" ] || [ ! -s "$LAND_INFO" ] && echo -e "${RED}无记录${NC}" && pause_return && return
+    cat "$LAND_INFO"; pause_return
+}
+
 check_root
 prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v138.0 (SNI自动优选版)       ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v138.1 (完整功能版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
@@ -546,6 +805,6 @@ while true; do
     
     read -p "选: " c < /dev/tty
     case $c in
-        1) tune_system;; 2) init_relay;; 3) gen_landing_code;; 4) deploy_landing;; 5) bind_landing;; 0) exit 0;; *) echo "错误"; sleep 1;;
+        1) tune_system;; 2) init_relay;; 3) gen_landing_code;; 4) deploy_landing;; 5) bind_landing;; 6) list_relay_nodes;; 7) list_landing_nodes;; 8) add_relay_port;; 9) add_landing_port;; a|A) delete_relay_by_port;; b|B) delete_landing_by_port;; c|C) view_iptables;; d|D) uninstall_all;; e|E) ping_test;; 0) exit 0;; *) echo "错误"; sleep 1;;
     esac
 done
