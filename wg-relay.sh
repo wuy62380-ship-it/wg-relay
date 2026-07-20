@@ -1,10 +1,12 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v137.0 (SNI优选与防假死版)
-# 修复：删除不存在的max_time_difference字段，引入大厂SNI自动测速优选
+# WireGuard 智能中转部署脚本 v138.0 (SNI自动优选版)
+# 融合：引入37个大厂域名自动测速优选，彻底解决 SNI 被拦截导致的不通
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
+
+find /tmp -maxdepth 1 -name "sb_*_*.json" -delete 2>/dev/null
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 export RED GREEN YELLOW CYAN NC
@@ -18,6 +20,8 @@ SYSCTL_FILE="/etc/sysctl.d/99-yg-tune.conf"
 IP_FORWARD_FILE="/etc/sysctl.d/99-ip-forward.conf"
 
 export DEBIAN_FRONTEND=noninteractive
+
+trap 'rm -f /tmp/sb_*_$$.json' EXIT
 
 check_root() { [ "$EUID" -ne 0 ] && echo -e "${RED}请使用root运行${NC}" && exit 1; }
 
@@ -69,6 +73,7 @@ prepare_env() {
     apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl coreutils iproute2 iputils-ping util-linux > /dev/null 2>&1
     modprobe nf_conntrack 2>/dev/null
     command -v jq &> /dev/null || { echo -e "${RED}❌ jq 安装失败${NC}"; exit 1; }
+    command -v openssl &> /dev/null || { echo -e "${RED}❌ openssl 安装失败${NC}"; exit 1; }
     echo -e "${GREEN}✓ 环境准备完毕${NC}"; sleep 1
 }
 
@@ -114,34 +119,86 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
-# 终极修复：引入大厂 SNI 自动测速优选，彻底解决伪装域名被拦截问题
-select_best_sni() {
-    echo -e "${YELLOW}[*] 正在测速优选大厂 SNI 伪装域名...${NC}"
-    local domains=("www.bing.com" "www.apple.com" "www.cloudflare.com" "www.amazon.com" "www.google.com")
-    local best_domain="" best_time=9999
-    
-    for domain in "${domains[@]}"; do
-        local time_ms=$(curl -sI -o /dev/null -w "%{time_connect}" --connect-timeout 2 "https://$domain" 2>/dev/null)
-        if [ -n "$time_ms" ]; then
-            local ms=$(echo "$time_ms * 1000" | bc 2>/dev/null | cut -d'.' -f1)
-            if [ -n "$ms" ] && [ "$ms" -lt "$best_time" ]; then
-                best_time=$ms
-                best_domain=$domain
-            fi
-        fi
+force_sync_time() {
+    echo -e "${YELLOW}[*] 正在校准系统时间...${NC}"
+    command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp false >/dev/null 2>&1
+    local sys_time=""
+    for url in "http://www.cloudflare.com" "http://www.baidu.com" "http://1.1.1.1"; do
+        sys_time=$(curl -sI --max-time 3 "$url" 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+        [ -n "$sys_time" ] && break
     done
-    
-    if [ -z "$best_domain" ]; then
-        best_domain="www.bing.com"
-        echo -e "${YELLOW}⚠ 测速失败，使用默认 SNI: $best_domain${NC}"
-    else
-        echo -e "${GREEN}✓ 优选 SNI: $best_domain (延迟: ${best_time}ms)${NC}"
+    if [ -n "$sys_time" ]; then
+        date -s "$sys_time" >/dev/null 2>&1
+        hwclock -w >/dev/null 2>&1
     fi
-    echo "$best_domain"
+    echo -e "${GREEN}✅ 系统时间: $(date)${NC}"
 }
 
 url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
 
+# ================= 顶级大厂域名优选模块 =================
+SNI_DOMAINS=(
+    "www.bing.com" "www.apple.com" "www.cloudflare.com" "www.amazon.com" "www.microsoft.com"
+    "www.icloud.com" "www.office.com" "aws.amazon.com" "azure.microsoft.com" "dl.google.com"
+    "cdn.apple.com" "api.apple.com" "init.push.apple.com" "www.sony.com" "www.oracle.com"
+    "www.ibm.com" "www.nvidia.com" "images.nvidia.com" "www.intel.com" "www.amd.com"
+    "www.ebay.com" "www.paypal.com" "www.tesla.com" "www.mozilla.org" "www.cisco.com"
+    "www.sap.com" "www.samsung.com" "www.huawei.com" "www.dell.com" "www.hp.com"
+    "www.canva.com" "www.cdn77.org" "www.fastly.com" "www.akamai.com" "www.digitalocean.com"
+)
+
+_test_domain_latency() {
+    local host="$1" result_file="$2"
+    local t1 t2 ms
+    t1=$(date +%s%3N 2>/dev/null)
+    [[ ! "$t1" =~ ^[0-9]+$ ]] && t1=$(date +%s)000
+    if timeout 2 openssl s_client -connect "${host}:443" -servername "${host}" </dev/null &>/dev/null; then
+        t2=$(date +%s%3N 2>/dev/null)
+        [[ ! "$t2" =~ ^[0-9]+$ ]] && t2=$(date +%s)000
+        ms=$((t2 - t1))
+        [ "$ms" -ge 0 ] 2>/dev/null && echo "${ms} ${host}" >> "$result_file" || echo "9999 ${host}" >> "$result_file"
+    else
+        echo "9999 ${host}" >> "$result_file"
+    fi
+}
+
+select_best_sni() {
+    local tmp_res="/tmp/sb_sni_speed"
+    > "$tmp_res"
+    echo -e "${YELLOW}[*] 正在测速优选大厂 SNI 伪装域名 (共 ${#SNI_DOMAINS[@]} 个)...${NC}"
+    
+    for domain in "${SNI_DOMAINS[@]}"; do
+        _test_domain_latency "$domain" "$tmp_res"
+    done
+    
+    local sorted_domains=$(grep -v "^9999" "$tmp_res" | sort -n)
+    rm -f "$tmp_res"
+    
+    if [ -z "$sorted_domains" ]; then 
+        echo -e "${RED}❌ 所有域名测速失败！将使用默认域名 www.bing.com${NC}"
+        echo "www.bing.com"
+        return 0
+    fi
+    
+    local best_domain=$(echo "$sorted_domains" | head -n 1 | awk '{print $2}')
+    local best_time=$(echo "$sorted_domains" | head -n 1 | awk '{print $1}')
+    
+    echo -e "${GREEN}=========================================="
+    echo -e " SNI 测速排名 Top 5:"
+    local i=1
+    while IFS= read -r line; do
+        local latency=$(echo "$line" | awk '{print $1}')
+        local dom=$(echo "$line" | awk '{print $2}')
+        printf "  ${GREEN}[%d]${NC} %-30s ${YELLOW}%s ms${NC}\n" "$i" "$dom" "$latency"
+        i=$((i+1))
+        [ $i -gt 5 ] && break
+    done <<< "$sorted_domains"
+    echo -e "=========================================="
+    echo -e "${GREEN}✓ 已自动选择最快域名: ${CYAN}${best_domain}${NC} (${best_time} ms)"
+    echo "$best_domain"
+}
+
+# ================= 核心部署逻辑 =================
 tune_system() {
     clear; echo -e "${YELLOW}━━━ 系统极限优化 ━━━${NC}"
     systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
@@ -174,6 +231,11 @@ check_node_name() {
 
 check_ip_format() {
     [[ ! "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo -e "${RED}❌ IP 格式不正确！${NC}" && return 1
+    return 0
+}
+
+check_pub_key() {
+    [[ ! "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]] && return 1
     return 0
 }
 
@@ -270,7 +332,9 @@ deploy_landing() {
     echo -e "${YELLOW}[*] 安装 WG 与 Sing-box...${NC}"
     kill_apt_locks; apt-get install -y wireguard > /dev/null 2>&1
     install_singbox || { echo -e "${RED}Sing-box 安装失败${NC}"; pause_return; return; }
-    
+    force_sync_time
+
+    # 核心融合：自动优选大厂 SNI 域名
     SNI=$(select_best_sni)
 
     mkdir -p /etc/wireguard
@@ -391,12 +455,86 @@ bind_landing() {
     pause_return
 }
 
+add_landing_port() {
+    clear; echo -e "${YELLOW}━━━ 落地机-新增端口节点 ━━━${NC}"
+    [ ! -f "$LAND_INFO" ] || [ ! -f "/etc/sing-box/config.json" ] && echo -e "${RED}请先执行选项4部署基础节点${NC}" && pause_return && return
+    ! jq empty /etc/sing-box/config.json 2>/dev/null && echo -e "${RED}❌ config.json 错误！${NC}" && pause_return && return
+    
+    local relay_ip=$(grep "中转机IP:" "$LAND_INFO" | head -1 | awk '{print $2}')
+    [ -z "$relay_ip" ] && echo -e "${RED}无法读取中转机IP${NC}" && pause_return && return
+    
+    while true; do 
+        read -p "监听端口: " LAND_PORT < /dev/tty
+        [[ "$LAND_PORT" =~ ^[0-9]+$ ]] && [ "$LAND_PORT" -ge 1 ] && [ "$LAND_PORT" -le 65535 ] || { echo -e "${RED}端口无效${NC}"; continue; }
+        ss -tulnp | grep -qE ":$LAND_PORT\b" && echo -e "${RED}❌ 端口占用${NC}" || break
+    done
+    
+    while true; do read -p "客户端连接端口: " MAP_PORT < /dev/tty; [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && break; echo -e "${RED}端口无效${NC}"; done
+    while true; do read -p "节点备注名称: " NODE_NAME < /dev/tty; [ -n "$NODE_NAME" ] && check_node_name "$NODE_NAME" && break; done
+    
+    # 读取基础节点的密钥和 SNI
+    local exist_priv=$(jq -r '.inbounds[0].tls.reality.private_key' /etc/sing-box/config.json)
+    local exist_sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' /etc/sing-box/config.json)
+    local exist_sni=$(jq -r '.inbounds[0].tls.server_name' /etc/sing-box/config.json)
+    local exist_pub=$(grep -oE 'pbk=[a-zA-Z0-9+/=]+' "$LAND_INFO" | head -1 | sed 's/^pbk=//')
+    
+    [ -z "$exist_priv" ] || [ -z "$exist_sid" ] || [ -z "$exist_sni" ] && echo -e "${RED}❌ 读取基础配置失败${NC}" && pause_return && return
+    [ -z "$exist_pub" ] && read -p "请输入 PublicKey (pbk): " exist_pub < /dev/tty
+    ! check_pub_key "$exist_pub" && echo -e "${RED}❌ 公钥格式错误${NC}" && pause_return && return
+    
+    local UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null)
+    local tmp_json="/tmp/sb_add_$$.json"
+    
+    jq --arg p "$LAND_PORT" --arg u "$UUID" --arg s "$exist_sni" --arg pk "$exist_priv" --arg sid "$exist_sid" \
+       --arg listen "0.0.0.0" --arg pub "$exist_pub" \
+       '.inbounds += [{
+           "type": "vless", "listen": $listen, "listen_port": ($p|tonumber),
+           "users": [{"name": "ext", "uuid": $u, "flow": "xtls-rprx-vision"}],
+           "tls": {
+               "enabled": true, "server_name": $s,
+               "alpn": ["h2", "http/1.1"],
+               "reality": {
+                   "enabled": true,
+                   "handshake": {"server": $s, "server_port": 443},
+                   "private_key": $pk, "short_id": [$sid]
+               }
+           }
+       }]' /etc/sing-box/config.json > "$tmp_json" 2>/dev/null
+    
+    ! jq empty "$tmp_json" 2>/dev/null && echo -e "${RED}❌ JSON 生成失败${NC}" && rm -f "$tmp_json" && pause_return && return
+    mv -f "$tmp_json" /etc/sing-box/config.json
+    systemctl restart sing-box
+    allow_port "$LAND_PORT"
+    
+    SAFE_NAME=$(url_encode "$NODE_NAME")
+    VLESS_LINK="vless://${UUID}@${relay_ip}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${exist_sni}&fp=chrome&pbk=${exist_pub}&sid=${exist_sid}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
+    
+    sed -i "/# ${NODE_NAME} START/,/# ${NODE_NAME} END/d" "$LAND_INFO"
+    cat >> "$LAND_INFO" << EOF
+# ${NODE_NAME} START
+节点名称: $NODE_NAME
+中转机IP: $relay_ip
+客户端端口: $MAP_PORT
+落地机端口: $LAND_PORT
+SNI: $exist_sni
+链接:
+ $VLESS_LINK
+# ${NODE_NAME} END
+EOF
+    
+    echo -e "${GREEN}=========================================="
+    echo -e " 落地机新端口节点 [${NODE_NAME}] 添加成功！"
+    echo -e " ${YELLOW}链接：${NC}\n ${GREEN}${VLESS_LINK}${NC}"
+    echo -e "=========================================="
+    pause_return
+}
+
 check_root
 prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v137.0 (SNI优选防假死版)     ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v138.0 (SNI自动优选版)       ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
