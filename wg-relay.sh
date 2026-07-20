@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v132.2 (极简安装版)
-# 修复：彻底重构 flock 锁机制，修复子 Shell 变量传递与目录缺失问题
+# WireGuard 智能中转部署脚本 v132.3 (极简安装版)
+# 修复：强制开启 IP 转发，修复 iptables 规则优先级被系统默认链拦截导致不通的问题
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -293,7 +293,6 @@ init_relay() {
         [[ ! "$c" =~ ^[Yy]$ ]] && { pause_return; return; }
     fi
     
-    # 修复：使用子 Shell 继承变量，并提前创建目录
     (
         flock -x 200
         echo -e "${YELLOW}[*] 清理旧规则...${NC}"
@@ -327,6 +326,13 @@ EOF
         echo -e " IP: ${CYAN}${RELAY_IP}${NC} | 公钥: ${CYAN}${WG_PUB}${NC}"
         echo -e "=========================================="
     ) 200>"$LOCK_FILE"
+    
+    # 修复：无论用户是否执行系统优化，都在此强制开启内核转发，否则中转必不通
+    mkdir -p /etc/sysctl.d
+    echo "net.ipv4.ip_forward = 1" > "$IP_FORWARD_FILE"
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+    sysctl -p "$IP_FORWARD_FILE" > /dev/null 2>&1
+    
     if [ $? -ne 0 ]; then echo -e "${RED}❌ 初始化失败！${NC}"; fi
     pause_return
 }
@@ -508,13 +514,26 @@ bind_landing() {
         while iptables -t nat -D PREROUTING -p udp --dport "$MAP_PORT" 2>/dev/null; do :; done
         while iptables -t nat -D POSTROUTING -d "$LAND_IP" -j MASQUERADE 2>/dev/null; do :; done
         iptables -D FORWARD -d "$LAND_IP" -j ACCEPT 2>/dev/null; iptables -D FORWARD -s "$LAND_IP" -j ACCEPT 2>/dev/null
-        iptables -D INPUT -p tcp --dport "$MAP_PORT" -j ACCEPT 2>/dev/null; iptables -D INPUT -p udp --dport "$MAP_PORT" -j ACCEPT 2>/dev/null
         
-        iptables -t nat -A PREROUTING -p tcp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
-        iptables -t nat -A PREROUTING -p udp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
-        iptables -t nat -A POSTROUTING -d "$LAND_IP" -j MASQUERADE
-        iptables -A FORWARD -d "$LAND_IP" -j ACCEPT; iptables -A FORWARD -s "$LAND_IP" -j ACCEPT
-        iptables -A INPUT -p tcp --dport "$MAP_PORT" -j ACCEPT; iptables -A INPUT -p udp --dport "$MAP_PORT" -j ACCEPT
+        # 修复：使用 -I 插入到规则链顶部，避免被系统默认的 DROP 规则拦截
+        iptables -t nat -I PREROUTING 1 -p tcp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
+        iptables -t nat -I PREROUTING 1 -p udp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
+        iptables -t nat -I POSTROUTING 1 -d "$LAND_IP" -j MASQUERADE
+        iptables -I FORWARD 1 -d "$LAND_IP" -j ACCEPT
+        iptables -I FORWARD 1 -s "$LAND_IP" -j ACCEPT
+        
+        # 修复：兼容系统的 ufw 和 firewalld，防止端口被系统防火墙拦截
+        if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
+            ufw allow "$MAP_PORT"/tcp >/dev/null 2>&1
+            ufw allow "$MAP_PORT"/udp >/dev/null 2>&1
+        elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+            firewall-cmd --permanent --add-port="$MAP_PORT"/tcp >/dev/null 2>&1
+            firewall-cmd --permanent --add-port="$MAP_PORT"/udp >/dev/null 2>&1
+            firewall-cmd --reload >/dev/null 2>&1
+        else
+            iptables -I INPUT 1 -p tcp --dport "$MAP_PORT" -j ACCEPT
+            iptables -I INPUT 1 -p udp --dport "$MAP_PORT" -j ACCEPT
+        fi
         netfilter-persistent save > /dev/null 2>&1
         
         touch "$NODES_INFO"; sed -i "/|${NODE_NAME}$/d" "$NODES_INFO"; echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
@@ -568,9 +587,21 @@ add_relay_port() {
         iptables -D INPUT -p tcp --dport "$MAP_PORT" -j ACCEPT 2>/dev/null
         iptables -D INPUT -p udp --dport "$MAP_PORT" -j ACCEPT 2>/dev/null
         
-        iptables -t nat -A PREROUTING -p tcp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
-        iptables -t nat -A PREROUTING -p udp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
-        iptables -A INPUT -p tcp --dport "$MAP_PORT" -j ACCEPT; iptables -A INPUT -p udp --dport "$MAP_PORT" -j ACCEPT
+        # 修复：使用 -I 插入到顶部
+        iptables -t nat -I PREROUTING 1 -p tcp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
+        iptables -t nat -I PREROUTING 1 -p udp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
+        
+        if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
+            ufw allow "$MAP_PORT"/tcp >/dev/null 2>&1
+            ufw allow "$MAP_PORT"/udp >/dev/null 2>&1
+        elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+            firewall-cmd --permanent --add-port="$MAP_PORT"/tcp >/dev/null 2>&1
+            firewall-cmd --permanent --add-port="$MAP_PORT"/udp >/dev/null 2>&1
+            firewall-cmd --reload >/dev/null 2>&1
+        else
+            iptables -I INPUT 1 -p tcp --dport "$MAP_PORT" -j ACCEPT
+            iptables -I INPUT 1 -p udp --dport "$MAP_PORT" -j ACCEPT
+        fi
         netfilter-persistent save > /dev/null 2>&1
         
         touch "$NODES_INFO"; sed -i "/|${NODE_NAME}$/d" "$NODES_INFO"; echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
@@ -863,7 +894,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v132.2 (极简安装版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v132.3 (极简安装版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
