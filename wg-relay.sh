@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v139.0 (独立密钥版)
-# 修复：新增端口时直接生成全新密钥对，彻底告别提取旧公钥失败的报错
+# WireGuard 智能中转部署脚本 v140.0 (独立密钥与SNI优选版)
+# 修复：新增端口直接生成全新密钥并重新优选 SNI，增加启动检测防假死
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -610,13 +610,19 @@ add_landing_port() {
     while true; do 
         read -p "监听端口: " LAND_PORT < /dev/tty
         [[ "$LAND_PORT" =~ ^[0-9]+$ ]] && [ "$LAND_PORT" -ge 1 ] && [ "$LAND_PORT" -le 65535 ] || { echo -e "${RED}端口无效${NC}"; continue; }
-        ss -tulnp | grep -qE ":$LAND_PORT\b" && echo -e "${RED}❌ 端口占用${NC}" || break
+        if ss -tulnp | grep -qE ":$LAND_PORT\b"; then
+            echo -e "${RED}❌ 端口被系统占用${NC}"
+        elif jq -e --argjson p "$LAND_PORT" '.inbounds[] | select(.listen_port == $p)' /etc/sing-box/config.json >/dev/null 2>&1; then
+            echo -e "${RED}❌ 端口已在 Sing-box 中配置${NC}"
+        else
+            break
+        fi
     done
     
-    while true; do read -p "客户端连接端口: " MAP_PORT < /dev/tty; [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && break; echo -e "${RED}端口无效${NC}"; done
+    while true; do read -p "客户端连接端口 (需与中转机一致): " MAP_PORT < /dev/tty; [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && break; echo -e "${RED}端口无效${NC}"; done
     while true; do read -p "节点备注名称: " NODE_NAME < /dev/tty; [ -n "$NODE_NAME" ] && check_node_name "$NODE_NAME" && break; done
     
-    # 终极降维打击：直接为新端口生成全新的独立密钥对，彻底告别提取旧公钥失败的报错！
+    # 1. 终极降维打击：直接为新端口生成全新的独立密钥对，彻底告别提取旧公钥失败的报错！
     local REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null)
     local NEW_PRIV=$(echo "$REALITY_KEYS" | awk '/PrivateKey/{print $2}')
     local NEW_PUB=$(echo "$REALITY_KEYS" | awk '/PublicKey/{print $2}')
@@ -625,13 +631,11 @@ add_landing_port() {
     
     [ -z "$NEW_PRIV" ] || [ -z "$NEW_PUB" ] || [ -z "$NEW_UUID" ] && echo -e "${RED}❌ 密钥生成失败${NC}" && pause_return && return
     
-    # 复用基础节点的 SNI
-    local exist_sni=$(jq -r '.inbounds[] | select(.tls.reality != null) | .tls.server_name' /etc/sing-box/config.json | head -1)
-    [ -z "$exist_sni" ] && exist_sni="www.bing.com"
+    # 2. 终极修复：为新端口重新优选 SNI，绝不复用可能被墙的基础节点 SNI
+    local NEW_SNI=$(select_best_sni)
     
     local tmp_json="/tmp/sb_add_$$.json"
-    
-    jq --arg p "$LAND_PORT" --arg u "$NEW_UUID" --arg s "$exist_sni" --arg pk "$NEW_PRIV" --arg sid "$NEW_SID" \
+    jq --arg p "$LAND_PORT" --arg u "$NEW_UUID" --arg s "$NEW_SNI" --arg pk "$NEW_PRIV" --arg sid "$NEW_SID" \
        --arg listen "0.0.0.0" \
        '.inbounds += [{
            "type": "vless", "listen": $listen, "listen_port": ($p|tonumber),
@@ -648,12 +652,34 @@ add_landing_port() {
        }]' /etc/sing-box/config.json > "$tmp_json" 2>/dev/null
     
     ! jq empty "$tmp_json" 2>/dev/null && echo -e "${RED}❌ JSON 生成失败${NC}" && rm -f "$tmp_json" && pause_return && return
+    
+    # 3. 备份原配置，并写入新配置
+    cp /etc/sing-box/config.json /etc/sing-box/config.json.bak.$(date +%s)
     mv -f "$tmp_json" /etc/sing-box/config.json
+    
+    # 4. 校验配置文件语法
+    if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+        echo -e "${RED}❌ Sing-box 配置语法错误！已自动回滚。${NC}"
+        /usr/local/bin/sing-box check -c /etc/sing-box/config.json
+        mv -f /etc/sing-box/config.json.bak.* /etc/sing-box/config.json 2>/dev/null
+        pause_return; return
+    fi
+    
+    # 5. 重启服务并验证启动状态
     systemctl restart sing-box
+    sleep 1
+    if ! systemctl is-active --quiet sing-box; then
+        echo -e "${RED}❌ Sing-box 启动失败！已自动回滚。${NC}"
+        journalctl -u sing-box -n 5 --no-pager
+        mv -f /etc/sing-box/config.json.bak.* /etc/sing-box/config.json 2>/dev/null
+        systemctl restart sing-box
+        pause_return; return
+    fi
+    
     allow_port "$LAND_PORT"
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
-    VLESS_LINK="vless://${NEW_UUID}@${relay_ip}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${exist_sni}&fp=chrome&pbk=${NEW_PUB}&sid=${NEW_SID}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
+    VLESS_LINK="vless://${NEW_UUID}@${relay_ip}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${NEW_SNI}&fp=chrome&pbk=${NEW_PUB}&sid=${NEW_SID}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
     
     sed -i "/# ${NODE_NAME} START/,/# ${NODE_NAME} END/d" "$LAND_INFO"
     cat >> "$LAND_INFO" << EOF
@@ -662,12 +688,15 @@ add_landing_port() {
 中转机IP: $relay_ip
 客户端端口: $MAP_PORT
 落地机端口: $LAND_PORT
-SNI: $exist_sni
+SNI: $NEW_SNI
 Reality公钥: $NEW_PUB
 链接:
  $VLESS_LINK
 # ${NODE_NAME} END
 EOF
+    
+    # 清理多余备份
+    ls -t /etc/sing-box/config.json.bak.* 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null
     
     echo -e "${GREEN}=========================================="
     echo -e " 落地机新端口节点 [${NODE_NAME}] 添加成功！"
@@ -798,7 +827,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v139.0 (独立密钥版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v140.0 (独立密钥与SNI优选版) ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
