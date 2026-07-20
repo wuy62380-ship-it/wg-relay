@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v138.1 (完整功能版)
-# 修复：补全所有菜单选项，恢复 BBR/BBRv3 选择与 SNI 自动优选
+# WireGuard 智能中转部署脚本 v1 (YW版)
+# 修复：优化落地机新增端口时的公钥提取逻辑，防止误报格式错误
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -509,6 +509,7 @@ EOF
 客户端端口: $MAP_PORT
 落地机端口: $LAND_PORT
 SNI: $SNI
+Reality公钥: $SB_PUB
 链接:
  $VLESS_LINK
 # ${NODE_NAME} END
@@ -618,11 +619,24 @@ add_landing_port() {
     local exist_priv=$(jq -r '.inbounds[0].tls.reality.private_key' /etc/sing-box/config.json)
     local exist_sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' /etc/sing-box/config.json)
     local exist_sni=$(jq -r '.inbounds[0].tls.server_name' /etc/sing-box/config.json)
-    local exist_pub=$(grep -oE 'pbk=[a-zA-Z0-9+/=]+' "$LAND_INFO" | head -1 | sed 's/^pbk=//')
+    
+    # 优化提取公钥逻辑：优先读字段，读不到从链接截取，再读不到提示手动输入
+    local exist_pub=$(grep "^Reality公钥:" "$LAND_INFO" | head -1 | awk '{print $2}')
+    if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
+        exist_pub=$(grep -oE 'pbk=[A-Za-z0-9+/=]+' "$LAND_INFO" | head -1 | sed 's/^pbk=//')
+    fi
     
     [ -z "$exist_priv" ] || [ -z "$exist_sid" ] || [ -z "$exist_sni" ] && echo -e "${RED}❌ 读取基础配置失败${NC}" && pause_return && return
-    [ -z "$exist_pub" ] && read -p "请输入 PublicKey (pbk): " exist_pub < /dev/tty
-    ! check_pub_key "$exist_pub" && echo -e "${RED}❌ 公钥格式错误${NC}" && pause_return && return
+    
+    if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
+        echo -e "${YELLOW}⚠ 未找到合法公钥记录。为了不影响旧节点，请输入第一个节点的 PublicKey (pbk)：${NC}"
+        read -p "PublicKey (pbk): " exist_pub < /dev/tty
+    fi
+    
+    if ! check_pub_key "$exist_pub"; then
+        echo -e "${RED}❌ 公钥格式不正确！操作取消。${NC}"
+        pause_return; return
+    fi
     
     local UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null)
     local tmp_json="/tmp/sb_add_$$.json"
@@ -659,6 +673,7 @@ add_landing_port() {
 客户端端口: $MAP_PORT
 落地机端口: $LAND_PORT
 SNI: $exist_sni
+Reality公钥: $exist_pub
 链接:
  $VLESS_LINK
 # ${NODE_NAME} END
@@ -793,7 +808,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v138.1 (完整功能版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v1 (YW版)      ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
