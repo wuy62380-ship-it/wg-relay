@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v132.9 (极简安装版)
-# 修复：删除 Reality 服务端配置中多余的 public_key 字段，增加启动前强制校验，防止服务假死
+# WireGuard 智能中转部署脚本 v133.0 (终极打通版)
+# 修复：强制 NTP 时间同步、彻底放行 wg0 隧道流量、删除多余的 Reality public_key
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -53,18 +53,22 @@ restart_wg() {
     return 0
 }
 
+# 终极防火墙放行函数：不仅放行公网端口，还彻底放行 wg0 隧道接口
 allow_port() {
     local port=$1
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
         ufw allow "$port"/tcp >/dev/null 2>&1
         ufw allow "$port"/udp >/dev/null 2>&1
+        ufw allow in on wg0 >/dev/null 2>&1  # 关键修复：放行 WG 隧道所有流量
     elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
         firewall-cmd --permanent --add-port="$port"/tcp >/dev/null 2>&1
         firewall-cmd --permanent --add-port="$port"/udp >/dev/null 2>&1
+        firewall-cmd --permanent --zone=trusted --add-interface=wg0 >/dev/null 2>&1 # 关键修复：将 wg0 设为信任区
         firewall-cmd --reload >/dev/null 2>&1
     else
         iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT 2>/dev/null
         iptables -I INPUT 1 -p udp --dport "$port" -j ACCEPT 2>/dev/null
+        iptables -I INPUT 1 -i wg0 -j ACCEPT 2>/dev/null # 关键修复：放行 WG 隧道所有流量
     fi
 }
 
@@ -127,14 +131,9 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
+# 终极时间校准：强制通过 NTP 同步，如果失败则用 HTTP 头兜底
 force_sync_time() {
     echo -e "${YELLOW}[*] 正在校准系统时间...${NC}"
-    
-    if command -v timedatectl >/dev/null 2>&1; then
-        timedatectl set-ntp true >/dev/null 2>&1
-        systemctl restart systemd-timesyncd >/dev/null 2>&1
-        sleep 1
-    fi
     
     apt-get install -y ntpdate >/dev/null 2>&1
     if command -v ntpdate >/dev/null 2>&1; then
@@ -143,7 +142,8 @@ force_sync_time() {
     fi
     
     local current_year=$(date +%Y)
-    if [ "$current_year" -lt 2000 ]; then
+    # 只有当年份离谱时才用 HTTP 兜底
+    if [ "$current_year" -lt 2023 ] || [ "$current_year" -gt 2025 ]; then
         echo -e "${YELLOW}⚠ 检测到系统时间异常($current_year)，尝试通过 HTTP 兜底校准...${NC}"
         local sys_time=""
         for url in "http://1.1.1.1" "http://www.baidu.com" "http://connect.rom.miui.com"; do
@@ -359,14 +359,13 @@ EOF
     mkdir -p /etc/sysctl.d
     cat > "$IP_FORWARD_FILE" << EOF
 net.ipv4.ip_forward = 1
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
 EOF
     sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.conf.all.rp_filter=2 > /dev/null 2>&1
+    sysctl -w net.ipv4.conf.all.rp_filter=0 > /dev/null 2>&1
     sysctl -p "$IP_FORWARD_FILE" > /dev/null 2>&1
     
-    # 放行 WG 端口
     allow_port "$WG_PORT"
     
     if [ $? -ne 0 ]; then echo -e "${RED}❌ 初始化失败！${NC}"; fi
@@ -462,11 +461,11 @@ EOF
     mkdir -p /etc/sysctl.d
     cat > "$IP_FORWARD_FILE" << EOF
 net.ipv4.ip_forward = 1
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
 EOF
     sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.conf.all.rp_filter=2 > /dev/null 2>&1
+    sysctl -w net.ipv4.conf.all.rp_filter=0 > /dev/null 2>&1
     sysctl -p "$IP_FORWARD_FILE" > /dev/null 2>&1
     
     local default_if=$(ip route show default | awk '/default/ {print $5}')
@@ -483,7 +482,7 @@ EOF
     UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
     if [ -z "$SB_PUB" ] || [ -z "$UUID" ]; then echo -e "${RED}❌ 密钥生成失败！${NC}"; pause_return; return; fi
 
-    # 修复：彻底删除服务端配置中的 public_key，否则 sing-box 会校验失败拒绝启动！
+    # 终极修复：彻底删除服务端配置中的 public_key
     cat > /etc/sing-box/config.json << EOF
 {
   "inbounds": [{
@@ -503,7 +502,7 @@ EOF
 }
 EOF
 
-    # 修复：增加启动前强制语法校验，防止假成功
+    # 终极修复：启动前强制校验，失败直接报错退出
     if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
         echo -e "${RED}❌ Sing-box 配置文件语法错误！请检查 JSON 格式。${NC}"
         /usr/local/bin/sing-box check -c /etc/sing-box/config.json
@@ -514,7 +513,6 @@ EOF
     if ! restart_wg; then pause_return; return; fi
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
     
-    # 放行落地机端口和 WG 端口
     allow_port "$LAND_PORT"
     allow_port "$WG_PORT"
     
@@ -697,7 +695,7 @@ add_landing_port() {
     local UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null)
     
     local tmp_json="/tmp/sb_add_$$.json"
-    # 修复：彻底删除服务端配置中的 public_key，否则 sing-box 会校验失败拒绝启动！
+    # 终极修复：彻底删除服务端配置中的 public_key
     if ! jq --arg p "$LAND_PORT" --arg u "$UUID" --arg s "$SNI" --arg pk "$exist_priv" --arg sid "$exist_sid" \
        --arg listen "0.0.0.0" --arg pub "$SB_PUB" \
        '.inbounds += [{
@@ -726,7 +724,7 @@ add_landing_port() {
     
     mv -f "$tmp_json" /etc/sing-box/config.json
     
-    # 修复：增加启动前强制语法校验，防止假成功
+    # 终极修复：启动前强制校验，失败直接报错退出
     if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
         echo -e "${RED}❌ Sing-box 配置文件语法错误！原配置已覆盖，请检查。${NC}"
         /usr/local/bin/sing-box check -c /etc/sing-box/config.json
@@ -933,7 +931,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v132.9 (极简安装版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v133.0 (终极打通版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
