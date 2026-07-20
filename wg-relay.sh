@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v1.0 (YW版)
-# 修复：重构三重公钥提取逻辑，彻底消灭提取失败报错
+# WireGuard 智能中转部署脚本 v138.5 (字符串切割终极修复版)
+# 修复：使用 sed 替代 cut 防止公钥末尾的 = 被截断，增加私钥自动补 = 逻辑
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -616,7 +616,6 @@ add_landing_port() {
     while true; do read -p "客户端连接端口: " MAP_PORT < /dev/tty; [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && break; echo -e "${RED}端口无效${NC}"; done
     while true; do read -p "节点备注名称: " NODE_NAME < /dev/tty; [ -n "$NODE_NAME" ] && check_node_name "$NODE_NAME" && break; done
     
-    # 终极修复：精准遍历 JSON 中的 reality 节点提取基础信息
     local exist_priv=$(jq -r '.inbounds[] | select(.tls.reality != null) | .tls.reality.private_key' /etc/sing-box/config.json | head -1)
     local exist_sid=$(jq -r '.inbounds[] | select(.tls.reality != null) | .tls.reality.short_id[0]' /etc/sing-box/config.json | head -1)
     local exist_sni=$(jq -r '.inbounds[] | select(.tls.reality != null) | .tls.server_name' /etc/sing-box/config.json | head -1)
@@ -626,16 +625,26 @@ add_landing_port() {
     local exist_pub=""
     
     # 1. 尝试从记录文件直接读取公钥
-    exist_pub=$(grep "^Reality公钥:" "$LAND_INFO" | head -1 | awk '{print $2}')
+    if grep -q "^Reality公钥:" "$LAND_INFO"; then
+        exist_pub=$(grep "^Reality公钥:" "$LAND_INFO" | head -1 | awk '{print $2}')
+    fi
     
-    # 2. 尝试从链接中精准提取 pbk 参数 (遇到 & 截止)
+    # 2. 终极修复：使用 sed 替代 cut 提取链接中的 pbk，防止公钥末尾的 = 被截断
     if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
-        exist_pub=$(grep -oE 'pbk=[^&]+' "$LAND_INFO" | head -1 | cut -d'=' -f2)
+        local link_pub=$(grep -oE 'pbk=[^&]+' "$LAND_INFO" | head -1 | sed 's/^pbk=//')
+        if [ -n "$link_pub" ]; then
+            # 补齐公钥末尾的 =
+            [[ "$link_pub" != *= ]] && link_pub="${link_pub}="
+            exist_pub="$link_pub"
+        fi
     fi
     
     # 3. 尝试用 wg 命令从私钥反算
     if { [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; } && command -v wg >/dev/null 2>&1; then
-        exist_pub=$(printf '%s\n' "$exist_priv" | wg pubkey 2>/dev/null)
+        local tmp_priv="$exist_priv"
+        # 补齐私钥末尾的 = (wg 命令要求标准 Base64)
+        [[ "$tmp_priv" != *= ]] && tmp_priv="${tmp_priv}="
+        exist_pub=$(printf '%s\n' "$tmp_priv" | wg pubkey 2>/dev/null)
     fi
     
     # 4. 极端情况兜底：允许手动输入
@@ -821,7 +830,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v1.0 (YW版)      ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v138.5 (字符串切割终极修复)  ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
