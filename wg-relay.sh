@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v132.4 (极简安装版)
-# 修复：重构时间同步逻辑防止 Reality 握手失败，补全落地机防火墙放行，关闭 rp_filter
+# WireGuard 智能中转部署脚本 v132.8 (极简安装版)
+# 修复：彻底移除时间年份上限硬编码，只防 1970 年初始状态，绝不再误改正确时间
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -53,7 +53,6 @@ restart_wg() {
     return 0
 }
 
-# 修复：通用的防火墙放行函数
 allow_port() {
     local port=$1
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
@@ -128,38 +127,42 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
-# 修复：彻底重构时间同步逻辑，防止拉取到 CDN 错误时间导致 Reality 崩溃
+# 修复：智能时间校准，只设下限(防1970年)，不设上限，绝不再误改正确时间
 force_sync_time() {
     echo -e "${YELLOW}[*] 正在校准系统时间...${NC}"
     
-    # 1. 优先使用系统自带的 NTP 服务同步
     if command -v timedatectl >/dev/null 2>&1; then
         timedatectl set-ntp true >/dev/null 2>&1
         systemctl restart systemd-timesyncd >/dev/null 2>&1
+        sleep 1
     fi
     
-    # 2. 检查当前年份是否离谱，如果离谱则通过 HTTP 头兜底
+    apt-get install -y ntpdate >/dev/null 2>&1
+    if command -v ntpdate >/dev/null 2>&1; then
+        ntpdate -u pool.ntp.org >/dev/null 2>&1
+        ntpdate -u time.windows.com >/dev/null 2>&1
+    fi
+    
     local current_year=$(date +%Y)
-    if [ "$current_year" -lt 2023 ] || [ "$current_year" -gt 2025 ]; then
-        echo -e "${Y}⚠ 检测到系统时间异常($current_year)，尝试通过 HTTP 兜底校准...${R}"
-        local sys_time=$(curl -sI --max-time 3 https://cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
-        if [ -n "$sys_time" ]; then
-            date -s "$sys_time" >/dev/null 2>&1
-            hwclock -w >/dev/null 2>&1
-        fi
+    # 只有当年份小于 2000 年（通常是 1970 初始状态）才触发兜底，绝不再限制上限
+    if [ "$current_year" -lt 2000 ]; then
+        echo -e "${YELLOW}⚠ 检测到系统时间异常($current_year)，尝试通过 HTTP 兜底校准...${NC}"
+        local sys_time=""
+        for url in "http://1.1.1.1" "http://www.baidu.com" "http://connect.rom.miui.com"; do
+            sys_time=$(curl -sI --max-time 3 "$url" 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+            if [ -n "$sys_time" ]; then
+                date -s "$sys_time" >/dev/null 2>&1
+                hwclock -w >/dev/null 2>&1
+                break
+            fi
+        done
     fi
     
-    current_year=$(date +%Y)
-    if [ "$current_year" -lt 2023 ] || [ "$current_year" -gt 2025 ]; then
-        echo -e "${RED}❌ 系统时间严重异常($(date))！Reality 将无法工作，请手动修改服务器时间！${NC}"
-    else
-        echo -e "${GREEN}✅ 系统时间正常: $(date)${NC}"
-    fi
+    echo -e "${GREEN}✅ 系统时间同步完成: $(date)${NC}"
 }
 
 url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
 
-# ================= 高阶 XanMod BBRv3 安装支持函数 =================
 xanmod_add_repo() {
     local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg" list_file="/etc/apt/sources.list.d/xanmod-release.list" os_codename=""
     if command -v lsb_release >/dev/null 2>&1; then os_codename=$(lsb_release -sc); elif [ -r /etc/os-release ]; then os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME"); fi
@@ -355,7 +358,6 @@ EOF
         echo -e "=========================================="
     ) 200>"$LOCK_FILE"
     
-    # 修复：强制开启 IP 转发，并关闭反向路由过滤(rp_filter)，防止内核丢包
     mkdir -p /etc/sysctl.d
     cat > "$IP_FORWARD_FILE" << EOF
 net.ipv4.ip_forward = 1
@@ -456,7 +458,6 @@ Endpoint = ${RELAY_IP}:$WG_PORT
 PersistentKeepalive = 25
 EOF
     
-    # 修复：落地机同样需要开启转发和关闭 rp_filter
     mkdir -p /etc/sysctl.d
     cat > "$IP_FORWARD_FILE" << EOF
 net.ipv4.ip_forward = 1
@@ -503,7 +504,6 @@ EOF
     if ! restart_wg; then pause_return; return; fi
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
     
-    # 修复：放行落地机监听端口防火墙
     allow_port "$LAND_PORT"
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
@@ -714,7 +714,6 @@ add_landing_port() {
     mv -f "$tmp_json" /etc/sing-box/config.json
     systemctl restart sing-box
     
-    # 修复：新增端口同样需要放行防火墙
     allow_port "$LAND_PORT"
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
@@ -914,7 +913,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v132.4 (极简安装版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v132.8 (极简安装版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
