@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v132.3 (极简安装版)
-# 修复：强制开启 IP 转发，修复 iptables 规则优先级被系统默认链拦截导致不通的问题
+# WireGuard 智能中转部署脚本 v132.4 (极简安装版)
+# 修复：重构时间同步逻辑防止 Reality 握手失败，补全落地机防火墙放行，关闭 rp_filter
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -51,6 +51,22 @@ restart_wg() {
         return 1
     fi
     return 0
+}
+
+# 修复：通用的防火墙放行函数
+allow_port() {
+    local port=$1
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
+        ufw allow "$port"/tcp >/dev/null 2>&1
+        ufw allow "$port"/udp >/dev/null 2>&1
+    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --add-port="$port"/tcp >/dev/null 2>&1
+        firewall-cmd --permanent --add-port="$port"/udp >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+    else
+        iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT 2>/dev/null
+        iptables -I INPUT 1 -p udp --dport "$port" -j ACCEPT 2>/dev/null
+    fi
 }
 
 prepare_env() {
@@ -112,20 +128,32 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
+# 修复：彻底重构时间同步逻辑，防止拉取到 CDN 错误时间导致 Reality 崩溃
 force_sync_time() {
-    echo -e "${YELLOW}[*] 正在强制校准系统时间...${NC}"
-    command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp false >/dev/null 2>&1
-    local sys_time=""
-    sys_time=$(curl -k -s --connect-timeout 3 --max-time 5 -I https://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
-    if [ -z "$sys_time" ]; then
-        sys_time=$(curl -s --connect-timeout 3 --max-time 5 -I http://www.cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+    echo -e "${YELLOW}[*] 正在校准系统时间...${NC}"
+    
+    # 1. 优先使用系统自带的 NTP 服务同步
+    if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl set-ntp true >/dev/null 2>&1
+        systemctl restart systemd-timesyncd >/dev/null 2>&1
     fi
-    if [[ "$sys_time" =~ [A-Za-z]{3},\ [0-9]{2}\ [A-Za-z]{3}\ [0-9]{4}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ (GMT|UTC) ]]; then
-        date -s "$sys_time" >/dev/null 2>&1
-        hwclock -w >/dev/null 2>&1
-        echo -e "${GREEN}✅ 时间已强制校准至: $(date)${NC}"
+    
+    # 2. 检查当前年份是否离谱，如果离谱则通过 HTTP 头兜底
+    local current_year=$(date +%Y)
+    if [ "$current_year" -lt 2023 ] || [ "$current_year" -gt 2025 ]; then
+        echo -e "${Y}⚠ 检测到系统时间异常($current_year)，尝试通过 HTTP 兜底校准...${R}"
+        local sys_time=$(curl -sI --max-time 3 https://cloudflare.com 2>/dev/null | grep -i '^date:' | sed 's/^[Dd]ate: //g' | tr -d '\r')
+        if [ -n "$sys_time" ]; then
+            date -s "$sys_time" >/dev/null 2>&1
+            hwclock -w >/dev/null 2>&1
+        fi
+    fi
+    
+    current_year=$(date +%Y)
+    if [ "$current_year" -lt 2023 ] || [ "$current_year" -gt 2025 ]; then
+        echo -e "${RED}❌ 系统时间严重异常($(date))！Reality 将无法工作，请手动修改服务器时间！${NC}"
     else
-        echo -e "${RED}⚠ 无法获取网络时间！请确保服务器时间正确，否则 Reality 将失败！${NC}"
+        echo -e "${GREEN}✅ 系统时间正常: $(date)${NC}"
     fi
 }
 
@@ -327,10 +355,15 @@ EOF
         echo -e "=========================================="
     ) 200>"$LOCK_FILE"
     
-    # 修复：无论用户是否执行系统优化，都在此强制开启内核转发，否则中转必不通
+    # 修复：强制开启 IP 转发，并关闭反向路由过滤(rp_filter)，防止内核丢包
     mkdir -p /etc/sysctl.d
-    echo "net.ipv4.ip_forward = 1" > "$IP_FORWARD_FILE"
+    cat > "$IP_FORWARD_FILE" << EOF
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+EOF
     sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.conf.all.rp_filter=2 > /dev/null 2>&1
     sysctl -p "$IP_FORWARD_FILE" > /dev/null 2>&1
     
     if [ $? -ne 0 ]; then echo -e "${RED}❌ 初始化失败！${NC}"; fi
@@ -423,9 +456,15 @@ Endpoint = ${RELAY_IP}:$WG_PORT
 PersistentKeepalive = 25
 EOF
     
+    # 修复：落地机同样需要开启转发和关闭 rp_filter
     mkdir -p /etc/sysctl.d
-    echo "net.ipv4.ip_forward = 1" > "$IP_FORWARD_FILE"
+    cat > "$IP_FORWARD_FILE" << EOF
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+EOF
     sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.conf.all.rp_filter=2 > /dev/null 2>&1
     sysctl -p "$IP_FORWARD_FILE" > /dev/null 2>&1
     
     local default_if=$(ip route show default | awk '/default/ {print $5}')
@@ -463,6 +502,9 @@ EOF
     systemctl enable wg-quick@wg0 > /dev/null 2>&1
     if ! restart_wg; then pause_return; return; fi
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
+    
+    # 修复：放行落地机监听端口防火墙
+    allow_port "$LAND_PORT"
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
     VLESS_LINK="vless://${UUID}@${RELAY_IP}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
@@ -515,25 +557,13 @@ bind_landing() {
         while iptables -t nat -D POSTROUTING -d "$LAND_IP" -j MASQUERADE 2>/dev/null; do :; done
         iptables -D FORWARD -d "$LAND_IP" -j ACCEPT 2>/dev/null; iptables -D FORWARD -s "$LAND_IP" -j ACCEPT 2>/dev/null
         
-        # 修复：使用 -I 插入到规则链顶部，避免被系统默认的 DROP 规则拦截
         iptables -t nat -I PREROUTING 1 -p tcp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
         iptables -t nat -I PREROUTING 1 -p udp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
         iptables -t nat -I POSTROUTING 1 -d "$LAND_IP" -j MASQUERADE
         iptables -I FORWARD 1 -d "$LAND_IP" -j ACCEPT
         iptables -I FORWARD 1 -s "$LAND_IP" -j ACCEPT
         
-        # 修复：兼容系统的 ufw 和 firewalld，防止端口被系统防火墙拦截
-        if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
-            ufw allow "$MAP_PORT"/tcp >/dev/null 2>&1
-            ufw allow "$MAP_PORT"/udp >/dev/null 2>&1
-        elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-            firewall-cmd --permanent --add-port="$MAP_PORT"/tcp >/dev/null 2>&1
-            firewall-cmd --permanent --add-port="$MAP_PORT"/udp >/dev/null 2>&1
-            firewall-cmd --reload >/dev/null 2>&1
-        else
-            iptables -I INPUT 1 -p tcp --dport "$MAP_PORT" -j ACCEPT
-            iptables -I INPUT 1 -p udp --dport "$MAP_PORT" -j ACCEPT
-        fi
+        allow_port "$MAP_PORT"
         netfilter-persistent save > /dev/null 2>&1
         
         touch "$NODES_INFO"; sed -i "/|${NODE_NAME}$/d" "$NODES_INFO"; echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
@@ -584,24 +614,11 @@ add_relay_port() {
         
         while iptables -t nat -D PREROUTING -p tcp --dport "$MAP_PORT" 2>/dev/null; do :; done
         while iptables -t nat -D PREROUTING -p udp --dport "$MAP_PORT" 2>/dev/null; do :; done
-        iptables -D INPUT -p tcp --dport "$MAP_PORT" -j ACCEPT 2>/dev/null
-        iptables -D INPUT -p udp --dport "$MAP_PORT" -j ACCEPT 2>/dev/null
         
-        # 修复：使用 -I 插入到顶部
         iptables -t nat -I PREROUTING 1 -p tcp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
         iptables -t nat -I PREROUTING 1 -p udp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
         
-        if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
-            ufw allow "$MAP_PORT"/tcp >/dev/null 2>&1
-            ufw allow "$MAP_PORT"/udp >/dev/null 2>&1
-        elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-            firewall-cmd --permanent --add-port="$MAP_PORT"/tcp >/dev/null 2>&1
-            firewall-cmd --permanent --add-port="$MAP_PORT"/udp >/dev/null 2>&1
-            firewall-cmd --reload >/dev/null 2>&1
-        else
-            iptables -I INPUT 1 -p tcp --dport "$MAP_PORT" -j ACCEPT
-            iptables -I INPUT 1 -p udp --dport "$MAP_PORT" -j ACCEPT
-        fi
+        allow_port "$MAP_PORT"
         netfilter-persistent save > /dev/null 2>&1
         
         touch "$NODES_INFO"; sed -i "/|${NODE_NAME}$/d" "$NODES_INFO"; echo "${MAP_PORT}|${LAND_IP}|${LAND_PORT}|${NODE_NAME}" >> "$NODES_INFO"
@@ -696,6 +713,9 @@ add_landing_port() {
     
     mv -f "$tmp_json" /etc/sing-box/config.json
     systemctl restart sing-box
+    
+    # 修复：新增端口同样需要放行防火墙
+    allow_port "$LAND_PORT"
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
     VLESS_LINK="vless://${UUID}@${relay_ip}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${exist_sid}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
@@ -894,7 +914,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v132.3 (极简安装版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v132.4 (极简安装版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
