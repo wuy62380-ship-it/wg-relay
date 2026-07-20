@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v133.0 (终极打通版)
-# 修复：强制 NTP 时间同步、彻底放行 wg0 隧道流量、删除多余的 Reality public_key
+# WireGuard 智能中转部署脚本 v133.1 (终极打通版)
+# 修复：MTU 降至 1280 防大包丢包，新增网络深度诊断功能
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -53,22 +53,21 @@ restart_wg() {
     return 0
 }
 
-# 终极防火墙放行函数：不仅放行公网端口，还彻底放行 wg0 隧道接口
 allow_port() {
     local port=$1
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
         ufw allow "$port"/tcp >/dev/null 2>&1
         ufw allow "$port"/udp >/dev/null 2>&1
-        ufw allow in on wg0 >/dev/null 2>&1  # 关键修复：放行 WG 隧道所有流量
+        ufw allow in on wg0 >/dev/null 2>&1
     elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
         firewall-cmd --permanent --add-port="$port"/tcp >/dev/null 2>&1
         firewall-cmd --permanent --add-port="$port"/udp >/dev/null 2>&1
-        firewall-cmd --permanent --zone=trusted --add-interface=wg0 >/dev/null 2>&1 # 关键修复：将 wg0 设为信任区
+        firewall-cmd --permanent --zone=trusted --add-interface=wg0 >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
     else
         iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT 2>/dev/null
         iptables -I INPUT 1 -p udp --dport "$port" -j ACCEPT 2>/dev/null
-        iptables -I INPUT 1 -i wg0 -j ACCEPT 2>/dev/null # 关键修复：放行 WG 隧道所有流量
+        iptables -I INPUT 1 -i wg0 -j ACCEPT 2>/dev/null
     fi
 }
 
@@ -131,7 +130,6 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
-# 终极时间校准：强制通过 NTP 同步，如果失败则用 HTTP 头兜底
 force_sync_time() {
     echo -e "${YELLOW}[*] 正在校准系统时间...${NC}"
     
@@ -142,7 +140,6 @@ force_sync_time() {
     fi
     
     local current_year=$(date +%Y)
-    # 只有当年份离谱时才用 HTTP 兜底
     if [ "$current_year" -lt 2023 ] || [ "$current_year" -gt 2025 ]; then
         echo -e "${YELLOW}⚠ 检测到系统时间异常($current_year)，尝试通过 HTTP 兜底校准...${NC}"
         local sys_time=""
@@ -155,7 +152,6 @@ force_sync_time() {
             fi
         done
     fi
-    
     echo -e "${GREEN}✅ 系统时间同步完成: $(date)${NC}"
 }
 
@@ -337,12 +333,13 @@ init_relay() {
         RELAY_IP=$(get_pub_ip)
         if [ -z "$RELAY_IP" ]; then echo -e "${RED}无法获取公网IP${NC}"; exit 1; fi
         
+        # 修复：MTU 降至 1280，防止大包在线路中被丢弃
         cat > "$WG_CONF" << EOF
 [Interface]
 PrivateKey = $WG_PRIV
 Address = 10.0.0.1/24
 ListenPort = $WG_PORT
-MTU = 1380
+MTU = 1280
 EOF
         systemctl enable wg-quick@wg0 > /dev/null 2>&1
         wg-quick down wg0 >/dev/null 2>&1
@@ -445,12 +442,13 @@ deploy_landing() {
 
     mkdir -p /etc/wireguard
     WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey)
+    # 修复：MTU 降至 1280，防止大包在线路中被丢弃
     cat > $WG_CONF << EOF
 [Interface]
 PrivateKey = $WG_PRIV
 Address = ${LAND_IP}/24
 ListenPort = $WG_PORT
-MTU = 1380
+MTU = 1280
 [Peer]
 PublicKey = $RELAY_PUB
 AllowedIPs = 10.0.0.1/32
@@ -482,7 +480,6 @@ EOF
     UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
     if [ -z "$SB_PUB" ] || [ -z "$UUID" ]; then echo -e "${RED}❌ 密钥生成失败！${NC}"; pause_return; return; fi
 
-    # 终极修复：彻底删除服务端配置中的 public_key
     cat > /etc/sing-box/config.json << EOF
 {
   "inbounds": [{
@@ -502,7 +499,6 @@ EOF
 }
 EOF
 
-    # 终极修复：启动前强制校验，失败直接报错退出
     if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
         echo -e "${RED}❌ Sing-box 配置文件语法错误！请检查 JSON 格式。${NC}"
         /usr/local/bin/sing-box check -c /etc/sing-box/config.json
@@ -695,7 +691,6 @@ add_landing_port() {
     local UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null)
     
     local tmp_json="/tmp/sb_add_$$.json"
-    # 终极修复：彻底删除服务端配置中的 public_key
     if ! jq --arg p "$LAND_PORT" --arg u "$UUID" --arg s "$SNI" --arg pk "$exist_priv" --arg sid "$exist_sid" \
        --arg listen "0.0.0.0" --arg pub "$SB_PUB" \
        '.inbounds += [{
@@ -724,7 +719,6 @@ add_landing_port() {
     
     mv -f "$tmp_json" /etc/sing-box/config.json
     
-    # 终极修复：启动前强制校验，失败直接报错退出
     if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
         echo -e "${RED}❌ Sing-box 配置文件语法错误！原配置已覆盖，请检查。${NC}"
         /usr/local/bin/sing-box check -c /etc/sing-box/config.json
@@ -880,6 +874,60 @@ ping_test() {
     pause_return
 }
 
+# 新增：网络深度诊断功能
+network_diagnosis() {
+    clear; echo -e "${YELLOW}━━━ 网络深度诊断 ━━━${NC}"
+    echo ""
+    echo -e "${CYAN}[1] WireGuard 接口状态${NC}"
+    if ip link show wg0 >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ wg0 接口已启动${NC}"
+        echo -e "最新握手状态:"
+        wg show wg0 | grep -E "peer|endpoint|latest handshake|transfer"
+    else
+        echo -e "${RED}❌ wg0 接口未启动！请检查 WG 配置或重新初始化。${NC}"
+    fi
+    
+    echo ""
+    echo -e "${CYAN}[2] Sing-box 服务状态${NC}"
+    if systemctl is-active --quiet sing-box; then
+        echo -e "${GREEN}✓ Sing-box 正在运行${NC}"
+        echo -e "监听端口:"
+        ss -tulnp | grep sing-box
+    else
+        echo -e "${RED}❌ Sing-box 未运行！请检查配置文件。${NC}"
+        echo -e "最近 10 行日志:"
+        journalctl -u sing-box -n 10 --no-pager
+    fi
+    
+    echo ""
+    echo -e "${CYAN}[3] 系统转发与防火墙状态${NC}"
+    local fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+    if [ "$fwd" == "1" ]; then
+        echo -e "${GREEN}✓ IP 转发已开启${NC}"
+    else
+        echo -e "${RED}❌ IP 转发未开启！请重新执行系统优化。${NC}"
+    fi
+    
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
+        echo -e "UFW 防火墙状态: ${YELLOW}开启${NC} (已自动放行 wg0)"
+    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        echo -e "Firewalld 防火墙状态: ${YELLOW}开启${NC} (已自动放行 wg0)"
+    else
+        echo -e "Iptables 防火墙状态: ${GREEN}无限制/已放行${NC}"
+    fi
+    
+    echo ""
+    echo -e "${RED}==================================================${NC}"
+    echo -e "${RED}如果以上都正常但节点还是不通，绝对只有一个原因：${NC}"
+    echo -e "${YELLOW}您的云服务器网页后台（安全组）没有放行端口！${NC}"
+    echo -e "请登录阿里云/腾讯云/AWS等控制台，放行以下端口："
+    echo -e "  1. UDP 51820 (WG 隧道端口)"
+    echo -e "  2. TCP/UDP 客户端连接端口 (如 17933)"
+    echo -e "  3. TCP/UDP 落地机监听端口 (如 17934)"
+    echo -e "${RED}==================================================${NC}"
+    pause_return
+}
+
 uninstall_all() {
     clear; echo -e "${YELLOW}━━━ 一键卸载环境 ━━━${NC}"
     read -p "${RED}⚠️ 此操作将删除所有 WG 配置、Sing-box 及转发规则！确定？[y/N]: ${NC}" c < /dev/tty
@@ -931,18 +979,18 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v133.0 (终极打通版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v133.1 (终极打通版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}7${NC} 落地-看信息  ${GREEN}8${NC} 中转-加端口    ${GREEN}9${NC} 落地-加端口    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}a${NC} 中转-删端口  ${GREEN}b${NC} 落地-删端口    ${GREEN}c${NC} 查看-转发规则  ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}d${NC} 一键卸载    ${GREEN}e${NC} Ping-连通测试                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}d${NC} 一键卸载    ${GREEN}e${NC} Ping-连通测试  ${GREEN}f${NC} 网络-深度诊断 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}0${NC} 退出                                      ${CYAN}║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
     
     read -p "选: " c < /dev/tty
     case $c in
-        1) tune_system;; 2) init_relay;; 3) gen_landing_code;; 4) deploy_landing;; 5) bind_landing;; 6) list_relay_nodes;; 7) list_landing_nodes;; 8) add_relay_port;; 9) add_landing_port;; a|A) delete_relay_by_port;; b|B) delete_landing_by_port;; c|C) view_iptables;; d|D) uninstall_all;; e|E) ping_test;; 0) exit 0;; *) echo "错误"; sleep 1;;
+        1) tune_system;; 2) init_relay;; 3) gen_landing_code;; 4) deploy_landing;; 5) bind_landing;; 6) list_relay_nodes;; 7) list_landing_nodes;; 8) add_relay_port;; 9) add_landing_port;; a|A) delete_relay_by_port;; b|B) delete_landing_by_port;; c|C) view_iptables;; d|D) uninstall_all;; e|E) ping_test;; f|F) network_diagnosis;; 0) exit 0;; *) echo "错误"; sleep 1;;
     esac
 done
