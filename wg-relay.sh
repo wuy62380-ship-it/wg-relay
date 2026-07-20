@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v138.5 (字符串切割终极修复版)
-# 修复：使用 sed 替代 cut 防止公钥末尾的 = 被截断，增加私钥自动补 = 逻辑
+# WireGuard 智能中转部署脚本 v139.0 (独立密钥版)
+# 修复：新增端口时直接生成全新密钥对，彻底告别提取旧公钥失败的报错
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -616,55 +616,23 @@ add_landing_port() {
     while true; do read -p "客户端连接端口: " MAP_PORT < /dev/tty; [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && break; echo -e "${RED}端口无效${NC}"; done
     while true; do read -p "节点备注名称: " NODE_NAME < /dev/tty; [ -n "$NODE_NAME" ] && check_node_name "$NODE_NAME" && break; done
     
-    local exist_priv=$(jq -r '.inbounds[] | select(.tls.reality != null) | .tls.reality.private_key' /etc/sing-box/config.json | head -1)
-    local exist_sid=$(jq -r '.inbounds[] | select(.tls.reality != null) | .tls.reality.short_id[0]' /etc/sing-box/config.json | head -1)
+    # 终极降维打击：直接为新端口生成全新的独立密钥对，彻底告别提取旧公钥失败的报错！
+    local REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null)
+    local NEW_PRIV=$(echo "$REALITY_KEYS" | awk '/PrivateKey/{print $2}')
+    local NEW_PUB=$(echo "$REALITY_KEYS" | awk '/PublicKey/{print $2}')
+    local NEW_UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null)
+    local NEW_SID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
+    
+    [ -z "$NEW_PRIV" ] || [ -z "$NEW_PUB" ] || [ -z "$NEW_UUID" ] && echo -e "${RED}❌ 密钥生成失败${NC}" && pause_return && return
+    
+    # 复用基础节点的 SNI
     local exist_sni=$(jq -r '.inbounds[] | select(.tls.reality != null) | .tls.server_name' /etc/sing-box/config.json | head -1)
+    [ -z "$exist_sni" ] && exist_sni="www.bing.com"
     
-    [ -z "$exist_priv" ] || [ -z "$exist_sid" ] || [ -z "$exist_sni" ] && echo -e "${RED}❌ 读取基础配置失败，请检查 Sing-box 配置文件！${NC}" && pause_return && return
-    
-    local exist_pub=""
-    
-    # 1. 尝试从记录文件直接读取公钥
-    if grep -q "^Reality公钥:" "$LAND_INFO"; then
-        exist_pub=$(grep "^Reality公钥:" "$LAND_INFO" | head -1 | awk '{print $2}')
-    fi
-    
-    # 2. 终极修复：使用 sed 替代 cut 提取链接中的 pbk，防止公钥末尾的 = 被截断
-    if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
-        local link_pub=$(grep -oE 'pbk=[^&]+' "$LAND_INFO" | head -1 | sed 's/^pbk=//')
-        if [ -n "$link_pub" ]; then
-            # 补齐公钥末尾的 =
-            [[ "$link_pub" != *= ]] && link_pub="${link_pub}="
-            exist_pub="$link_pub"
-        fi
-    fi
-    
-    # 3. 尝试用 wg 命令从私钥反算
-    if { [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; } && command -v wg >/dev/null 2>&1; then
-        local tmp_priv="$exist_priv"
-        # 补齐私钥末尾的 = (wg 命令要求标准 Base64)
-        [[ "$tmp_priv" != *= ]] && tmp_priv="${tmp_priv}="
-        exist_pub=$(printf '%s\n' "$tmp_priv" | wg pubkey 2>/dev/null)
-    fi
-    
-    # 4. 极端情况兜底：允许手动输入
-    if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
-        echo -e "${RED}❌ 无法自动提取公钥！${NC}"
-        echo -e "${YELLOW}私有钥: ${exist_priv}${NC}"
-        echo -e "${YELLOW}请手动输入第一个节点的 PublicKey (pbk)：${NC}"
-        read -p "PublicKey (pbk): " exist_pub < /dev/tty
-    fi
-    
-    if ! check_pub_key "$exist_pub"; then
-        echo -e "${RED}❌ 公钥格式不正确！操作取消。${NC}"
-        pause_return; return
-    fi
-    
-    local UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null)
     local tmp_json="/tmp/sb_add_$$.json"
     
-    jq --arg p "$LAND_PORT" --arg u "$UUID" --arg s "$exist_sni" --arg pk "$exist_priv" --arg sid "$exist_sid" \
-       --arg listen "0.0.0.0" --arg pub "$exist_pub" \
+    jq --arg p "$LAND_PORT" --arg u "$NEW_UUID" --arg s "$exist_sni" --arg pk "$NEW_PRIV" --arg sid "$NEW_SID" \
+       --arg listen "0.0.0.0" \
        '.inbounds += [{
            "type": "vless", "listen": $listen, "listen_port": ($p|tonumber),
            "users": [{"name": "ext", "uuid": $u, "flow": "xtls-rprx-vision"}],
@@ -685,7 +653,7 @@ add_landing_port() {
     allow_port "$LAND_PORT"
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
-    VLESS_LINK="vless://${UUID}@${relay_ip}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${exist_sni}&fp=chrome&pbk=${exist_pub}&sid=${exist_sid}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
+    VLESS_LINK="vless://${NEW_UUID}@${relay_ip}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${exist_sni}&fp=chrome&pbk=${NEW_PUB}&sid=${NEW_SID}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
     
     sed -i "/# ${NODE_NAME} START/,/# ${NODE_NAME} END/d" "$LAND_INFO"
     cat >> "$LAND_INFO" << EOF
@@ -695,7 +663,7 @@ add_landing_port() {
 客户端端口: $MAP_PORT
 落地机端口: $LAND_PORT
 SNI: $exist_sni
-Reality公钥: $exist_pub
+Reality公钥: $NEW_PUB
 链接:
  $VLESS_LINK
 # ${NODE_NAME} END
@@ -830,7 +798,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v138.5 (字符串切割终极修复)  ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v139.0 (独立密钥版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
