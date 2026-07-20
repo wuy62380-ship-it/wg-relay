@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v132.8 (极简安装版)
-# 修复：彻底移除时间年份上限硬编码，只防 1970 年初始状态，绝不再误改正确时间
+# WireGuard 智能中转部署脚本 v132.9 (极简安装版)
+# 修复：删除 Reality 服务端配置中多余的 public_key 字段，增加启动前强制校验，防止服务假死
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -127,7 +127,6 @@ EOF
     echo -e "${GREEN}✓ Sing-box 安装成功${NC}"
 }
 
-# 修复：智能时间校准，只设下限(防1970年)，不设上限，绝不再误改正确时间
 force_sync_time() {
     echo -e "${YELLOW}[*] 正在校准系统时间...${NC}"
     
@@ -144,7 +143,6 @@ force_sync_time() {
     fi
     
     local current_year=$(date +%Y)
-    # 只有当年份小于 2000 年（通常是 1970 初始状态）才触发兜底，绝不再限制上限
     if [ "$current_year" -lt 2000 ]; then
         echo -e "${YELLOW}⚠ 检测到系统时间异常($current_year)，尝试通过 HTTP 兜底校准...${NC}"
         local sys_time=""
@@ -368,6 +366,9 @@ EOF
     sysctl -w net.ipv4.conf.all.rp_filter=2 > /dev/null 2>&1
     sysctl -p "$IP_FORWARD_FILE" > /dev/null 2>&1
     
+    # 放行 WG 端口
+    allow_port "$WG_PORT"
+    
     if [ $? -ne 0 ]; then echo -e "${RED}❌ 初始化失败！${NC}"; fi
     pause_return
 }
@@ -482,6 +483,7 @@ EOF
     UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null); SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
     if [ -z "$SB_PUB" ] || [ -z "$UUID" ]; then echo -e "${RED}❌ 密钥生成失败！${NC}"; pause_return; return; fi
 
+    # 修复：彻底删除服务端配置中的 public_key，否则 sing-box 会校验失败拒绝启动！
     cat > /etc/sing-box/config.json << EOF
 {
   "inbounds": [{
@@ -493,18 +495,28 @@ EOF
       "reality": {
         "enabled": true,
         "handshake": { "server": "${SNI}", "server_port": 443 },
-        "private_key": "$SB_PRIV", "short_id": ["$SHORT_ID"], "public_key": "$SB_PUB"
+        "private_key": "$SB_PRIV", "short_id": ["$SHORT_ID"]
       }
     }
   }],
   "outbounds": [{ "type": "direct" }]
 }
 EOF
+
+    # 修复：增加启动前强制语法校验，防止假成功
+    if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+        echo -e "${RED}❌ Sing-box 配置文件语法错误！请检查 JSON 格式。${NC}"
+        /usr/local/bin/sing-box check -c /etc/sing-box/config.json
+        pause_return; return
+    fi
+
     systemctl enable wg-quick@wg0 > /dev/null 2>&1
     if ! restart_wg; then pause_return; return; fi
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
     
+    # 放行落地机端口和 WG 端口
     allow_port "$LAND_PORT"
+    allow_port "$WG_PORT"
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
     VLESS_LINK="vless://${UUID}@${RELAY_IP}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&spx=%2F&type=tcp#WG-${SAFE_NAME}"
@@ -685,6 +697,7 @@ add_landing_port() {
     local UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null)
     
     local tmp_json="/tmp/sb_add_$$.json"
+    # 修复：彻底删除服务端配置中的 public_key，否则 sing-box 会校验失败拒绝启动！
     if ! jq --arg p "$LAND_PORT" --arg u "$UUID" --arg s "$SNI" --arg pk "$exist_priv" --arg sid "$exist_sid" \
        --arg listen "0.0.0.0" --arg pub "$SB_PUB" \
        '.inbounds += [{
@@ -696,7 +709,7 @@ add_landing_port() {
                "reality": {
                    "enabled": true,
                    "handshake": {"server": $s, "server_port": 443},
-                   "private_key": $pk, "short_id": [$sid], "public_key": $pub
+                   "private_key": $pk, "short_id": [$sid]
                }
            }
        }]' /etc/sing-box/config.json > "$tmp_json" 2>/dev/null; then
@@ -712,8 +725,15 @@ add_landing_port() {
     fi
     
     mv -f "$tmp_json" /etc/sing-box/config.json
-    systemctl restart sing-box
     
+    # 修复：增加启动前强制语法校验，防止假成功
+    if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+        echo -e "${RED}❌ Sing-box 配置文件语法错误！原配置已覆盖，请检查。${NC}"
+        /usr/local/bin/sing-box check -c /etc/sing-box/config.json
+        pause_return; return
+    fi
+
+    systemctl restart sing-box
     allow_port "$LAND_PORT"
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
@@ -913,7 +933,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v132.8 (极简安装版)          ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v132.9 (极简安装版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
