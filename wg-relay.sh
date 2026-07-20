@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
-# WireGuard 智能中转部署脚本 v140.0 (独立密钥与SNI优选版)
-# 修复：新增端口直接生成全新密钥并重新优选 SNI，增加启动检测防假死
+# WireGuard 智能中转部署脚本 v141.0 (变量污染修复版)
+# 修复：分离 SNI 测速日志与返回值，防止多行文本污染链接导致截断
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -293,7 +293,8 @@ _test_domain_latency() {
 select_best_sni() {
     local tmp_res="/tmp/sb_sni_speed"
     > "$tmp_res"
-    echo -e "${YELLOW}[*] 正在测速优选大厂 SNI 伪装域名 (共 ${#SNI_DOMAINS[@]} 个)...${NC}"
+    # 终极修复：日志输出到 >&2，避免污染返回值
+    echo -e "${YELLOW}[*] 正在测速优选大厂 SNI 伪装域名 (共 ${#SNI_DOMAINS[@]} 个)...${NC}" >&2
     
     for domain in "${SNI_DOMAINS[@]}"; do
         _test_domain_latency "$domain" "$tmp_res"
@@ -303,7 +304,7 @@ select_best_sni() {
     rm -f "$tmp_res"
     
     if [ -z "$sorted_domains" ]; then 
-        echo -e "${RED}❌ 所有域名测速失败！将使用默认域名 www.bing.com${NC}"
+        echo -e "${RED}❌ 所有域名测速失败！将使用默认域名 www.bing.com${NC}" >&2
         echo "www.bing.com"
         return 0
     fi
@@ -311,18 +312,20 @@ select_best_sni() {
     local best_domain=$(echo "$sorted_domains" | head -n 1 | awk '{print $2}')
     local best_time=$(echo "$sorted_domains" | head -n 1 | awk '{print $1}')
     
-    echo -e "${GREEN}=========================================="
-    echo -e " SNI 测速排名 Top 5:"
+    echo -e "${GREEN}==========================================" >&2
+    echo -e " SNI 测速排名 Top 5:" >&2
     local i=1
     while IFS= read -r line; do
         local latency=$(echo "$line" | awk '{print $1}')
         local dom=$(echo "$line" | awk '{print $2}')
-        printf "  ${GREEN}[%d]${NC} %-30s ${YELLOW}%s ms${NC}\n" "$i" "$dom" "$latency"
+        printf "  ${GREEN}[%d]${NC} %-30s ${YELLOW}%s ms${NC}\n" "$i" "$dom" "$latency" >&2
         i=$((i+1))
         [ $i -gt 5 ] && break
     done <<< "$sorted_domains"
-    echo -e "=========================================="
-    echo -e "${GREEN}✓ 已自动选择最快域名: ${CYAN}${best_domain}${NC} (${best_time} ms)"
+    echo -e "==========================================" >&2
+    echo -e "${GREEN}✓ 已自动选择最快域名: ${CYAN}${best_domain}${NC} (${best_time} ms)" >&2
+    
+    # 干净的返回结果
     echo "$best_domain"
 }
 
@@ -622,7 +625,6 @@ add_landing_port() {
     while true; do read -p "客户端连接端口 (需与中转机一致): " MAP_PORT < /dev/tty; [[ "$MAP_PORT" =~ ^[0-9]+$ ]] && break; echo -e "${RED}端口无效${NC}"; done
     while true; do read -p "节点备注名称: " NODE_NAME < /dev/tty; [ -n "$NODE_NAME" ] && check_node_name "$NODE_NAME" && break; done
     
-    # 1. 终极降维打击：直接为新端口生成全新的独立密钥对，彻底告别提取旧公钥失败的报错！
     local REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null)
     local NEW_PRIV=$(echo "$REALITY_KEYS" | awk '/PrivateKey/{print $2}')
     local NEW_PUB=$(echo "$REALITY_KEYS" | awk '/PublicKey/{print $2}')
@@ -631,7 +633,6 @@ add_landing_port() {
     
     [ -z "$NEW_PRIV" ] || [ -z "$NEW_PUB" ] || [ -z "$NEW_UUID" ] && echo -e "${RED}❌ 密钥生成失败${NC}" && pause_return && return
     
-    # 2. 终极修复：为新端口重新优选 SNI，绝不复用可能被墙的基础节点 SNI
     local NEW_SNI=$(select_best_sni)
     
     local tmp_json="/tmp/sb_add_$$.json"
@@ -653,11 +654,9 @@ add_landing_port() {
     
     ! jq empty "$tmp_json" 2>/dev/null && echo -e "${RED}❌ JSON 生成失败${NC}" && rm -f "$tmp_json" && pause_return && return
     
-    # 3. 备份原配置，并写入新配置
     cp /etc/sing-box/config.json /etc/sing-box/config.json.bak.$(date +%s)
     mv -f "$tmp_json" /etc/sing-box/config.json
     
-    # 4. 校验配置文件语法
     if ! /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
         echo -e "${RED}❌ Sing-box 配置语法错误！已自动回滚。${NC}"
         /usr/local/bin/sing-box check -c /etc/sing-box/config.json
@@ -665,7 +664,6 @@ add_landing_port() {
         pause_return; return
     fi
     
-    # 5. 重启服务并验证启动状态
     systemctl restart sing-box
     sleep 1
     if ! systemctl is-active --quiet sing-box; then
@@ -695,7 +693,6 @@ Reality公钥: $NEW_PUB
 # ${NODE_NAME} END
 EOF
     
-    # 清理多余备份
     ls -t /etc/sing-box/config.json.bak.* 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null
     
     echo -e "${GREEN}=========================================="
@@ -827,7 +824,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v140.0 (独立密钥与SNI优选版) ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v141.0 (变量污染修复版)      ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
