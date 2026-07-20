@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
 # WireGuard 智能中转部署脚本 v1 (YW版)
-# 修复：优化落地机新增端口时的公钥提取逻辑，防止误报格式错误
+# 修复：直接从私钥反算公钥，彻底消灭新增端口时需手动输入公钥的报错
 # ==========================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -620,21 +620,21 @@ add_landing_port() {
     local exist_sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' /etc/sing-box/config.json)
     local exist_sni=$(jq -r '.inbounds[0].tls.server_name' /etc/sing-box/config.json)
     
-    # 优化提取公钥逻辑：优先读字段，读不到从链接截取，再读不到提示手动输入
-    local exist_pub=$(grep "^Reality公钥:" "$LAND_INFO" | head -1 | awk '{print $2}')
-    if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
-        exist_pub=$(grep -oE 'pbk=[A-Za-z0-9+/=]+' "$LAND_INFO" | head -1 | sed 's/^pbk=//')
-    fi
-    
     [ -z "$exist_priv" ] || [ -z "$exist_sid" ] || [ -z "$exist_sni" ] && echo -e "${RED}❌ 读取基础配置失败${NC}" && pause_return && return
     
+    # 终极修复：直接通过私钥反算公钥，彻底消灭手动输入公钥的报错！
+    local exist_pub=$(echo "$exist_priv" | wg pubkey 2>/dev/null)
+    
+    # 极端情况 wg 命令不可用时，退回从记录里提取
     if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
-        echo -e "${YELLOW}⚠ 未找到合法公钥记录。为了不影响旧节点，请输入第一个节点的 PublicKey (pbk)：${NC}"
-        read -p "PublicKey (pbk): " exist_pub < /dev/tty
+        exist_pub=$(grep "^Reality公钥:" "$LAND_INFO" | head -1 | awk '{print $2}')
+        if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
+            exist_pub=$(grep -oE 'pbk=[A-Za-z0-9+/=]+' "$LAND_INFO" | head -1 | sed 's/^pbk=//')
+        fi
     fi
     
-    if ! check_pub_key "$exist_pub"; then
-        echo -e "${RED}❌ 公钥格式不正确！操作取消。${NC}"
+    if [ -z "$exist_pub" ] || ! check_pub_key "$exist_pub"; then
+        echo -e "${RED}❌ 无法自动提取公钥，请检查 wg 命令是否可用！${NC}"
         pause_return; return
     fi
     
@@ -808,7 +808,7 @@ prepare_env
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG 智能中转 v1 (YW版)      ║${NC}"
+    echo -e "${CYAN}║  WG 智能中转 v1 (YW版)          ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} 系统优化    ${GREEN}2${NC} 中转-初始化    ${GREEN}3${NC} 中转-生成码    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 落地-部署    ${GREEN}5${NC} 中转-绑定码    ${GREEN}6${NC} 中转-看列表    ${CYAN}║${NC}"
