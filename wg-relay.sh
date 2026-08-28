@@ -1,5 +1,5 @@
 #!/bin/bash
-# WireGuard + iptables + udp2raw 多落地隧道中转架构 (清爽TUI版)
+# WireGuard + iptables + udp2raw 多落地隧道中转架构 (清爽TUI完整版)
 # 支持: Debian 11/12/13, Ubuntu 20.04/22.04/24.04
 
 set -uo pipefail
@@ -61,7 +61,7 @@ EOF
 landing_menu() {
     while true; do
         clear
-        echo -e "\n${GREEN}===== 落地机专属配置 =====${NC}"
+        echo -e "${GREEN}===== 落地机专属配置 =====${NC}"
         echo "1. 初始化/重置落地机环境"
         echo "2. 添加中转机 Peer"
         echo "3. 删除中转机 Peer"
@@ -172,7 +172,7 @@ EOF
 
 landing_add_peer() {
     if ! ip link show wg0 &>/dev/null; then
-        echo -e "${RED}WG 接口未运行${NC}"; return 1
+        echo -e "${RED}WG 接口未运行，请先执行选项 1 进行初始化！${NC}"; return 1
     fi
     read -rp "请输入中转机名称 (如 relay-jp): " name; name=$(echo "$name" | tr -dc '[:alnum:]-_')
     [[ -z "$name" ]] && return
@@ -240,7 +240,7 @@ landing_del_peer() {
 landing_list_peers() {
     echo -e "\n${CYAN}===== 已连接的中转机列表 =====${NC}"
     if ! ip link show wg0 &>/dev/null; then
-        echo -e "${RED}WG 接口未运行${NC}"; return 1
+        echo -e "${RED}WG 接口未运行，请先初始化！${NC}"; return 1
     fi
     [[ ! -d "$PEERS_DIR" || -z "$(ls -A "$PEERS_DIR" 2>/dev/null)" ]] && { echo -e "${YELLOW}当前没有配置中转机${NC}"; return; }
     
@@ -268,7 +268,7 @@ landing_list_peers() {
 relay_menu() {
     while true; do
         clear
-        echo -e "\n${GREEN}===== 中转机专属配置 (支持多落地) =====${NC}"
+        echo -e "${GREEN}===== 中转机专属配置 (支持多落地) =====${NC}"
         echo "1. 初始化/重置中转机基础环境"
         echo "2. 添加落地机隧道"
         echo "3. 添加/修改端口转发规则 (TCP+UDP)"
@@ -391,7 +391,7 @@ EOF
 
 relay_add_forward() {
     if ! ip link show wg0 &>/dev/null; then
-        echo -e "${RED}WG 接口未运行${NC}"; return 1
+        echo -e "${RED}WG 接口未运行，请先初始化！${NC}"; return 1
     fi
     
     echo -e "\n${CYAN}当前可用落地机内网 IP:${NC}"
@@ -432,7 +432,7 @@ relay_add_forward() {
 relay_view_config() {
     echo -e "\n${CYAN}===== 中转机隧道与转发状态 =====${NC}"
     if ! ip link show wg0 &>/dev/null; then
-        echo -e "${RED}WG 接口未运行${NC}"; return 1
+        echo -e "${RED}WG 接口未运行，请先初始化！${NC}"; return 1
     fi
     
     echo -e "${GREEN}1. 落地机隧道列表:${NC}"
@@ -508,7 +508,7 @@ optimize_kernel() {
         local cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
         local cur_kr=$(uname -r)
         local xm="否"; [[ "$cur_kr" == *xanmod* ]] && xm="是"
-        echo -e "\n${CYAN}===== 内核与 BBR 优化 =====${NC}"
+        echo -e "${CYAN}===== 内核与 BBR 优化 =====${NC}"
         echo -e "内核: ${cur_kr} | XanMod: ${xm} | 算法: ${cur_cc}"
         echo "1. 标准 BBR (v1，免重启)"
         echo "2. BBRv3 (安装 XanMod，需重启)"
@@ -633,7 +633,7 @@ uninstall_all() {
 main() {
     while true; do
         clear
-        echo -e "\n${GREEN}===== WG + udp2raw 隧道中转架构 (多落地支持) =====${NC}"
+        echo -e "${GREEN}===== WG + udp2raw 隧道中转架构 (多落地支持) =====${NC}"
         echo "1. 落地机配置"
         echo "2. 中转机配置 (多落地)"
         echo "3. 查看全局系统状态"
