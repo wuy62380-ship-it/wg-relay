@@ -83,10 +83,9 @@ landing_init() {
     echo -e "${CYAN}===== 初始化落地机 (WG服务端 + udp2raw服务端) =====${NC}"
     setup_base
     
-    if [[ -f "$WG_CONF" ]]; then
-        wg-quick down wg0 2>/dev/null || true
-        systemctl stop udp2raw 2>/dev/null || true
-    fi
+    # 先清理可能残留的旧实例
+    systemctl stop wg-quick@wg0 2>/dev/null || true
+    ip link delete wg0 2>/dev/null || true
     
     while true; do
         read -rp "udp2raw 伪装 TCP 端口 [20022]: " FAKE_PORT; FAKE_PORT=${FAKE_PORT:-20022}
@@ -158,8 +157,16 @@ Restart=always
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now wg-quick@wg0
     systemctl enable --now udp2raw
+    
+    # 修复启动逻辑：统一使用 systemctl restart，避免 wg-quick up 冲突
+    systemctl enable wg-quick@wg0 2>/dev/null || true
+    systemctl restart wg-quick@wg0 2>/dev/null || true
+    
+    if ! systemctl is-active --quiet wg-quick@wg0; then
+        echo -e "${RED}WireGuard 启动失败！请手动执行 wg-quick up wg0 检查报错。${NC}"
+        return 1
+    fi
     netfilter-persistent save 2>/dev/null || true
     
     echo -e "${GREEN}======================================${NC}"
@@ -292,9 +299,8 @@ relay_init_base() {
     echo -e "${CYAN}===== 初始化中转机基础环境 =====${NC}"
     setup_base
     
-    if [[ -f "$WG_CONF" ]]; then
-        wg-quick down wg0 2>/dev/null || true
-    fi
+    systemctl stop wg-quick@wg0 2>/dev/null || true
+    ip link delete wg0 2>/dev/null || true
     
     local RELAY_IP
     while true; do
@@ -316,7 +322,13 @@ PrivateKey = ${cli_priv}
 MTU = 1280
 EOF
     
-    systemctl enable --now wg-quick@wg0
+    systemctl enable wg-quick@wg0 2>/dev/null || true
+    systemctl restart wg-quick@wg0 2>/dev/null || true
+    
+    if ! systemctl is-active --quiet wg-quick@wg0; then
+        echo -e "${RED}WireGuard 启动失败！请手动执行 wg-quick up wg0 检查报错。${NC}"
+        return 1
+    fi
     netfilter-persistent save 2>/dev/null || true
     
     echo -e "${GREEN}======================================${NC}"
