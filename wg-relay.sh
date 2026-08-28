@@ -1,8 +1,9 @@
 #!/bin/bash
-# WireGuard + iptables + udp2raw 多落地隧道中转架构 (傻瓜式自动化版)
+# WireGuard + iptables + udp2raw 多落地隧道中转架构 (全功能完美修复版)
 # 支持: IPv4 / IPv6 / 域名 / Debian 11/12/13, Ubuntu 20.04/22.04/24.04
 
 set -uo pipefail
+shopt -s nullglob
 
 WG_DIR="/etc/wireguard"
 WG_CONF="${WG_DIR}/wg0.conf"
@@ -19,10 +20,14 @@ WAN_IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'
 
 # ==================== 全局核心机制 ====================
 sync_wg() {
-    wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || {
-        wg-quick down wg0 2>/dev/null || true
+    if ip link show wg0 &>/dev/null; then
+        wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || {
+            wg-quick down wg0 2>/dev/null || true
+            wg-quick up wg0 2>/dev/null || true
+        }
+    else
         wg-quick up wg0 2>/dev/null || true
-    }
+    fi
 }
 
 validate_ip() {
@@ -41,8 +46,14 @@ format_addr() {
 
 setup_base() {
     apt-get update -y
-    apt-get install -y wireguard iptables iptables-persistent iproute2 curl wget
+    apt-get install -y wireguard iptables iptables-persistent iproute2 curl wget net-tools
     
+    # 强制切换至兼容模式避免 nftables 拦截 raw socket
+    if update-alternatives --list iptables &>/dev/null; then
+        update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
+        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
+    fi
+
     cat > "$SYSCTL_CONF" <<'EOF'
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
@@ -92,7 +103,7 @@ landing_init() {
     ip link delete wg0 2>/dev/null || true
     
     while true; do
-        read -rp "udp2raw 伪装 TCP 端口 [20022]: " FAKE_PORT; FAKE_PORT=${FAKE_PORT:-20022}
+        read -rp "udp2raw 监听端口 (NAT机器请填内网端口) [20022]: " FAKE_PORT; FAKE_PORT=${FAKE_PORT:-20022}
         [[ "$FAKE_PORT" =~ ^[0-9]+$ && "$FAKE_PORT" -ge 1 && "$FAKE_PORT" -le 65535 ]] && break
         echo -e "${RED}无效端口${NC}"
     done
@@ -103,6 +114,13 @@ landing_init() {
         echo -e "${RED}无效端口${NC}"
     done
 
+    echo "请选择 udp2raw 伪装模式:"
+    echo "  1. faketcp (伪装TCP, 性能较好, 部分严格NAT会阻断) [默认]"
+    echo "  2. udp (纯UDP转发, 适合受限家宽与复杂NAT线路)"
+    read -rp "选择 [1/2]: " mode_choice
+    local RAW_MODE="faketcp"
+    if [[ "$mode_choice" == "2" ]]; then RAW_MODE="udp"; fi
+
     echo "请选择 udp2raw 监听的网络类型:"
     echo "  1. 仅 IPv4 (0.0.0.0) [默认]"
     echo "  2. IPv6 + IPv4 双栈 ([::])"
@@ -112,6 +130,7 @@ landing_init() {
     
     local u2r_pass=$(head -c 16 /dev/urandom | base64)
     echo "$u2r_pass" > "${UDP2RAW_DIR}/password"
+    echo "$RAW_MODE" > "${UDP2RAW_DIR}/raw_mode"
     
     local srv_priv=$(wg genkey)
     local srv_pub=$(echo "$srv_priv" | wg pubkey)
@@ -141,17 +160,17 @@ PrivateKey = ${srv_priv}
 MTU = 1280
 
 PostUp = iptables -I INPUT -p tcp --dport ${FAKE_PORT} -j ACCEPT
-PostUp = iptables -I INPUT -p udp --dport ${WG_PORT} ! -i lo -j DROP
+PostUp = iptables -I INPUT -p udp --dport ${FAKE_PORT} -j ACCEPT
 PostUp = iptables -I FORWARD -i %i -j ACCEPT
 PostUp = iptables -I FORWARD -o %i -j ACCEPT
 PostUp = iptables -t nat -I POSTROUTING -s 10.0.0.0/24 -o ${WAN_IFACE} -j MASQUERADE
 PostUp = ${WG_DIR}/load-peers.sh %i
 
-PostDown = iptables -D INPUT -p tcp --dport ${FAKE_PORT} -j ACCEPT
-PostDown = iptables -D INPUT -p udp --dport ${WG_PORT} ! -i lo -j DROP
-PostDown = iptables -D FORWARD -i %i -j ACCEPT
-PostDown = iptables -D FORWARD -o %i -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o ${WAN_IFACE} -j MASQUERADE
+PostDown = iptables -D INPUT -p tcp --dport ${FAKE_PORT} -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D INPUT -p udp --dport ${FAKE_PORT} -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null || true
 EOF
     
     cat > /etc/systemd/system/udp2raw.service <<EOF
@@ -162,7 +181,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/udp2raw -s -l ${LISTEN_ADDR}:${FAKE_PORT} -r 127.0.0.1:${WG_PORT} --raw-mode faketcp -a -k "${u2r_pass}"
+ExecStart=/usr/local/bin/udp2raw -s -l ${LISTEN_ADDR}:${FAKE_PORT} -r 127.0.0.1:${WG_PORT} --raw-mode ${RAW_MODE} -a -k "${u2r_pass}"
 Restart=always
 
 [Install]
@@ -183,8 +202,8 @@ EOF
     echo -e "${GREEN} 落地机初始化完成!${NC}"
     echo -e "${YELLOW} >>> 落地机 WG 公钥: ${srv_pub}${NC}"
     echo -e "${YELLOW} >>> udp2raw 密码: ${u2r_pass}${NC}"
-    echo -e "${YELLOW} >>> udp2raw 伪装端口: ${FAKE_PORT} (TCP)${NC}"
-    echo -e "${YELLOW} >>> 监听地址: ${LISTEN_ADDR}${NC}"
+    echo -e "${YELLOW} >>> udp2raw 模式: ${RAW_MODE}${NC}"
+    echo -e "${YELLOW} >>> udp2raw 端口: ${FAKE_PORT}${NC}"
     echo -e "${GREEN}======================================${NC}"
 }
 
@@ -243,10 +262,10 @@ landing_del_peer() {
 landing_list_peers() {
     echo -e "\n${CYAN}===== 已连接的中转机列表 =====${NC}"
     if ! ip link show wg0 &>/dev/null; then echo -e "${RED}WG 接口未运行，请先初始化！${NC}"; return 1; fi
-    [[ ! -d "$PEERS_DIR" || -z "$(ls -A "$PEERS_DIR" 2>/dev/null)" ]] && { echo -e "${YELLOW}当前没有配置中转机${NC}"; return; }
-    local has_peer=0
-    for f in "$PEERS_DIR"/*.conf; do
-        [[ -e "$f" ]] || continue; has_peer=1
+    local peers_list=("${PEERS_DIR}"/*.conf)
+    [[ ${#peers_list[@]} -eq 0 ]] && { echo -e "${YELLOW}当前没有配置中转机${NC}"; return; }
+    
+    for f in "${peers_list[@]}"; do
         local name=$(basename "$f" .conf); local pub=$(grep "^PublicKey" "$f" | awk '{print $3}')
         local ip=$(grep "^AllowedIPs" "$f" | awk '{print $3}')
         local handshake=$(wg show wg0 latest-handshakes 2>/dev/null | grep "$pub" | awk '{print $2}')
@@ -258,7 +277,6 @@ landing_list_peers() {
         echo -e " - 名称: ${GREEN}${name}${NC} | IP: ${ip} | 状态: ${status}"
         echo -e "   公钥: ${pub:0:20}..."
     done
-    [[ "$has_peer" -eq 0 ]] && echo -e "${YELLOW}当前没有配置中转机${NC}"
 }
 
 # ==================== 中转机专属模块 ====================
@@ -330,9 +348,16 @@ relay_add_landing() {
     
     read -rp "落地机公网 IP 或 域名: " LAND_ADDR_RAW; [[ -z "$LAND_ADDR_RAW" ]] && return
     local LAND_ADDR=$(format_addr "$LAND_ADDR_RAW")
-    read -rp "落地机 udp2raw 伪装端口 [20022]: " LAND_FAKE_PORT; LAND_FAKE_PORT=${LAND_FAKE_PORT:-20022}
+    read -rp "落地机 udp2raw 公网端口 (NAT填外部映射端口) [20022]: " LAND_FAKE_PORT; LAND_FAKE_PORT=${LAND_FAKE_PORT:-20022}
     read -rp "落地机 udp2raw 密码: " U2R_PASS
     read -rp "落地机 WG 公钥: " LAND_PUBKEY
+
+    echo "请选择 udp2raw 伪装模式 (需与落地机一致):"
+    echo "  1. faketcp [默认]"
+    echo "  2. udp"
+    read -rp "选择 [1/2]: " mode_choice
+    local RAW_MODE="faketcp"
+    if [[ "$mode_choice" == "2" ]]; then RAW_MODE="udp"; fi
     
     local self_ip=$(grep "^Address" "$WG_CONF" | awk '{print $3}' | cut -d'/' -f1 | cut -d'.' -f4); self_ip=${self_ip:-0}
     local used_ips=$(grep "AllowedIPs" "$WG_CONF" | grep -oE "10\.0\.0\.[0-9]+" | cut -d'.' -f4 | sort -n)
@@ -356,7 +381,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/udp2raw -c -l 127.0.0.1:${local_port} -r ${LAND_ADDR}:${LAND_FAKE_PORT} --raw-mode faketcp -a -k "${U2R_PASS}"
+ExecStart=/usr/local/bin/udp2raw -c -l 127.0.0.1:${local_port} -r ${LAND_ADDR}:${LAND_FAKE_PORT} --raw-mode ${RAW_MODE} -a -k "${U2R_PASS}"
 Restart=always
 
 [Install]
@@ -414,10 +439,18 @@ relay_add_forward() {
         1) protos="tcp" ;; 2) protos="udp" ;; 3) protos="tcp udp" ;; *) echo -e "${RED}无效选择${NC}"; return ;;
     esac
 
+    # 修复：分别独立处理每个协议的规则清理，避免混杂协议导致的行号位移错误
     for proto in $protos; do
-        while read -r num; do iptables -t nat -D PREROUTING $num 2>/dev/null; done < <(iptables -t nat -L PREROUTING -n --line-numbers | grep -E "dpt:${C_PORT}( |$)" | grep -w "${proto}" | awk '{print $1}' | sort -rn)
+        while read -r num; do 
+            [[ -n "$num" ]] && iptables -t nat -D PREROUTING "$num" 2>/dev/null || true
+        done < <(iptables -t nat -L PREROUTING -n --line-numbers | grep -E "dpt:${C_PORT}( |$)" | grep -w "${proto}" | awk '{print $1}' | sort -rn)
+        
         iptables -t nat -A PREROUTING -p ${proto} --dport ${C_PORT} -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
-        while read -r num; do iptables -D FORWARD $num 2>/dev/null; done < <(iptables -L FORWARD -n --line-numbers | grep -E " ${LAND_IP}( |$)" | grep -E "dpt:${LAND_PORT}( |$)" | grep -w "${proto}" | awk '{print $1}' | sort -rn)
+
+        while read -r num; do 
+            [[ -n "$num" ]] && iptables -D FORWARD "$num" 2>/dev/null || true
+        done < <(iptables -L FORWARD -n --line-numbers | grep -E " ${LAND_IP}( |$)" | grep -E "dpt:${LAND_PORT}( |$)" | grep -w "${proto}" | awk '{print $1}' | sort -rn)
+        
         iptables -A FORWARD -p ${proto} -d ${LAND_IP} --dport ${LAND_PORT} -j ACCEPT
     done
 
@@ -460,8 +493,14 @@ relay_del_landing() {
     local name=${arr[$c]}
     local land_ip=$(awk -v key="# ${name}" '$0 == key {f=1} f && /^AllowedIPs/ {split($3,a,"/"); print a[1]; exit}' "$WG_CONF")
     if [[ -n "$land_ip" ]]; then
-        while read -r num; do iptables -t nat -D PREROUTING $num 2>/dev/null; done < <(iptables -t nat -L PREROUTING -n --line-numbers | grep -E "to:${land_ip}:" | awk '{print $1}' | sort -rn)
-        while read -r num; do iptables -D FORWARD $num 2>/dev/null; done < <(iptables -L FORWARD -n --line-numbers | grep -E " ${land_ip}( |$)" | awk '{print $1}' | sort -rn)
+        while read -r num; do 
+            [[ -n "$num" ]] && iptables -t nat -D PREROUTING "$num" 2>/dev/null || true
+        done < <(iptables -t nat -L PREROUTING -n --line-numbers | grep -E "to:${land_ip}:" | awk '{print $1}' | sort -rn)
+        
+        while read -r num; do 
+            [[ -n "$num" ]] && iptables -D FORWARD "$num" 2>/dev/null || true
+        done < <(iptables -L FORWARD -n --line-numbers | grep -E " ${land_ip}( |$)" | awk '{print $1}' | sort -rn)
+        
         netfilter-persistent save 2>/dev/null || true
         echo -e "${CYAN}已自动清理指向 ${land_ip} 的 iptables 转发规则${NC}"
     fi
@@ -531,7 +570,6 @@ _enable_bbrv3() {
     [[ "$arch" != "amd64" ]] && { echo -e "${RED}XanMod 仅支持 amd64${NC}"; return; }
     . /etc/os-release; local codename="${VERSION_CODENAME:-}"
     
-    # 修复支持的发行版代号白名单
     case "$codename" in
         focal|jammy|noble|resolute|bullseye|bookworm|trixie) ;;
         *) echo -e "${RED}XanMod 不支持当前系统版本 (${codename})${NC}"; return 1 ;;
