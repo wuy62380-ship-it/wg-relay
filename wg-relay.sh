@@ -141,14 +141,14 @@ PrivateKey = ${srv_priv}
 MTU = 1280
 
 PostUp = iptables -I INPUT -p tcp --dport ${FAKE_PORT} -j ACCEPT
-PostUp = iptables -I INPUT -p udp --dport ${WG_PORT} ! -s 127.0.0.1 -j DROP
+PostUp = iptables -I INPUT -p udp --dport ${WG_PORT} ! -i lo -j DROP
 PostUp = iptables -I FORWARD -i %i -j ACCEPT
 PostUp = iptables -I FORWARD -o %i -j ACCEPT
 PostUp = iptables -t nat -I POSTROUTING -s 10.0.0.0/24 -o ${WAN_IFACE} -j MASQUERADE
 PostUp = ${WG_DIR}/load-peers.sh %i
 
 PostDown = iptables -D INPUT -p tcp --dport ${FAKE_PORT} -j ACCEPT
-PostDown = iptables -D INPUT -p udp --dport ${WG_PORT} ! -s 127.0.0.1 -j DROP
+PostDown = iptables -D INPUT -p udp --dport ${WG_PORT} ! -i lo -j DROP
 PostDown = iptables -D FORWARD -i %i -j ACCEPT
 PostDown = iptables -D FORWARD -o %i -j ACCEPT
 PostDown = iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o ${WAN_IFACE} -j MASQUERADE
@@ -157,7 +157,8 @@ EOF
     cat > /etc/systemd/system/udp2raw.service <<EOF
 [Unit]
 Description=udp2raw Server (Landing)
-After=network.target
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -350,7 +351,8 @@ relay_add_landing() {
     cat > "/etc/systemd/system/udp2raw-${name}.service" <<EOF
 [Unit]
 Description=udp2raw Client for ${name}
-After=network.target
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -378,7 +380,6 @@ EOF
     echo -e "${GREEN}======================================${NC}"
 }
 
-# ★★★ 傻瓜式自动化：自动检测落地机IP，自动同步端口 ★★★
 relay_add_forward() {
     if ! ip link show wg0 &>/dev/null; then echo -e "${RED}WG 接口未运行，请先初始化！${NC}"; return 1; fi
     
@@ -529,10 +530,13 @@ _enable_bbrv3() {
     local arch=$(dpkg --print-architecture 2>/dev/null || true)
     [[ "$arch" != "amd64" ]] && { echo -e "${RED}XanMod 仅支持 amd64${NC}"; return; }
     . /etc/os-release; local codename="${VERSION_CODENAME:-}"
+    
+    # 修复支持的发行版代号白名单
     case "$codename" in
-        bookworm|trixie|noble|resolute) ;;
-        *) echo -e "${RED}XanMod 不支持 ${codename}${NC}"; return ;;
+        focal|jammy|noble|resolute|bullseye|bookworm|trixie) ;;
+        *) echo -e "${RED}XanMod 不支持当前系统版本 (${codename})${NC}"; return 1 ;;
     esac
+
     if command -v mokutil &>/dev/null && mokutil --sb-state 2>/dev/null | grep -qi enabled; then echo -e "${RED}请先关闭 Secure Boot${NC}"; return; fi
     cd /tmp || return
     curl -fsSLO https://dl.xanmod.org/check_x86-64_psabi.sh 2>/dev/null || wget -qO check_x86-64_psabi.sh https://dl.xanmod.org/check_x86-64_psabi.sh || true
