@@ -1,5 +1,5 @@
 #!/bin/bash
-# WireGuard + iptables + udp2raw 多落地隧道中转架构 (全量审查终极完整版)
+# WireGuard + iptables + udp2raw 多落地隧道中转架构 (清爽TUI版)
 # 支持: Debian 11/12/13, Ubuntu 20.04/22.04/24.04
 
 set -uo pipefail
@@ -18,7 +18,6 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC
 WAN_IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)
 
 # ==================== 全局核心机制 ====================
-# 1. 热重载机制 (不断开现有连接)
 sync_wg() {
     wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || {
         wg-quick down wg0 2>/dev/null || true
@@ -26,19 +25,15 @@ sync_wg() {
     }
 }
 
-# 2. IP 格式校验函数
 validate_ip() {
     local ip=$1
     if [[ "$ip" =~ ^10\.0\.0\.([0-9]+)$ ]]; then
         local last=${BASH_REMATCH[1]}
-        if [[ "$last" -ge 2 && "$last" -le 254 ]]; then
-            return 0
-        fi
+        if [[ "$last" -ge 2 && "$last" -le 254 ]]; then return 0; fi
     fi
     return 1
 }
 
-# 3. 公共环境初始化
 setup_base() {
     apt-get update -y
     apt-get install -y wireguard iptables iptables-persistent iproute2 curl wget
@@ -65,6 +60,7 @@ EOF
 # ==================== 落地机专属模块 ====================
 landing_menu() {
     while true; do
+        clear
         echo -e "\n${GREEN}===== 落地机专属配置 =====${NC}"
         echo "1. 初始化/重置落地机环境"
         echo "2. 添加中转机 Peer"
@@ -73,12 +69,12 @@ landing_menu() {
         echo "0. 返回主菜单"
         read -rp "选择 [0-4]: " c
         case $c in
-            1) landing_init ;;
-            2) landing_add_peer ;;
-            3) landing_del_peer ;;
-            4) landing_list_peers ;;
+            1) landing_init; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
+            2) landing_add_peer; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
+            3) landing_del_peer; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
+            4) landing_list_peers; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
             0) return ;;
-            *) echo -e "${RED}无效${NC}" ;;
+            *) echo -e "${RED}无效输入${NC}"; sleep 1 ;;
         esac
     done
 }
@@ -198,7 +194,6 @@ landing_add_peer() {
         local is_used=0
         for f in "$PEERS_DIR"/*.conf; do
             [[ -e "$f" ]] || continue
-            # 修复 Bug: 使用 -F 进行纯文本匹配，防止点号被当作正则任意字符
             if grep -qF "${RELAY_IP}/32" "$f"; then is_used=1; break; fi
         done
         if [[ "$is_used" -eq 1 ]]; then
@@ -247,7 +242,6 @@ landing_list_peers() {
     if ! ip link show wg0 &>/dev/null; then
         echo -e "${RED}WG 接口未运行${NC}"; return 1
     fi
-    
     [[ ! -d "$PEERS_DIR" || -z "$(ls -A "$PEERS_DIR" 2>/dev/null)" ]] && { echo -e "${YELLOW}当前没有配置中转机${NC}"; return; }
     
     local has_peer=0
@@ -261,25 +255,19 @@ landing_list_peers() {
         local handshake=$(wg show wg0 latest-handshakes 2>/dev/null | grep "$pub" | awk '{print $2}')
         local status="${RED}离线${NC}"
         if [[ -n "$handshake" && "$handshake" -ne 0 ]]; then
-            local now=$(date +%s)
-            local diff=$((now - handshake))
-            if [[ "$diff" -lt 180 ]]; then
-                status="${GREEN}在线 (${diff}秒前握手)${NC}"
-            fi
+            local now=$(date +%s); local diff=$((now - handshake))
+            if [[ "$diff" -lt 180 ]]; then status="${GREEN}在线 (${diff}秒前握手)${NC}"; fi
         fi
-        
         echo -e " - 名称: ${GREEN}${name}${NC} | IP: ${ip} | 状态: ${status}"
         echo -e "   公钥: ${pub:0:20}..."
     done
-    
-    if [[ "$has_peer" -eq 0 ]]; then
-        echo -e "${YELLOW}当前没有配置中转机${NC}"
-    fi
+    [[ "$has_peer" -eq 0 ]] && echo -e "${YELLOW}当前没有配置中转机${NC}"
 }
 
-# ==================== 中转机专属模块 (多落地支持) ====================
+# ==================== 中转机专属模块 ====================
 relay_menu() {
     while true; do
+        clear
         echo -e "\n${GREEN}===== 中转机专属配置 (支持多落地) =====${NC}"
         echo "1. 初始化/重置中转机基础环境"
         echo "2. 添加落地机隧道"
@@ -289,13 +277,13 @@ relay_menu() {
         echo "0. 返回主菜单"
         read -rp "选择 [0-5]: " c
         case $c in
-            1) relay_init_base ;;
-            2) relay_add_landing ;;
-            3) relay_add_forward ;;
-            4) relay_view_config ;;
-            5) relay_del_landing ;;
+            1) relay_init_base; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
+            2) relay_add_landing; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
+            3) relay_add_forward; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
+            4) relay_view_config; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
+            5) relay_del_landing; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
             0) return ;;
-            *) echo -e "${RED}无效${NC}" ;;
+            *) echo -e "${RED}无效输入${NC}"; sleep 1 ;;
         esac
     done
 }
@@ -356,26 +344,15 @@ relay_add_landing() {
     local used_ips=$(grep "AllowedIPs" "$WG_CONF" | grep -oE "10\.0\.0\.[0-9]+" | cut -d'.' -f4 | sort -n)
     local num=1
     while true; do
-        if [[ "$num" -gt 255 ]]; then
-            echo -e "${RED}IP 池耗尽${NC}"; return 1
-        fi
-        if [[ "$num" -eq 1 || "$num" -eq "$self_ip" ]]; then 
-            ((num++))
-            continue
-        fi
-        if echo "$used_ips" | grep -qw "$num"; then
-            ((num++))
-        else
-            break
-        fi
+        if [[ "$num" -gt 255 ]]; then echo -e "${RED}IP 池耗尽${NC}"; return 1; fi
+        if [[ "$num" -eq 1 || "$num" -eq "$self_ip" ]]; then ((num++)); continue; fi
+        if echo "$used_ips" | grep -qw "$num"; then ((num++)); else break; fi
     done
     local land_ip="10.0.0.${num}"
     
     local used_ports=$(grep "Endpoint" "$WG_CONF" | grep -oE "127.0.0.1:[0-9]+" | cut -d':' -f2 | sort -n)
     local local_port=51821
-    while echo "$used_ports" | grep -qw "$local_port"; do
-        ((local_port++))
-    done
+    while echo "$used_ports" | grep -qw "$local_port"; do ((local_port++)); done
     
     cat > "/etc/systemd/system/udp2raw-${name}.service" <<EOF
 [Unit]
@@ -393,7 +370,6 @@ EOF
     systemctl daemon-reload
     systemctl enable --now "udp2raw-${name}"
     
-    # 修复致命 Bug: WireGuard INI 格式 [Peer] 后不能直接跟注释，必须换行
     {
         echo ""
         echo "# ${name}"
@@ -405,7 +381,6 @@ EOF
     } >> "$WG_CONF"
     
     sync_wg
-    
     echo -e "${GREEN}======================================${NC}"
     echo -e "${GREEN} 落地机 ${name} 隧道添加成功!${NC}"
     echo -e " - 分配落地机内网 IP: ${land_ip}"
@@ -421,12 +396,9 @@ relay_add_forward() {
     
     echo -e "\n${CYAN}当前可用落地机内网 IP:${NC}"
     if ! grep -q "AllowedIPs" "$WG_CONF"; then
-        echo -e "${RED}无可用落地机，请先添加落地机隧道${NC}"
-        return 1
+        echo -e "${RED}无可用落地机，请先添加落地机隧道${NC}"; return 1
     fi
-    grep "AllowedIPs" "$WG_CONF" | grep -oE "10\.0\.0\.[0-9]+" | while read ip; do
-        echo " - $ip"
-    done
+    grep "AllowedIPs" "$WG_CONF" | grep -oE "10\.0\.0\.[0-9]+" | while read ip; do echo " - $ip"; done
     
     read -rp "客户端连接本机的哪个端口: " C_PORT
     read -rp "转发到哪个落地机内网 IP: " LAND_IP
@@ -439,25 +411,14 @@ relay_add_forward() {
     read -rp "选择 [1/2/3]: " proto_choice
     local protos=""
     case $proto_choice in
-        1) protos="tcp" ;;
-        2) protos="udp" ;;
-        3) protos="tcp udp" ;;
-        *) echo -e "${RED}无效选择${NC}"; return ;;
+        1) protos="tcp" ;; 2) protos="udp" ;; 3) protos="tcp udp" ;; *) echo -e "${RED}无效选择${NC}"; return ;;
     esac
 
     for proto in $protos; do
-        # 倒序删除旧规则，防止规则累积
-        while read -r num; do
-            iptables -t nat -D PREROUTING $num 2>/dev/null
-        done < <(iptables -t nat -L PREROUTING -n --line-numbers | grep -E "dpt:${C_PORT}( |$)" | grep -w "${proto}" | awk '{print $1}' | sort -rn)
-        
+        while read -r num; do iptables -t nat -D PREROUTING $num 2>/dev/null; done < <(iptables -t nat -L PREROUTING -n --line-numbers | grep -E "dpt:${C_PORT}( |$)" | grep -w "${proto}" | awk '{print $1}' | sort -rn)
         iptables -t nat -A PREROUTING -p ${proto} --dport ${C_PORT} -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
         
-        # 修复 Bug: grep -w 对带点的IP失效，改用精准正则匹配
-        while read -r num; do
-            iptables -D FORWARD $num 2>/dev/null
-        done < <(iptables -L FORWARD -n --line-numbers | grep -E " ${LAND_IP}( |$)" | grep -E "dpt:${LAND_PORT}( |$)" | grep -w "${proto}" | awk '{print $1}' | sort -rn)
-        
+        while read -r num; do iptables -D FORWARD $num 2>/dev/null; done < <(iptables -L FORWARD -n --line-numbers | grep -E " ${LAND_IP}( |$)" | grep -E "dpt:${LAND_PORT}( |$)" | grep -w "${proto}" | awk '{print $1}' | sort -rn)
         iptables -A FORWARD -p ${proto} -d ${LAND_IP} --dport ${LAND_PORT} -j ACCEPT
     done
 
@@ -465,7 +426,6 @@ relay_add_forward() {
     iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
     
     netfilter-persistent save 2>/dev/null || true
-    
     echo -e "${GREEN}规则添加成功: 本机端口 ${C_PORT} (${protos}) -> 落地机 ${LAND_IP} 端口 ${LAND_PORT}${NC}"
 }
 
@@ -480,11 +440,7 @@ relay_view_config() {
     
     echo -e "\n${GREEN}2. 端口转发规则 (DNAT):${NC}"
     local nat_rules=$(iptables -t nat -L PREROUTING -n | grep "DNAT")
-    if [[ -z "$nat_rules" ]]; then
-        echo -e " - ${YELLOW}无转发规则${NC}"
-    else
-        echo "$nat_rules" | awk '{for(i=1;i<=NF;i++) if($i ~ /dpt:/ || $i ~ /to:/) printf $i" "; print ""}' | sed 's/^/ - /'
-    fi
+    [[ -z "$nat_rules" ]] && echo -e " - ${YELLOW}无转发规则${NC}" || echo "$nat_rules" | awk '{for(i=1;i<=NF;i++) if($i ~ /dpt:/ || $i ~ /to:/) printf $i" "; print ""}' | sed 's/^/ - /'
 }
 
 relay_del_landing() {
@@ -502,27 +458,15 @@ relay_del_landing() {
     done < "$WG_CONF"
     
     [[ ${#arr[@]} -eq 0 ]] && { echo -e "${YELLOW}无落地机隧道${NC}"; return; }
-    
     read -rp "删除编号: " c
     [[ ! "$c" =~ ^[0-9]+$ || "$c" -lt 1 || "$c" -gt ${#arr[@]} ]] && return
     
     local name=${arr[$c]}
-    
-    # 提取落地机 IP
     local land_ip=$(awk -v key="# ${name}" '$0 == key {f=1} f && /^AllowedIPs/ {split($3,a,"/"); print a[1]; exit}' "$WG_CONF")
     
-    # 修复 Bug: grep -w 对带点的IP完全失效，改用精准正则匹配 iptables 输出格式
     if [[ -n "$land_ip" ]]; then
-        # 清理 NAT 链规则 (iptables 输出格式为 to:10.0.0.2:443)
-        while read -r num; do
-            iptables -t nat -D PREROUTING $num 2>/dev/null
-        done < <(iptables -t nat -L PREROUTING -n --line-numbers | grep -E "to:${land_ip}:" | awk '{print $1}' | sort -rn)
-        
-        # 清理 FORWARD 链规则 (iptables 输出格式为 10.0.0.2 tcp)
-        while read -r num; do
-            iptables -D FORWARD $num 2>/dev/null
-        done < <(iptables -L FORWARD -n --line-numbers | grep -E " ${land_ip}( |$)" | awk '{print $1}' | sort -rn)
-        
+        while read -r num; do iptables -t nat -D PREROUTING $num 2>/dev/null; done < <(iptables -t nat -L PREROUTING -n --line-numbers | grep -E "to:${land_ip}:" | awk '{print $1}' | sort -rn)
+        while read -r num; do iptables -D FORWARD $num 2>/dev/null; done < <(iptables -L FORWARD -n --line-numbers | grep -E " ${land_ip}( |$)" | awk '{print $1}' | sort -rn)
         netfilter-persistent save 2>/dev/null || true
         echo -e "${CYAN}已自动清理指向 ${land_ip} 的 iptables 转发规则${NC}"
     fi
@@ -532,17 +476,8 @@ relay_del_landing() {
     rm -f "/etc/systemd/system/udp2raw-${name}.service"
     systemctl daemon-reload
     
-    # 使用 awk 状态机精准剔除配置块，无惧空行干扰
-    awk -v key="# ${name}" '
-        BEGIN { skip=0 }
-        /^# / && $0 != key { skip=0 }
-        $0 == key { skip=1 }
-        skip==1 { next }
-        { print }
-    ' "$WG_CONF" > "${WG_CONF}.tmp" && mv "${WG_CONF}.tmp" "$WG_CONF"
-    
+    awk -v key="# ${name}" 'BEGIN { skip=0 } /^# / && $0 != key { skip=0 } $0 == key { skip=1 } skip==1 { next } { print }' "$WG_CONF" > "${WG_CONF}.tmp" && mv "${WG_CONF}.tmp" "$WG_CONF"
     sync_wg
-    
     echo -e "${GREEN}隧道 ${name} 已删除${NC}"
 }
 
@@ -552,7 +487,6 @@ show_status() {
     echo -e "${GREEN}1. 内核与网络:${NC}"
     echo "内核版本 : $(uname -r)"
     echo "拥塞算法 : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未知')"
-    echo "队列调度 : $(sysctl -n net.core.default_qdisc 2>/dev/null || echo '未知')"
     echo "IPv4转发 : $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '未知')"
     
     echo -e "\n${GREEN}2. WireGuard 接口:${NC}"
@@ -560,10 +494,17 @@ show_status() {
     
     echo -e "\n${GREEN}3. udp2raw 服务状态:${NC}"
     systemctl list-units --type=service --state=running | grep "udp2raw" || echo "无运行中的 udp2raw 服务"
+    
+    if [[ -f "${WG_CONF}" ]] && grep -q "AllowedIPs" "$WG_CONF"; then
+        echo -e "\n${GREEN}4. 端口转发规则 (DNAT):${NC}"
+        local nat_rules=$(iptables -t nat -L PREROUTING -n | grep "DNAT")
+        [[ -z "$nat_rules" ]] && echo -e " - ${YELLOW}无转发规则${NC}" || echo "$nat_rules" | awk '{for(i=1;i<=NF;i++) if($i ~ /dpt:/ || $i ~ /to:/) printf $i" "; print ""}' | sed 's/^/ - /'
+    fi
 }
 
 optimize_kernel() {
     while true; do
+        clear
         local cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
         local cur_kr=$(uname -r)
         local xm="否"; [[ "$cur_kr" == *xanmod* ]] && xm="是"
@@ -575,11 +516,11 @@ optimize_kernel() {
         echo "0. 返回主菜单"
         read -rp "选择 [0-3]: " c
         case $c in
-            1) _enable_bbr ;;
-            2) _enable_bbrv3 ;;
-            3) _deep_tune ;;
+            1) _enable_bbr; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
+            2) _enable_bbrv3; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
+            3) _deep_tune; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
             0) return ;;
-            *) echo -e "${RED}无效${NC}" ;;
+            *) echo -e "${RED}无效输入${NC}"; sleep 1 ;;
         esac
     done
 }
@@ -621,9 +562,7 @@ _enable_bbrv3() {
     local suffix="x64v2"
     [[ "$cpu" == "x86-64-v3" ]] && suffix="x64v3"
     
-    echo "选择分支:"
-    echo "  1) LTS (Debian 12+/Ubuntu 24.04+)"
-    echo "  2) MAIN (Debian 13/Ubuntu 24.04+)"
+    echo "选择分支: 1) LTS 2) MAIN"
     read -rp "[1]: " br; br=${br:-1}
     local pkg="linux-xanmod-lts-${suffix}"
     [[ "$br" == "2" ]] && pkg="linux-xanmod-${suffix}"
@@ -693,6 +632,7 @@ uninstall_all() {
 # ==================== 主菜单 ====================
 main() {
     while true; do
+        clear
         echo -e "\n${GREEN}===== WG + udp2raw 隧道中转架构 (多落地支持) =====${NC}"
         echo "1. 落地机配置"
         echo "2. 中转机配置 (多落地)"
@@ -704,11 +644,11 @@ main() {
         case $c in
             1) landing_menu ;;
             2) relay_menu ;;
-            3) show_status ;;
+            3) show_status; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
             4) optimize_kernel ;;
-            5) uninstall_all ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效${NC}" ;;
+            5) uninstall_all; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
+            0) clear; exit 0 ;;
+            *) echo -e "${RED}无效输入${NC}"; sleep 1 ;;
         esac
     done
 }
