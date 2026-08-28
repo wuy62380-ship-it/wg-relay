@@ -1,5 +1,5 @@
 #!/bin/bash
-# WireGuard + iptables + udp2raw 多落地隧道中转架构 (全量审查终极版)
+# WireGuard + iptables + udp2raw 多落地隧道中转架构 (全量审查终极完整版)
 # 支持: Debian 11/12/13, Ubuntu 20.04/22.04/24.04
 
 set -uo pipefail
@@ -393,7 +393,7 @@ EOF
     systemctl daemon-reload
     systemctl enable --now "udp2raw-${name}"
     
-    # 严格遵守 INI 格式，注释换行放在 [Peer] 上方
+    # 修复致命 Bug: WireGuard INI 格式 [Peer] 后不能直接跟注释，必须换行
     {
         echo ""
         echo "# ${name}"
