@@ -1,6 +1,6 @@
 #!/bin/bash
-# WireGuard + iptables + udp2raw 多落地隧道中转架构 (清爽TUI完整版)
-# 支持: Debian 11/12/13, Ubuntu 20.04/22.04/24.04
+# WireGuard + iptables + udp2raw 多落地隧道中转架构 (全协议支持版)
+# 支持: IPv4 / IPv6 / 域名 / Debian 11/12/13, Ubuntu 20.04/22.04/24.04
 
 set -uo pipefail
 
@@ -32,6 +32,17 @@ validate_ip() {
         if [[ "$last" -ge 2 && "$last" -le 254 ]]; then return 0; fi
     fi
     return 1
+}
+
+# 自动格式化 udp2raw 的目标地址 (处理 IPv6 和域名)
+format_addr() {
+    local addr=$1
+    # 如果包含多个冒号且没有被方括号包裹，说明是 IPv6
+    if [[ "$addr" == *:* && "$addr" != \[*\] ]]; then
+        echo "[${addr}]"
+    else
+        echo "$addr"
+    fi
 }
 
 setup_base() {
@@ -83,7 +94,6 @@ landing_init() {
     echo -e "${CYAN}===== 初始化落地机 (WG服务端 + udp2raw服务端) =====${NC}"
     setup_base
     
-    # 先清理可能残留的旧实例
     systemctl stop wg-quick@wg0 2>/dev/null || true
     ip link delete wg0 2>/dev/null || true
     
@@ -98,6 +108,14 @@ landing_init() {
         [[ "$WG_PORT" =~ ^[0-9]+$ && "$WG_PORT" -ge 1 && "$WG_PORT" -le 65535 ]] && break
         echo -e "${RED}无效端口${NC}"
     done
+
+    # 新增：监听地址选择
+    echo "请选择 udp2raw 监听的网络类型:"
+    echo "  1. 仅 IPv4 (0.0.0.0) [默认]"
+    echo "  2. IPv6 + IPv4 双栈 ([::])"
+    read -rp "选择 [1/2]: " listen_choice
+    local LISTEN_ADDR="0.0.0.0"
+    if [[ "$listen_choice" == "2" ]]; then LISTEN_ADDR="[::]"; fi
     
     local u2r_pass=$(head -c 16 /dev/urandom | base64)
     echo "$u2r_pass" > "${UDP2RAW_DIR}/password"
@@ -134,6 +152,10 @@ PostUp = iptables -I INPUT -p udp --dport ${WG_PORT} ! -s 127.0.0.1 -j DROP
 PostUp = iptables -I FORWARD -i %i -j ACCEPT
 PostUp = iptables -I FORWARD -o %i -j ACCEPT
 PostUp = iptables -t nat -I POSTROUTING -s 10.0.0.0/24 -o ${WAN_IFACE} -j MASQUERADE
+PostUp = ip6tables -I INPUT -p tcp --dport ${FAKE_PORT} -j ACCEPT 2>/dev/null
+PostUp = ip6tables -I FORWARD -i %i -j ACCEPT 2>/dev/null
+PostUp = ip6tables -I FORWARD -o %i -j ACCEPT 2>/dev/null
+PostUp = ip6tables -t nat -I POSTROUTING -s fd42:42:42::/64 -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null
 PostUp = ${WG_DIR}/load-peers.sh %i
 
 PostDown = iptables -D INPUT -p tcp --dport ${FAKE_PORT} -j ACCEPT
@@ -141,6 +163,10 @@ PostDown = iptables -D INPUT -p udp --dport ${WG_PORT} ! -s 127.0.0.1 -j DROP
 PostDown = iptables -D FORWARD -i %i -j ACCEPT
 PostDown = iptables -D FORWARD -o %i -j ACCEPT
 PostDown = iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o ${WAN_IFACE} -j MASQUERADE
+PostDown = ip6tables -D INPUT -p tcp --dport ${FAKE_PORT} -j ACCEPT 2>/dev/null
+PostDown = ip6tables -D FORWARD -i %i -j ACCEPT 2>/dev/null
+PostDown = ip6tables -D FORWARD -o %i -j ACCEPT 2>/dev/null
+PostDown = ip6tables -t nat -D POSTROUTING -s fd42:42:42::/64 -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null
 EOF
     
     cat > /etc/systemd/system/udp2raw.service <<EOF
@@ -150,7 +176,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/udp2raw -s -l 0.0.0.0:${FAKE_PORT} -r 127.0.0.1:${WG_PORT} --raw-mode faketcp -a -k "${u2r_pass}"
+ExecStart=/usr/local/bin/udp2raw -s -l ${LISTEN_ADDR}:${FAKE_PORT} -r 127.0.0.1:${WG_PORT} --raw-mode faketcp -a -k "${u2r_pass}"
 Restart=always
 
 [Install]
@@ -158,8 +184,6 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now udp2raw
-    
-    # 修复启动逻辑：统一使用 systemctl restart，避免 wg-quick up 冲突
     systemctl enable wg-quick@wg0 2>/dev/null || true
     systemctl restart wg-quick@wg0 2>/dev/null || true
     
@@ -173,7 +197,8 @@ EOF
     echo -e "${GREEN} 落地机初始化完成!${NC}"
     echo -e "${YELLOW} >>> 落地机 WG 公钥: ${srv_pub}${NC}"
     echo -e "${YELLOW} >>> udp2raw 密码: ${u2r_pass}${NC}"
-    echo -e "${YELLOW} >>> udp2raw 伪装端口: ${FAKE_PORT}${NC}"
+    echo -e "${YELLOW} >>> udp2raw 伪装端口: ${FAKE_PORT} (TCP)${NC}"
+    echo -e "${YELLOW} >>> 监听地址: ${LISTEN_ADDR}${NC}"
     echo -e "${GREEN}======================================${NC}"
 }
 
@@ -346,7 +371,12 @@ relay_add_landing() {
     read -rp "请为此落地机命名 (如 land-us): " name; name=$(echo "$name" | tr -dc '[:alnum:]-_')
     [[ -z "$name" ]] && return
     
-    read -rp "落地机公网 IP: " LAND_IP
+    # 支持输入 IP 或 域名
+    read -rp "落地机公网 IP 或 域名: " LAND_ADDR_RAW
+    [[ -z "$LAND_ADDR_RAW" ]] && return
+    # 自动格式化 IPv6 加上方括号
+    local LAND_ADDR=$(format_addr "$LAND_ADDR_RAW")
+    
     read -rp "落地机 udp2raw 伪装端口 [20022]: " LAND_FAKE_PORT; LAND_FAKE_PORT=${LAND_FAKE_PORT:-20022}
     read -rp "落地机 udp2raw 密码: " U2R_PASS
     read -rp "落地机 WG 公钥: " LAND_PUBKEY
@@ -373,7 +403,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/udp2raw -c -l 127.0.0.1:${local_port} -r ${LAND_IP}:${LAND_FAKE_PORT} --raw-mode faketcp -a -k "${U2R_PASS}"
+ExecStart=/usr/local/bin/udp2raw -c -l 127.0.0.1:${local_port} -r ${LAND_ADDR}:${LAND_FAKE_PORT} --raw-mode faketcp -a -k "${U2R_PASS}"
 Restart=always
 
 [Install]
@@ -397,6 +427,7 @@ EOF
     echo -e "${GREEN} 落地机 ${name} 隧道添加成功!${NC}"
     echo -e " - 分配落地机内网 IP: ${land_ip}"
     echo -e " - 本地监听端口: ${local_port}"
+    echo -e " - 目标地址: ${LAND_ADDR}:${LAND_FAKE_PORT}"
     echo -e "${CYAN}请使用 '添加端口转发规则' 将外部端口映射到 ${land_ip}${NC}"
     echo -e "${GREEN}======================================${NC}"
 }
@@ -450,7 +481,10 @@ relay_view_config() {
     echo -e "${GREEN}1. 落地机隧道列表:${NC}"
     wg show wg0 | grep -E "peer|endpoint|allowed" || echo "无隧道"
     
-    echo -e "\n${GREEN}2. 端口转发规则 (DNAT):${NC}"
+    echo -e "\n${GREEN}2. udp2raw 客户端服务:${NC}"
+    systemctl list-units --type=service --state=running | grep "udp2raw" || echo "无运行中的 udp2raw 服务"
+    
+    echo -e "\n${GREEN}3. 端口转发规则 (DNAT):${NC}"
     local nat_rules=$(iptables -t nat -L PREROUTING -n | grep "DNAT")
     [[ -z "$nat_rules" ]] && echo -e " - ${YELLOW}无转发规则${NC}" || echo "$nat_rules" | awk '{for(i=1;i<=NF;i++) if($i ~ /dpt:/ || $i ~ /to:/) printf $i" "; print ""}' | sed 's/^/ - /'
 }
