@@ -1,5 +1,5 @@
 #!/bin/bash
-# WireGuard + iptables + udp2raw 多落地隧道中转架构 (全协议支持版)
+# WireGuard + iptables + udp2raw 多落地隧道中转架构 (傻瓜式自动化版)
 # 支持: IPv4 / IPv6 / 域名 / Debian 11/12/13, Ubuntu 20.04/22.04/24.04
 
 set -uo pipefail
@@ -34,15 +34,9 @@ validate_ip() {
     return 1
 }
 
-# 自动格式化 udp2raw 的目标地址 (处理 IPv6 和域名)
 format_addr() {
     local addr=$1
-    # 如果包含多个冒号且没有被方括号包裹，说明是 IPv6
-    if [[ "$addr" == *:* && "$addr" != \[*\] ]]; then
-        echo "[${addr}]"
-    else
-        echo "$addr"
-    fi
+    if [[ "$addr" == *:* && "$addr" != \[*\] ]]; then echo "[${addr}]"; else echo "$addr"; fi
 }
 
 setup_base() {
@@ -109,7 +103,6 @@ landing_init() {
         echo -e "${RED}无效端口${NC}"
     done
 
-    # 新增：监听地址选择
     echo "请选择 udp2raw 监听的网络类型:"
     echo "  1. 仅 IPv4 (0.0.0.0) [默认]"
     echo "  2. IPv6 + IPv4 双栈 ([::])"
@@ -152,10 +145,6 @@ PostUp = iptables -I INPUT -p udp --dport ${WG_PORT} ! -s 127.0.0.1 -j DROP
 PostUp = iptables -I FORWARD -i %i -j ACCEPT
 PostUp = iptables -I FORWARD -o %i -j ACCEPT
 PostUp = iptables -t nat -I POSTROUTING -s 10.0.0.0/24 -o ${WAN_IFACE} -j MASQUERADE
-PostUp = ip6tables -I INPUT -p tcp --dport ${FAKE_PORT} -j ACCEPT 2>/dev/null
-PostUp = ip6tables -I FORWARD -i %i -j ACCEPT 2>/dev/null
-PostUp = ip6tables -I FORWARD -o %i -j ACCEPT 2>/dev/null
-PostUp = ip6tables -t nat -I POSTROUTING -s fd42:42:42::/64 -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null
 PostUp = ${WG_DIR}/load-peers.sh %i
 
 PostDown = iptables -D INPUT -p tcp --dport ${FAKE_PORT} -j ACCEPT
@@ -163,10 +152,6 @@ PostDown = iptables -D INPUT -p udp --dport ${WG_PORT} ! -s 127.0.0.1 -j DROP
 PostDown = iptables -D FORWARD -i %i -j ACCEPT
 PostDown = iptables -D FORWARD -o %i -j ACCEPT
 PostDown = iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o ${WAN_IFACE} -j MASQUERADE
-PostDown = ip6tables -D INPUT -p tcp --dport ${FAKE_PORT} -j ACCEPT 2>/dev/null
-PostDown = ip6tables -D FORWARD -i %i -j ACCEPT 2>/dev/null
-PostDown = ip6tables -D FORWARD -o %i -j ACCEPT 2>/dev/null
-PostDown = ip6tables -t nat -D POSTROUTING -s fd42:42:42::/64 -o ${WAN_IFACE} -j MASQUERADE 2>/dev/null
 EOF
     
     cat > /etc/systemd/system/udp2raw.service <<EOF
@@ -228,20 +213,11 @@ landing_add_peer() {
             [[ -e "$f" ]] || continue
             if grep -qF "${RELAY_IP}/32" "$f"; then is_used=1; break; fi
         done
-        if [[ "$is_used" -eq 1 ]]; then
-            echo -e "${RED}该 IP 已被占用，请重新输入${NC}"
-        else
-            break
-        fi
+        if [[ "$is_used" -eq 1 ]]; then echo -e "${RED}该 IP 已被占用，请重新输入${NC}"; else break; fi
     done
     
     local cip4="${RELAY_IP}/32"
-    {
-        echo "[Peer]"
-        echo "PublicKey = ${pub}"
-        echo "AllowedIPs = ${cip4}"
-    } > "$peer_file"
-    
+    { echo "[Peer]"; echo "PublicKey = ${pub}"; echo "AllowedIPs = ${cip4}"; } > "$peer_file"
     wg set wg0 peer "$pub" allowed-ips "$cip4" 2>/dev/null || true
     echo -e "${GREEN}中转机 Peer ${name} 添加成功 (IP: ${RELAY_IP})${NC}"
 }
@@ -251,19 +227,13 @@ landing_del_peer() {
     for f in "$PEERS_DIR"/*.conf; do
         [[ -e "$f" ]] || continue
         local name=$(basename "$f" .conf)
-        echo "  [$i] $name"
-        arr[$i]="$name"
-        ((i++))
+        echo "  [$i] $name"; arr[$i]="$name"; ((i++))
     done
     [[ ${#arr[@]} -eq 0 ]] && { echo -e "${YELLOW}无中转机节点${NC}"; return; }
-    
     read -rp "删除编号: " c
     [[ ! "$c" =~ ^[0-9]+$ || "$c" -lt 1 || "$c" -gt ${#arr[@]} ]] && return
-    
-    local name=${arr[$c]}
-    local peer_file="${PEERS_DIR}/${name}.conf"
+    local name=${arr[$c]}; local peer_file="${PEERS_DIR}/${name}.conf"
     local pub=$(grep "^PublicKey" "$peer_file" | awk '{print $3}')
-    
     wg set wg0 peer "$pub" remove 2>/dev/null || true
     rm -f "$peer_file"
     echo -e "${GREEN}节点 ${name} 已删除${NC}"
@@ -271,19 +241,13 @@ landing_del_peer() {
 
 landing_list_peers() {
     echo -e "\n${CYAN}===== 已连接的中转机列表 =====${NC}"
-    if ! ip link show wg0 &>/dev/null; then
-        echo -e "${RED}WG 接口未运行，请先初始化！${NC}"; return 1
-    fi
+    if ! ip link show wg0 &>/dev/null; then echo -e "${RED}WG 接口未运行，请先初始化！${NC}"; return 1; fi
     [[ ! -d "$PEERS_DIR" || -z "$(ls -A "$PEERS_DIR" 2>/dev/null)" ]] && { echo -e "${YELLOW}当前没有配置中转机${NC}"; return; }
-    
     local has_peer=0
     for f in "$PEERS_DIR"/*.conf; do
-        [[ -e "$f" ]] || continue
-        has_peer=1
-        local name=$(basename "$f" .conf)
-        local pub=$(grep "^PublicKey" "$f" | awk '{print $3}')
+        [[ -e "$f" ]] || continue; has_peer=1
+        local name=$(basename "$f" .conf); local pub=$(grep "^PublicKey" "$f" | awk '{print $3}')
         local ip=$(grep "^AllowedIPs" "$f" | awk '{print $3}')
-        
         local handshake=$(wg show wg0 latest-handshakes 2>/dev/null | grep "$pub" | awk '{print $2}')
         local status="${RED}离线${NC}"
         if [[ -n "$handshake" && "$handshake" -ne 0 ]]; then
@@ -323,7 +287,6 @@ relay_menu() {
 relay_init_base() {
     echo -e "${CYAN}===== 初始化中转机基础环境 =====${NC}"
     setup_base
-    
     systemctl stop wg-quick@wg0 2>/dev/null || true
     ip link delete wg0 2>/dev/null || true
     
@@ -335,10 +298,8 @@ relay_init_base() {
         echo -e "${RED}格式错误，请输入 10.0.0.2 ~ 10.0.0.254 之间的 IP${NC}"
     done
     
-    local cli_priv=$(wg genkey)
-    local cli_pub=$(echo "$cli_priv" | wg pubkey)
-    echo "$cli_priv" > "${WG_DIR}/privatekey"
-    echo "$cli_pub" > "${WG_DIR}/client_public"
+    local cli_priv=$(wg genkey); local cli_pub=$(echo "$cli_priv" | wg pubkey)
+    echo "$cli_priv" > "${WG_DIR}/privatekey"; echo "$cli_pub" > "${WG_DIR}/client_public"
     
     cat > "$WG_CONF" <<EOF
 [Interface]
@@ -349,10 +310,8 @@ EOF
     
     systemctl enable wg-quick@wg0 2>/dev/null || true
     systemctl restart wg-quick@wg0 2>/dev/null || true
-    
     if ! systemctl is-active --quiet wg-quick@wg0; then
-        echo -e "${RED}WireGuard 启动失败！请手动执行 wg-quick up wg0 检查报错。${NC}"
-        return 1
+        echo -e "${RED}WireGuard 启动失败！请手动执行 wg-quick up wg0 检查报错。${NC}"; return 1
     fi
     netfilter-persistent save 2>/dev/null || true
     
@@ -364,25 +323,17 @@ EOF
 }
 
 relay_add_landing() {
-    if [[ ! -f "$WG_CONF" ]]; then
-        echo -e "${RED}请先初始化中转机基础环境${NC}"; return 1
-    fi
-    
+    if [[ ! -f "$WG_CONF" ]]; then echo -e "${RED}请先初始化中转机基础环境${NC}"; return 1; fi
     read -rp "请为此落地机命名 (如 land-us): " name; name=$(echo "$name" | tr -dc '[:alnum:]-_')
     [[ -z "$name" ]] && return
     
-    # 支持输入 IP 或 域名
-    read -rp "落地机公网 IP 或 域名: " LAND_ADDR_RAW
-    [[ -z "$LAND_ADDR_RAW" ]] && return
-    # 自动格式化 IPv6 加上方括号
+    read -rp "落地机公网 IP 或 域名: " LAND_ADDR_RAW; [[ -z "$LAND_ADDR_RAW" ]] && return
     local LAND_ADDR=$(format_addr "$LAND_ADDR_RAW")
-    
     read -rp "落地机 udp2raw 伪装端口 [20022]: " LAND_FAKE_PORT; LAND_FAKE_PORT=${LAND_FAKE_PORT:-20022}
     read -rp "落地机 udp2raw 密码: " U2R_PASS
     read -rp "落地机 WG 公钥: " LAND_PUBKEY
     
-    local self_ip=$(grep "^Address" "$WG_CONF" | awk '{print $3}' | cut -d'/' -f1 | cut -d'.' -f4)
-    self_ip=${self_ip:-0}
+    local self_ip=$(grep "^Address" "$WG_CONF" | awk '{print $3}' | cut -d'/' -f1 | cut -d'.' -f4); self_ip=${self_ip:-0}
     local used_ips=$(grep "AllowedIPs" "$WG_CONF" | grep -oE "10\.0\.0\.[0-9]+" | cut -d'.' -f4 | sort -n)
     local num=1
     while true; do
@@ -409,20 +360,15 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now "udp2raw-${name}"
+    systemctl daemon-reload; systemctl enable --now "udp2raw-${name}"
     
     {
-        echo ""
-        echo "# ${name}"
-        echo "[Peer]"
-        echo "PublicKey = ${LAND_PUBKEY}"
-        echo "Endpoint = 127.0.0.1:${local_port}"
-        echo "AllowedIPs = ${land_ip}/32"
+        echo ""; echo "# ${name}"; echo "[Peer]"; echo "PublicKey = ${LAND_PUBKEY}"
+        echo "Endpoint = 127.0.0.1:${local_port}"; echo "AllowedIPs = ${land_ip}/32"
         echo "PersistentKeepalive = 25"
     } >> "$WG_CONF"
-    
     sync_wg
+    
     echo -e "${GREEN}======================================${NC}"
     echo -e "${GREEN} 落地机 ${name} 隧道添加成功!${NC}"
     echo -e " - 分配落地机内网 IP: ${land_ip}"
@@ -432,26 +378,36 @@ EOF
     echo -e "${GREEN}======================================${NC}"
 }
 
+# ★★★ 傻瓜式自动化：自动检测落地机IP，自动同步端口 ★★★
 relay_add_forward() {
-    if ! ip link show wg0 &>/dev/null; then
-        echo -e "${RED}WG 接口未运行，请先初始化！${NC}"; return 1
+    if ! ip link show wg0 &>/dev/null; then echo -e "${RED}WG 接口未运行，请先初始化！${NC}"; return 1; fi
+    
+    local land_ips=()
+    while read -r ip; do land_ips+=("$ip"); done < <(grep "AllowedIPs" "$WG_CONF" | grep -oE "10\.0\.0\.[0-9]+")
+    
+    if [[ ${#land_ips[@]} -eq 0 ]]; then echo -e "${RED}无可用落地机，请先添加落地机隧道${NC}"; return 1; fi
+    
+    local LAND_IP
+    if [[ ${#land_ips[@]} -eq 1 ]]; then
+        LAND_IP="${land_ips[0]}"
+        echo -e "${CYAN}检测到唯一落地机，自动选中: ${GREEN}${LAND_IP}${NC}"
+    else
+        echo -e "${CYAN}当前可用落地机内网 IP:${NC}"
+        for ip in "${land_ips[@]}"; do echo " - $ip"; done
+        read -rp "请输入转发到哪个落地机内网 IP: " LAND_IP
     fi
     
-    echo -e "\n${CYAN}当前可用落地机内网 IP:${NC}"
-    if ! grep -q "AllowedIPs" "$WG_CONF"; then
-        echo -e "${RED}无可用落地机，请先添加落地机隧道${NC}"; return 1
-    fi
-    grep "AllowedIPs" "$WG_CONF" | grep -oE "10\.0\.0\.[0-9]+" | while read ip; do echo " - $ip"; done
+    local C_PORT
+    read -rp "客户端连接本机的哪个端口 (如 443): " C_PORT
+    [[ -z "$C_PORT" ]] && C_PORT=443
     
-    read -rp "客户端连接本机的哪个端口: " C_PORT
-    read -rp "转发到哪个落地机内网 IP: " LAND_IP
-    read -rp "转发到落地机的哪个端口: " LAND_PORT
+    local LAND_PORT
+    read -rp "转发到落地机的哪个端口 (回车默认同上: ${C_PORT}): " LAND_PORT
+    [[ -z "$LAND_PORT" ]] && LAND_PORT=$C_PORT
     
-    echo "请选择转发协议:"
-    echo "  1. 仅 TCP"
-    echo "  2. 仅 UDP"
-    echo "  3. TCP + UDP (推荐)"
-    read -rp "选择 [1/2/3]: " proto_choice
+    local proto_choice
+    read -rp "选择协议 (1.TCP / 2.UDP / 3.TCP+UDP) [回车默认3]: " proto_choice
+    proto_choice=${proto_choice:-3}
     local protos=""
     case $proto_choice in
         1) protos="tcp" ;; 2) protos="udp" ;; 3) protos="tcp udp" ;; *) echo -e "${RED}无效选择${NC}"; return ;;
@@ -460,7 +416,6 @@ relay_add_forward() {
     for proto in $protos; do
         while read -r num; do iptables -t nat -D PREROUTING $num 2>/dev/null; done < <(iptables -t nat -L PREROUTING -n --line-numbers | grep -E "dpt:${C_PORT}( |$)" | grep -w "${proto}" | awk '{print $1}' | sort -rn)
         iptables -t nat -A PREROUTING -p ${proto} --dport ${C_PORT} -j DNAT --to-destination ${LAND_IP}:${LAND_PORT}
-        
         while read -r num; do iptables -D FORWARD $num 2>/dev/null; done < <(iptables -L FORWARD -n --line-numbers | grep -E " ${LAND_IP}( |$)" | grep -E "dpt:${LAND_PORT}( |$)" | grep -w "${proto}" | awk '{print $1}' | sort -rn)
         iptables -A FORWARD -p ${proto} -d ${LAND_IP} --dport ${LAND_PORT} -j ACCEPT
     done
@@ -474,9 +429,7 @@ relay_add_forward() {
 
 relay_view_config() {
     echo -e "\n${CYAN}===== 中转机隧道与转发状态 =====${NC}"
-    if ! ip link show wg0 &>/dev/null; then
-        echo -e "${RED}WG 接口未运行，请先初始化！${NC}"; return 1
-    fi
+    if ! ip link show wg0 &>/dev/null; then echo -e "${RED}WG 接口未运行，请先初始化！${NC}"; return 1; fi
     
     echo -e "${GREEN}1. 落地机隧道列表:${NC}"
     wg show wg0 | grep -E "peer|endpoint|allowed" || echo "无隧道"
@@ -491,15 +444,11 @@ relay_view_config() {
 
 relay_del_landing() {
     if [[ ! -f "$WG_CONF" ]]; then return 1; fi
-    
     echo -e "\n${CYAN}当前落地机隧道:${NC}"
     local i=1 arr=()
     while IFS= read -r line; do
         if [[ "$line" == "# "* ]]; then
-            local name=$(echo "$line" | awk '{print $2}')
-            echo "  [$i] $name"
-            arr[$i]="$name"
-            ((i++))
+            local name=$(echo "$line" | awk '{print $2}'); echo "  [$i] $name"; arr[$i]="$name"; ((i++))
         fi
     done < "$WG_CONF"
     
@@ -509,7 +458,6 @@ relay_del_landing() {
     
     local name=${arr[$c]}
     local land_ip=$(awk -v key="# ${name}" '$0 == key {f=1} f && /^AllowedIPs/ {split($3,a,"/"); print a[1]; exit}' "$WG_CONF")
-    
     if [[ -n "$land_ip" ]]; then
         while read -r num; do iptables -t nat -D PREROUTING $num 2>/dev/null; done < <(iptables -t nat -L PREROUTING -n --line-numbers | grep -E "to:${land_ip}:" | awk '{print $1}' | sort -rn)
         while read -r num; do iptables -D FORWARD $num 2>/dev/null; done < <(iptables -L FORWARD -n --line-numbers | grep -E " ${land_ip}( |$)" | awk '{print $1}' | sort -rn)
@@ -531,8 +479,7 @@ relay_del_landing() {
 show_status() {
     echo -e "\n${CYAN}===== 系统全局状态 =====${NC}"
     echo -e "${GREEN}1. 内核与网络:${NC}"
-    echo "内核版本 : $(uname -r)"
-    echo "拥塞算法 : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未知')"
+    echo "内核版本 : $(uname -r)"; echo "拥塞算法 : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '未知')"
     echo "IPv4转发 : $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '未知')"
     
     echo -e "\n${GREEN}2. WireGuard 接口:${NC}"
@@ -552,14 +499,10 @@ optimize_kernel() {
     while true; do
         clear
         local cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-        local cur_kr=$(uname -r)
-        local xm="否"; [[ "$cur_kr" == *xanmod* ]] && xm="是"
+        local cur_kr=$(uname -r); local xm="否"; [[ "$cur_kr" == *xanmod* ]] && xm="是"
         echo -e "${CYAN}===== 内核与 BBR 优化 =====${NC}"
         echo -e "内核: ${cur_kr} | XanMod: ${xm} | 算法: ${cur_cc}"
-        echo "1. 标准 BBR (v1，免重启)"
-        echo "2. BBRv3 (安装 XanMod，需重启)"
-        echo "3. 深度网络栈调优 (高并发推荐)"
-        echo "0. 返回主菜单"
+        echo "1. 标准 BBR (v1，免重启)"; echo "2. BBRv3 (安装 XanMod，需重启)"; echo "3. 深度网络栈调优 (高并发推荐)"; echo "0. 返回主菜单"
         read -rp "选择 [0-3]: " c
         case $c in
             1) _enable_bbr; echo; read -n 1 -s -r -p "按任意键返回菜单..." ;;
@@ -573,51 +516,35 @@ optimize_kernel() {
 
 _enable_bbr() {
     modprobe tcp_bbr 2>/dev/null || true
-    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-        echo -e "${RED}内核不支持 BBR${NC}"; return 1
-    fi
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then echo -e "${RED}内核不支持 BBR${NC}"; return 1; fi
     cat > "$BBR_CONF" <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-    sysctl --system > /dev/null 2>&1 || true
-    echo -e "${GREEN}标准 BBR 已启用${NC}"
+    sysctl --system > /dev/null 2>&1 || true; echo -e "${GREEN}标准 BBR 已启用${NC}"
 }
 
 _enable_bbrv3() {
     if [[ "$(uname -r)" == *xanmod* ]]; then _enable_bbr; return; fi
     local arch=$(dpkg --print-architecture 2>/dev/null || true)
     [[ "$arch" != "amd64" ]] && { echo -e "${RED}XanMod 仅支持 amd64${NC}"; return; }
-    . /etc/os-release
-    local codename="${VERSION_CODENAME:-}"
+    . /etc/os-release; local codename="${VERSION_CODENAME:-}"
     case "$codename" in
         bookworm|trixie|noble|resolute) ;;
         *) echo -e "${RED}XanMod 不支持 ${codename}${NC}"; return ;;
     esac
-    if command -v mokutil &>/dev/null && mokutil --sb-state 2>/dev/null | grep -qi enabled; then
-        echo -e "${RED}请先关闭 Secure Boot${NC}"; return
-    fi
+    if command -v mokutil &>/dev/null && mokutil --sb-state 2>/dev/null | grep -qi enabled; then echo -e "${RED}请先关闭 Secure Boot${NC}"; return; fi
     cd /tmp || return
     curl -fsSLO https://dl.xanmod.org/check_x86-64_psabi.sh 2>/dev/null || wget -qO check_x86-64_psabi.sh https://dl.xanmod.org/check_x86-64_psabi.sh || true
     local cpu
     if [[ -f ./check_x86-64_psabi.sh ]]; then
-        chmod +x check_x86-64_psabi.sh
-        cpu=$(./check_x86-64_psabi.sh 2>/dev/null | grep -oE 'x86-64-v[0-9]' | tail -n1 || true)
-        rm -f check_x86-64_psabi.sh
+        chmod +x check_x86-64_psabi.sh; cpu=$(./check_x86-64_psabi.sh 2>/dev/null | grep -oE 'x86-64-v[0-9]' | tail -n1 || true); rm -f check_x86-64_psabi.sh
     fi
-    local suffix="x64v2"
-    [[ "$cpu" == "x86-64-v3" ]] && suffix="x64v3"
-    
-    echo "选择分支: 1) LTS 2) MAIN"
-    read -rp "[1]: " br; br=${br:-1}
-    local pkg="linux-xanmod-lts-${suffix}"
-    [[ "$br" == "2" ]] && pkg="linux-xanmod-${suffix}"
-    
-    apt-get install -y ca-certificates curl gpg
-    install -m 0755 -d /etc/apt/keyrings
-    if ! curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null; then
-        echo -e "${RED}密钥下载失败${NC}"; return 1
-    fi
+    local suffix="x64v2"; [[ "$cpu" == "x86-64-v3" ]] && suffix="x64v3"
+    echo "选择分支: 1) LTS 2) MAIN"; read -rp "[1]: " br; br=${br:-1}
+    local pkg="linux-xanmod-lts-${suffix}"; [[ "$br" == "2" ]] && pkg="linux-xanmod-${suffix}"
+    apt-get install -y ca-certificates curl gpg; install -m 0755 -d /etc/apt/keyrings
+    if ! curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null; then echo -e "${RED}密钥下载失败${NC}"; return 1; fi
     cat > /etc/apt/sources.list.d/xanmod.sources <<EOF
 Types: deb
 URIs: https://deb.xanmod.org
@@ -626,10 +553,8 @@ Components: main
 Architectures: amd64
 Signed-By: /etc/apt/keyrings/xanmod-archive-keyring.gpg
 EOF
-    apt-get update -y
-    apt-get install -y "$pkg" || { echo -e "${RED}安装失败${NC}"; return; }
-    echo -e "${YELLOW}需重启。重启后再次运行此项启用 BBRv3${NC}"
-    read -rp "立即重启, [y/N]: " rb; [[ "$rb" =~ ^[Yy]$ ]] && reboot
+    apt-get update -y; apt-get install -y "$pkg" || { echo -e "${RED}安装失败${NC}"; return; }
+    echo -e "${YELLOW}需重启。重启后再次运行此项启用 BBRv3${NC}"; read -rp "立即重启, [y/N]: " rb; [[ "$rb" =~ ^[Yy]$ ]] && reboot
 }
 
 _deep_tune() {
@@ -650,15 +575,13 @@ net.ipv4.ip_local_port_range = 1024 65535
 net.netfilter.nf_conntrack_max = 1048576
 net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 EOF
-    sysctl --system > /dev/null 2>&1 || true
-    echo -e "${GREEN}深度调优完成${NC}"
+    sysctl --system > /dev/null 2>&1 || true; echo -e "${GREEN}深度调优完成${NC}"
 }
 
 uninstall_all() {
     read -rp "确认卸载 WG + udp2raw 及所有规则, [y/N]: " c
     [[ ! "$c" =~ ^[Yy]$ ]] && return
-    systemctl stop wg-quick@wg0 2>/dev/null || true
-    systemctl disable wg-quick@wg0 2>/dev/null || true
+    systemctl stop wg-quick@wg0 2>/dev/null || true; systemctl disable wg-quick@wg0 2>/dev/null || true
     for svc in /etc/systemd/system/udp2raw*.service; do
         [[ -f "$svc" ]] && systemctl stop "$(basename "$svc" .service)" 2>/dev/null
         [[ -f "$svc" ]] && systemctl disable "$(basename "$svc" .service)" 2>/dev/null
@@ -667,12 +590,9 @@ uninstall_all() {
     systemctl daemon-reload
     rm -rf "$WG_DIR" "$UDP2RAW_DIR" /etc/sysctl.d/99-wireguard*.conf /etc/sysctl.d/99-bbr.conf
     rm -f /usr/local/bin/udp2raw
-    iptables -F
-    iptables -t nat -F
-    iptables -t mangle -F
+    iptables -F; iptables -t nat -F; iptables -t mangle -F
     netfilter-persistent save 2>/dev/null || true
-    apt-get remove -y wireguard iptables-persistent
-    echo -e "${GREEN}卸载完成${NC}"
+    apt-get remove -y wireguard iptables-persistent; echo -e "${GREEN}卸载完成${NC}"
 }
 
 # ==================== 主菜单 ====================
@@ -680,12 +600,8 @@ main() {
     while true; do
         clear
         echo -e "${GREEN}===== WG + udp2raw 隧道中转架构 (多落地支持) =====${NC}"
-        echo "1. 落地机配置"
-        echo "2. 中转机配置 (多落地)"
-        echo "3. 查看全局系统状态"
-        echo "4. 内核与 BBR 优化"
-        echo "5. 卸载组件"
-        echo "0. 退出"
+        echo "1. 落地机配置"; echo "2. 中转机配置 (多落地)"; echo "3. 查看全局系统状态"
+        echo "4. 内核与 BBR 优化"; echo "5. 卸载组件"; echo "0. 退出"
         read -rp "选择 [0-5]: " c
         case $c in
             1) landing_menu ;;
