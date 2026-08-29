@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (全协议导入 & 工业级防崩溃版)
+# 跨境软件定义边缘网络系统 (输入校验修复版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -538,8 +538,25 @@ setup_landing_node() {
     SUBNET_PREFIX=$(echo "$DECODED" | cut -d'|' -f4)
     FAKE_PORT=$(echo "$DECODED" | cut -d'|' -f5)
 
-    read -p "为此落地机起个名字 [例如: tw3 或 jp1]: " NODE_TAG
-    read -p "分配内网编号 [例如 2 或 3]: " HOST_ID
+    # 强制校验节点名称
+    while true; do
+        read -p "为此落地机起个名字 [例如: tw3 或 jp1]: " NODE_TAG
+        if [[ "$NODE_TAG" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            break
+        else
+            echo -e "${RED}节点名称只能包含字母、数字、下划线或横杠，请重新输入！${R}"
+        fi
+    done
+
+    # 强制校验内网编号
+    while true; do
+        read -p "分配内网编号 [2-254]: " HOST_ID
+        if [[ "$HOST_ID" =~ ^[0-9]+$ ]] && [ "$HOST_ID" -ge 2 ] && [ "$HOST_ID" -le 254 ]; then
+            break
+        else
+            echo -e "${RED}内网编号必须是 2-254 的数字，请重新输入！${R}"
+        fi
+    done
     
     LAND_IP="${SUBNET_PREFIX}.${HOST_ID}"
     WG_PRIV=$(wg genkey)
@@ -1052,7 +1069,6 @@ rebuild_hk_sdn_matrix() {
                     if [ -n "$link" ]; then
                         json_entry=$(parse_proxy_link "$link" "$ext_type" "$ext_tag")
                         if [ -n "$json_entry" ]; then
-                            # 使用 jq 验证并压缩 JSON，防止格式错误导致整体崩溃
                             json_entry=$(echo "$json_entry" | jq -c . 2>/dev/null || echo "")
                         fi
                     fi
