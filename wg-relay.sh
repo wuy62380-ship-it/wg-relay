@@ -427,6 +427,7 @@ Address = ${SUBNET_PREFIX}.1/24
 ListenPort = 30000
 MTU = 1360
 EOF
+    chmod 600 /etc/wireguard/wg0.conf
 
     UUID=$(uuidgen)
     KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null || echo "")
@@ -570,6 +571,7 @@ Endpoint = 127.0.0.1:$LOCAL_WG_PORT
 AllowedIPs = ${SUBNET_PREFIX}.1/32
 PersistentKeepalive = 10
 EOF
+    chmod 600 /etc/wireguard/wg0.conf
 
     cat > /etc/systemd/system/udp2raw.service <<EOF
 [Unit]
@@ -661,7 +663,6 @@ EOF
     iptables -I INPUT -p tcp --dport $FAKE_PORT -j ACCEPT || true
     netfilter-persistent save >/dev/null 2>&1 || true
 
-    # 修复: 使用纯数字的 IP 作为服务名后缀，彻底避开 systemd 不支持中文命名的坑
     cat > /etc/systemd/system/udp2raw-${LAND_IP}.service <<EOF
 [Unit]
 Description=udp2raw server for $NODE_TAG
@@ -987,14 +988,11 @@ manage_nodes() {
                         rm -f "/etc/systemd/system/udp2raw-${node_ip}.service"
                         systemctl daemon-reload
                         
-                        awk -v t="$tag" '
-                        BEGIN { skip=0 }
-                        /^# Node: / {
-                            if ($0 == "# Node: " t) { skip=1; next }
-                        }
-                        /^\[Peer\]/ { skip=0 }
-                        !skip { print }
-                        ' /etc/wireguard/wg0.conf > /tmp/wg0.conf.tmp && mv /tmp/wg0.conf.tmp /etc/wireguard/wg0.conf
+                        # 修复：按块精准删除节点，彻底杜绝残留空 [Peer] 导致断网
+                        awk -v RS='' -v ORS='\n\n' -v t="$tag" 'index($0, "# Node: " t) { next } { print }' /etc/wireguard/wg0.conf > /tmp/wg0.conf.tmp
+                        # 清理可能残留的多个连续空行
+                        sed -i '/^$/N;/^\n$/D' /tmp/wg0.conf.tmp
+                        mv /tmp/wg0.conf.tmp /etc/wireguard/wg0.conf
                         
                         wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || systemctl reload wg-quick@wg0 2>/dev/null || true
 
