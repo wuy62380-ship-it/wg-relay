@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (集成完整 XanMod BBRv3 管理与卸载版)
+# 跨境软件定义边缘网络系统 (修复 BBRv3 模块识别与 XanMod 源更新版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -60,16 +60,19 @@ xanmod_add_repo() {
         return 1
     fi
 
-    echo -e "${Y}正在安装依赖并下载密钥...${R}"
-    apt-get update -y >/dev/null 2>&1
-    apt-get install -y wget gnupg ca-certificates >/dev/null 2>&1
+    echo -e "${Y}正在安装依赖并配置 XanMod 官方 HTTPS 源...${R}"
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y wget gnupg ca-certificates apt-transport-https >/dev/null 2>&1 || true
     mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
     if ! wget -qO - "$key_url" | gpg --dearmor -o "$keyring" --yes; then
         echo -e "${RED}官方密钥下载失败${R}"
         return 1
     fi
     chmod 644 "$keyring"
-    echo "deb [signed-by=$keyring] http://deb.xanmod.org $os_codename main" > "$list_file"
+    echo "deb [signed-by=$keyring] https://deb.xanmod.org $os_codename main" > "$list_file"
+    
+    echo -e "${Y}正在刷新软件包索引...${R}"
+    apt-get update -y
     echo -e "${G}XanMod 源配置完成 (系统代号: $os_codename)${R}"
 }
 
@@ -77,7 +80,6 @@ xanmod_detect_psabi_level() {
     local level=""
     local ld_so=""
     
-    # 优先使用动态链接器精确读取 CPU 架构级别
     for f in /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2; do
         if [ -x "$f" ]; then ld_so="$f"; break; fi
     done
@@ -86,7 +88,6 @@ xanmod_detect_psabi_level() {
         level=$("$ld_so" --help 2>/dev/null | grep -oP 'x86-64-v\K[1-4](?= \(supported)' | tail -n1 || echo "")
     fi
 
-    # 降级备用 CPU Flag 检测
     if [ -z "$level" ]; then
         level=$(awk 'BEGIN {
             while (!/flags/) if (getline < "/proc/cpuinfo" != 1) exit 1
@@ -111,12 +112,10 @@ xanmod_detect_package() {
     local psabi_level=""
     local level=""
     local package=""
-    local prefix_list="linux-xanmod-lts linux-xanmod"
+    local prefix_list="linux-xanmod-lts linux-xanmod linux-xanmod-mainline"
 
     psabi_level=$(xanmod_detect_psabi_level) || psabi_level=3
     [ "$psabi_level" -gt 3 ] && psabi_level=3
-
-    apt-get update -y >/dev/null 2>&1
 
     for prefix in $prefix_list; do
         level="$psabi_level"
@@ -167,7 +166,6 @@ xanmod_install_or_update() {
     }
 
     echo -e "${Y}正在更新软件源并安装内核 (包大小约100MB，请耐心等待)...${R}"
-    apt-get update -y
     if [ "$action" = "update" ]; then
         apt-get install -y --only-upgrade "$package" || apt-get install -y "$package" || {
             echo -e "${RED}XanMod内核更新失败，请检查软件源或稍后重试${R}"
@@ -180,7 +178,7 @@ xanmod_install_or_update() {
         }
     fi
 
-    set_bbr_algo "bbr3" > /dev/null 2>&1 || true
+    set_bbr_algo "bbr" > /dev/null 2>&1 || true
 
     echo -e "${G}XanMod BBRv3内核处理完成。重启后生效${R}"
     ask_reboot
@@ -212,7 +210,7 @@ xanmod_manage() {
         while true; do
             clear
             local kernel_version=$(uname -r)
-            echo -e "${G}您已安装xanmod的BBRv3内核${R}"
+            echo -e "${G}您已安装 xanmod 内核${R}"
             echo -e "当前内核版本: ${C}$kernel_version${R}\n"
             echo -e "${Y}内核管理${R}"
             echo -e "------------------------"
@@ -245,19 +243,33 @@ xanmod_manage() {
 
 set_bbr_algo() {
     local target_algo="$1"
+    local current_kernel=$(uname -r)
+    local is_xanmod=0
+
+    if echo "$current_kernel" | grep -qi "xanmod"; then
+        is_xanmod=1
+    fi
+
     echo -e "\n${G}[+] 正在配置并切换 TCP 拥塞控制算法为: ${target_algo}...${R}"
-    
-    if [ "$target_algo" = "bbr3" ]; then
-        if ! modprobe tcp_bbr3 2>/dev/null; then
-            echo -e "${RED}[错误] 当前系统内核不支持 BBRv3 模块 (tcp_bbr3)！${R}"
-            echo -e "${Y}[提示] 请先一键安装 XanMod 内核后重试。${R}"
+
+    if [ "$target_algo" = "bbr3" ] || [ "$target_algo" = "bbr" ]; then
+        modprobe tcp_bbr 2>/dev/null || true
+
+        local avail_algos
+        avail_algos=$(sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | awk -F'=' '{print $2}' || echo "")
+        
+        if ! echo "$avail_algos" | grep -qw "bbr"; then
+            echo -e "${RED}[错误] 当前系统内核不支持或未加载 BBR 模块！${R}"
+            if [ $is_xanmod -eq 0 ]; then
+                echo -e "${Y}[提示] 非 XanMod 内核，请先一键安装 XanMod 内核以获得 BBRv3 支持。${R}"
+            fi
             return 1
         fi
-        echo "tcp_bbr3" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
-    elif [ "$target_algo" = "bbr" ]; then
-        if ! modprobe tcp_bbr 2>/dev/null; then
-            echo -e "${RED}[错误] 当前系统内核无法加载 tcp_bbr 模块！${R}"
-            return 1
+
+        target_algo="bbr"
+
+        if [ $is_xanmod -eq 1 ]; then
+            echo -e "${G}[信息] 检测到 XanMod 内核 ($current_kernel)，启用 bbr 算法即生效 BBRv3！${R}"
         fi
         echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
     fi
@@ -294,22 +306,26 @@ manage_bbr() {
         clear
         CURRENT_ALGO=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || echo "unknown")
         CURRENT_QDISC=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}' || echo "unknown")
+        CURRENT_KERNEL=$(uname -r)
 
         echo "===================================================================="
         echo "               📊 当前系统 BBR / BBRv3 状态与管理                       "
         echo "===================================================================="
+        echo -e "当前内核版本        : ${C}${CURRENT_KERNEL}${R}"
         echo -e "当前 TCP 拥塞控制算法 : ${G}${CURRENT_ALGO}${R}"
         echo -e "当前队列调度算法     : ${C}${CURRENT_QDISC}${R}"
         if xanmod_installed; then
-            echo -e "XanMod 内核状态      : ${G}已安装 (已支持 BBRv3)${R}"
+            echo -e "XanMod 内核状态      : ${G}已安装 (运行 bbr 算法即为 BBRv3)${R}"
         else
             echo -e "XanMod 内核状态      : ${Y}未安装${R}"
         fi
         echo "--------------------------------------------------------------------"
-        lsmod | grep bbr || echo -e "${Y}[提示] 当前未在 lsmod 中发现已加载的 bbr 模块${R}"
+        if echo "$CURRENT_KERNEL" | grep -qi "xanmod"; then
+            echo -e "${G}[说明] 当前为 XanMod 内核，系统自带完整 BBRv3 代码集成${R}"
+        fi
         echo "===================================================================="
         echo " 1. 切换/开启 原版标准 BBR (内核自带)"
-        echo " 2. 切换/开启 BBRv3 (需系统内核支持 tcp_bbr3)"
+        echo " 2. 切换/开启 BBRv3 (在 XanMod 内核下激活 BBRv3)"
         echo " 3. XanMod BBRv3 内核管理 (安装 / 更新 / 卸载)"
         echo " 4. 还原为 CUBIC 默认算法"
         echo " 0. 返回主菜单"
@@ -340,13 +356,7 @@ apply_ultimate_kernel() {
     local target_algo="${1:-auto}"
     
     if [ "$target_algo" = "auto" ]; then
-        if modprobe tcp_bbr3 2>/dev/null; then
-            target_algo="bbr3"
-        elif modprobe tcp_bbr 2>/dev/null; then
-            target_algo="bbr"
-        else
-            target_algo="cubic"
-        fi
+        target_algo="bbr"
     fi
 
     set_bbr_algo "$target_algo"
