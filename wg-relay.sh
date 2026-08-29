@@ -690,220 +690,6 @@ EOF
     echo -e "===================================================================="
 }
 
-# ================= 多协议链接解析器 =================
-decode_url() {
-    python3 -c "import urllib.parse, sys; sys.stdout.write(urllib.parse.unquote(sys.argv[1]))" "$1" 2>/dev/null || printf '%s' "$1"
-}
-
-sanitize_tag() {
-    echo "$1" | tr -d '[:space:]"'\''/\\|&;$:'
-}
-
-parse_proxy_link() {
-    local link="$1"
-    local tag="$2"
-    local protocol="${link%%://*}"
-    local body="${link#*://}"
-    local auth="${body%%@*}"
-    local rest="${body#*@}"
-    
-    local server_port="${rest%%\?*}"
-    local server="${server_port%%:*}"
-    local port="${server_port##*:}"
-    
-    local query_tag="${rest#*\?}"
-    local query=""
-    local link_tag=""
-    if [[ "$query_tag" == *"#"* ]]; then
-        query="${query_tag%%#*}"
-        link_tag="${query_tag##*#}"
-    else
-        query="$query_tag"
-    fi
-    
-    [ -z "$tag" ] && tag="$(decode_url "$link_tag")"
-    tag=$(sanitize_tag "$tag")
-    [ -z "$port" ] && return 1
-
-    local json_str=""
-    local flow="" security="" sni="" fp="" pbk="" sid="" type="tcp" path="" host="" alpn="" insecure="" pass="" obfs="" obfs_pwd=""
-
-    local IFS='&'
-    for kv in $query; do
-        local k="${kv%%=*}"
-        local v="${kv#*=}"
-        case "$k" in
-            flow) flow="$v" ;;
-            security) security="$v" ;;
-            sni) sni=$(decode_url "$v") ;;
-            fp) fp="$v" ;;
-            pbk) pbk="$v" ;;
-            sid) sid="$v" ;;
-            type) type="$v" ;;
-            path) path=$(decode_url "$v") ;;
-            host) host=$(decode_url "$v") ;;
-            alpn) alpn="$v" ;;
-            insecure) insecure="$v" ;;
-            obfs) obfs="$v" ;;
-            obfs-password) obfs_pwd=$(decode_url "$v") ;;
-        esac
-    done
-
-    case "$protocol" in
-        vless)
-            json_str="{ \"type\": \"vless\", \"tag\": \"out-ext-$tag\", \"server\": \"$server\", \"server_port\": $port, \"uuid\": \"$auth\""
-            if [ -n "$flow" ]; then json_str+=", \"flow\": \"$flow\""; fi
-            if [ "$type" = "ws" ]; then
-                json_str+=", \"network\": \"ws\", \"transport\": { \"type\": \"ws\", \"path\": \"$path\""
-                if [ -n "$host" ]; then json_str+=", \"headers\": { \"Host\": \"$host\" }"; fi
-                json_str+=" }"
-            elif [ "$type" = "grpc" ]; then
-                json_str+=", \"network\": \"grpc\", \"transport\": { \"type\": \"grpc\", \"serviceName\": \"$path\" }"
-            fi
-            if [ "$security" = "reality" ]; then
-                json_str+=", \"tls\": { \"enabled\": true, \"server_name\": \"$sni\", \"reality\": { \"enabled\": true, \"public_key\": \"$pbk\", \"short_id\": \"$sid\" }"
-                if [ -n "$fp" ]; then
-                    json_str+=", \"utls\": { \"enabled\": true, \"fingerprint\": \"$fp\" }"
-                else
-                    json_str+=", \"utls\": { \"enabled\": true, \"fingerprint\": \"chrome\" }"
-                fi
-                json_str+=" }"
-            elif [ "$security" = "tls" ]; then
-                json_str+=", \"tls\": { \"enabled\": true, \"server_name\": \"$sni\""
-                if [ -n "$fp" ]; then json_str+=", \"utls\": { \"enabled\": true, \"fingerprint\": \"$fp\" }"; fi
-                if [ -n "$alpn" ]; then json_str+=", \"alpn\": [\"$alpn\"]"; fi
-                json_str+=" }"
-            fi
-            json_str+=" }"
-            ;;
-        hysteria2)
-            json_str="{ \"type\": \"hysteria2\", \"tag\": \"out-ext-$tag\", \"server\": \"$server\", \"server_port\": $port, \"password\": \"$auth\""
-            json_str+=", \"tls\": { \"enabled\": true, \"server_name\": \"$sni\""
-            if [ "$insecure" = "1" ]; then json_str+=", \"insecure\": true"; fi
-            if [ -n "$alpn" ]; then json_str+=", \"alpn\": [\"$alpn\"]"; fi
-            json_str+=" }"
-            if [ -n "$obfs" ]; then
-                json_str+=", \"obfs\": { \"type\": \"$obfs\", \"password\": \"$obfs_pwd\" }"
-            fi
-            json_str+=" }"
-            ;;
-        trojan)
-            json_str="{ \"type\": \"trojan\", \"tag\": \"out-ext-$tag\", \"server\": \"$server\", \"server_port\": $port, \"password\": \"$auth\""
-            if [ "$security" = "tls" ] || [ -z "$security" ]; then
-                json_str+=", \"tls\": { \"enabled\": true, \"server_name\": \"$sni\""
-                if [ -n "$alpn" ]; then json_str+=", \"alpn\": [\"$alpn\"]"; fi
-                json_str+=" }"
-            fi
-            json_str+=" }"
-            ;;
-        *) return 1 ;;
-    esac
-    echo "$json_str"
-}
-
-# ================= 外部节点导入模块 =================
-setup_external_proxy() {
-    if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
-        echo -e "${RED}[错误] 请先初始化香港总控！${R}"
-        return
-    fi
-    source /etc/sdn_hk_cluster.env
-
-    echo -e "\n${G}=== 添加外部现成代理节点 ===${R}"
-    echo -e "适用于直接购买的静态代理或现成的节点链接 (无需在目标机安装脚本)。"
-    echo -e " 1. HTTP 代理"
-    echo -e " 2. SOCKS5 代理"
-    echo -e " 3. VLESS 链接导入 (支持 Reality / WS / TLS)"
-    echo -e " 4. Hysteria2 链接导入"
-    echo -e " 5. Trojan 链接导入"
-    read -p "请选择导入类型 [默认 3]: " type_choice
-    
-    local proxy_type=""
-    local node_tag=""
-    local payload=""
-    
-    case "$type_choice" in
-        1) proxy_type="http" ;;
-        2) proxy_type="socks" ;;
-        4) proxy_type="hysteria2" ;;
-        5) proxy_type="trojan" ;;
-        *) proxy_type="vless" ;;
-    esac
-
-    if [ "$proxy_type" == "vless" ] || [ "$proxy_type" == "hysteria2" ] || [ "$proxy_type" == "trojan" ]; then
-        read -p "请粘贴 $proxy_type 链接: " proxy_link
-        if [[ ! "$proxy_link" =~ ^$proxy_type:// ]]; then
-            echo -e "${RED}[错误] 无效的 $proxy_type 链接！${R}"
-            return
-        fi
-        
-        local temp_tag="${proxy_link##*#}"
-        temp_tag=$(sanitize_tag "$(decode_url "$temp_tag")")
-        if [ -z "$temp_tag" ]; then
-            read -p "请输入节点名称 [例如: 台湾-VLESS]: " node_tag
-            node_tag=$(sanitize_tag "$node_tag")
-        else
-            node_tag="$temp_tag"
-        fi
-        
-        payload=$(echo -n "$proxy_link" | base64 -w 0)
-    else
-        while true; do
-            read -p "请输入外部代理节点名称 [例如: 台湾-http]: " node_tag
-            if [ -z "$node_tag" ]; then
-                echo -e "${RED}节点名称不能为空，请重新输入！${R}"
-            elif [[ "$node_tag" =~ [\"\'/\\|\&\;\$\:\ \r] ]]; then
-                echo -e "${RED}节点名称不能包含引号、空格、斜杠、冒号等特殊符号，请重新输入！${R}"
-            else
-                break
-            fi
-        done
-        
-        read -p "请输入代理服务器IP或域名: " PROXY_SERVER
-        if [ -z "$PROXY_SERVER" ]; then
-            echo -e "${RED}[错误] IP不能为空！${R}"
-            return
-        fi
-
-        while true; do
-            read -p "请输入代理端口 [1-65535]: " PROXY_PORT
-            if [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] && [ "$PROXY_PORT" -ge 1 ] && [ "$PROXY_PORT" -le 65535 ]; then
-                break
-            else
-                echo -e "${RED}端口必须是 1-65535 的数字，请重新输入！${R}"
-            fi
-        done
-
-        read -p "请输入用户名 (无认证则回车跳过): " PROXY_USER
-        local PROXY_PASS="-"
-        if [ -n "$PROXY_USER" ]; then
-            read -s -p "请输入密码: " PROXY_PASS
-            echo ""
-        else
-            PROXY_USER="-"
-        fi
-
-        NODE_TAG=$(echo "$NODE_TAG" | tr -d '"')
-        PROXY_SERVER=$(echo "$PROXY_SERVER" | tr -d '"')
-        PROXY_USER=$(echo "$PROXY_USER" | tr -d '"')
-        PROXY_PASS=$(echo "$PROXY_PASS" | tr -d '"')
-        
-        payload=$(echo -n "${PROXY_SERVER}:${PROXY_PORT}:${PROXY_USER}:${PROXY_PASS}" | base64 -w 0)
-    fi
-
-    (
-        flock -x 200
-        grep -v "^EXT:${proxy_type}:${node_tag}:" /etc/sdn_nodes_registry.list > /tmp/ext_nodes.tmp 2>/dev/null || true
-        mv /tmp/ext_nodes.tmp /etc/sdn_nodes_registry.list
-        echo "EXT:${proxy_type}:${node_tag}:${payload}" >> /etc/sdn_nodes_registry.list
-        rebuild_hk_sdn_matrix
-    ) 200>/var/lock/sdn_registry.lock
-
-    echo -e "\n===================================================================="
-    echo -e "${G}[√] 外部代理节点 [$node_tag] ($proxy_type) 处理完成！${R}"
-    echo -e "===================================================================="
-}
-
 # ================= 节点管理与链接导出模块 =================
 manage_nodes() {
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
@@ -926,19 +712,6 @@ manage_nodes() {
                 if [ "$prefix" = "NODE" ]; then
                     echo -e "${C}[$idx]${R} 内网落地: ${G}${p1}${R} (隧道IP: ${Y}${p2}${R})"
                     nodes_list+=("NODE:${p1}:${p2}")
-                    ((idx++))
-                elif [ "$prefix" = "EXT" ]; then
-                    local ext_type="$p1"
-                    local ext_tag="$p2"
-                    if [[ "$ext_type" == "vless" || "$ext_type" == "hysteria2" || "$ext_type" == "trojan" ]]; then
-                        echo -e "${C}[$idx]${R} 外部代理: ${G}${ext_tag}${R} (${Y}${ext_type} 链接${R})"
-                    else
-                        local decoded=$(echo "$p3" | base64 -d 2>/dev/null)
-                        local ext_server=$(echo "$decoded" | cut -d':' -f1)
-                        local ext_port=$(echo "$decoded" | cut -d':' -f2)
-                        echo -e "${C}[$idx]${R} 外部代理: ${G}${ext_tag}${R} (${Y}${ext_type}://${ext_server}:${ext_port}${R})"
-                    fi
-                    nodes_list+=("EXT:${ext_type}:${ext_tag}")
                     ((idx++))
                 fi
             done < /etc/sdn_nodes_registry.list
@@ -981,8 +754,6 @@ manage_nodes() {
                 if [ "$type" == "NODE" ]; then
                     tag=$(echo "$target" | cut -d':' -f2)
                     node_ip=$(echo "$target" | cut -d':' -f3)
-                elif [ "$type" == "EXT" ]; then
-                    tag=$(echo "$target" | cut -d':' -f3)
                 elif [ "$type" == "CHAIN" ]; then
                     tag=$(echo "$target" | cut -d':' -f2)
                 fi
@@ -1006,9 +777,6 @@ manage_nodes() {
                         
                         wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || systemctl reload wg-quick@wg0 2>/dev/null || true
 
-                    elif [ "$type" = "EXT" ]; then
-                        grep -v "^EXT:[^:]*:${tag}:" /etc/sdn_nodes_registry.list > /tmp/ext_nodes.tmp 2>/dev/null || true
-                        mv /tmp/ext_nodes.tmp /etc/sdn_nodes_registry.list
                     elif [ "$type" = "CHAIN" ]; then
                         grep -v "^CHAIN:${tag}:" /etc/sdn_chains_registry.list > /tmp/chains.tmp 2>/dev/null || true
                         mv /tmp/chains.tmp /etc/sdn_chains_registry.list
@@ -1034,8 +802,6 @@ manage_nodes() {
                 if [ "$type" == "NODE" ]; then
                     tag=$(echo "$target" | cut -d':' -f2)
                     node_ip=$(echo "$target" | cut -d':' -f3)
-                elif [ "$type" == "EXT" ]; then
-                    tag=$(echo "$target" | cut -d':' -f3)
                 elif [ "$type" == "CHAIN" ]; then
                     tag=$(echo "$target" | cut -d':' -f2)
                 fi
@@ -1043,8 +809,6 @@ manage_nodes() {
                 echo -e "\n${H}=== VLESS 接入链接 ===${R}"
                 if [ "$type" = "CHAIN" ]; then
                     echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-Chain-${tag}${R}"
-                elif [ "$type" = "EXT" ]; then
-                    echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-EXT-${tag}${R}"
                 elif [ "$type" = "NODE" ]; then
                     echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${tag}${R}"
                 fi
@@ -1105,41 +869,6 @@ rebuild_hk_sdn_matrix() {
             if [ "$prefix" = "NODE" ]; then
                 outbounds_json+="{ \"type\": \"socks\", \"tag\": \"out-$p1\", \"server\": \"$p2\", \"server_port\": 10808 },"
                 tags_array+="\"out-$p1\","
-            elif [ "$prefix" = "EXT" ]; then
-                local ext_type="$p1"
-                local ext_tag="$p2"
-                local ext_payload="$p3"
-                
-                local json_entry=""
-                if [[ "$ext_type" == "vless" || "$ext_type" == "hysteria2" || "$ext_type" == "trojan" ]]; then
-                    local link=$(echo "$ext_payload" | base64 -d 2>/dev/null)
-                    if [ -n "$link" ]; then
-                        # 修复：将正确的节点名 $ext_tag 传给解析器，之前误传了 $ext_type
-                        json_entry=$(parse_proxy_link "$link" "$ext_tag")
-                        if [ -n "$json_entry" ]; then
-                            json_entry=$(echo "$json_entry" | jq -c . 2>/dev/null || echo "")
-                        fi
-                    fi
-                else
-                    local decoded=$(echo "$ext_payload" | base64 -d 2>/dev/null)
-                    local ext_server=$(echo "$decoded" | cut -d':' -f1)
-                    local ext_port=$(echo "$decoded" | cut -d':' -f2)
-                    local ext_user=$(echo "$decoded" | cut -d':' -f3)
-                    local ext_pass=$(echo "$decoded" | cut -d':' -f4-)
-                    
-                    if [ "$ext_user" = "-" ] || [ -z "$ext_user" ]; then
-                        json_entry="{ \"type\": \"$ext_type\", \"tag\": \"out-ext-$ext_tag\", \"server\": \"$ext_server\", \"server_port\": $ext_port }"
-                    else
-                        json_entry="{ \"type\": \"$ext_type\", \"tag\": \"out-ext-$ext_tag\", \"server\": \"$ext_server\", \"server_port\": $ext_port, \"username\": \"$ext_user\", \"password\": \"$ext_pass\" }"
-                    fi
-                fi
-                
-                if [ -n "$json_entry" ]; then
-                    outbounds_json+="${json_entry},"
-                    tags_array+="\"out-ext-$ext_tag\","
-                else
-                    echo -e "${RED}[警告] 节点 $ext_tag 解析失败，已忽略。${R}"
-                fi
             fi
         done < /etc/sdn_nodes_registry.list
     fi
@@ -1327,11 +1056,10 @@ while true; do
     echo " 5. 【香港总控】节点管理 (查看链接 / 删除节点)"
     echo " 6. 【香港总控】配置多级链式代理 (例如: 香港->台湾->日本)"
     echo " 7. 【系统工具】BBR / BBRv3 算法独立切换与内核管理 (含卸载)"
-    echo " 8. 【香港总控】添加外部代理 (支持 HTTP/SOCKS5/VLESS/Hysteria2/Trojan 链接导入)"
-    echo " 9. 【系统工具】一键卸载所有组件与配置 (彻底清理)"
+    echo " 8. 【系统工具】一键卸载所有组件与配置 (彻底清理)"
     echo " 0. 退出脚本"
     echo "===================================================================="
-    read -p "请选择对应操作的数字 [0-9]: " choice
+    read -p "请选择对应操作的数字 [0-8]: " choice
 
     choice=$(echo "$choice" | tr -d '[:space:]')
 
@@ -1343,8 +1071,7 @@ while true; do
         5) manage_nodes ;;
         6) setup_chain_proxy; read -p "按回车键继续..." ;;
         7) manage_bbr ;;
-        8) setup_external_proxy; read -p "按回车键继续..." ;;
-        9) uninstall_all; read -p "按回车键继续..." ;;
+        8) uninstall_all; read -p "按回车键继续..." ;;
         0) exit 0 ;;
         *) echo -e "${RED}[错误] 输入无效，请重新选择。${R}"; sleep 2 ;;
     esac
