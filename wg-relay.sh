@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (集成 XanMod BBRv3 架构级适配版)
+# 跨境软件定义边缘网络系统 (集成 XanMod BBRv3 完美修复版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -24,33 +24,12 @@ detect_hardware_and_bandwidth() {
     echo -e "    -> CPU核心: \033[36m${CPU_CORES}核 | 物理内存: ${TOTAL_MEM_GB}GB\033[0m"
 }
 
-# ================= XanMod & BBRv3 核心检测与安装逻辑 =================
+# ================= XanMod & BBRv3 核心检测与安装逻辑 (完全修复版) =================
 
 xanmod_add_repo() {
     local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
     local list_file="/etc/apt/sources.list.d/xanmod-release.list"
     local key_url="https://dl.xanmod.org/archive.key"
-    local os_codename=""
-
-    if command -v lsb_release >/dev/null 2>&1; then
-        os_codename=$(lsb_release -sc)
-    elif [ -r /etc/os-release ]; then
-        os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-    fi
-
-    if ! echo "bookworm trixie forky sid noble plucky questing resolute faye gigi wilma xia zara zena" | grep -qw "$os_codename"; then
-        os_codename="releases"
-    fi
-
-    if echo "jammy focal bullseye buster" | grep -qw "$os_codename"; then
-        echo -e "\033[31m[错误] XanMod 官方已停止对当前系统 ($os_codename) 的 APT 源支持，请升级至 Debian 12 / Ubuntu 24.04 或更高版本。\033[0m"
-        return 1
-    fi
-
-    if [ -z "$os_codename" ]; then
-        echo -e "\033[31m[错误] 无法获取系统版本代号，无法配置 XanMod 源。\033[0m"
-        return 1
-    fi
 
     echo -e "\033[32m[+] 正在安装系统基础依赖并导入 XanMod GPG 密钥...\033[0m"
     export DEBIAN_FRONTEND=noninteractive
@@ -63,22 +42,41 @@ xanmod_add_repo() {
         return 1
     fi
     chmod 644 "$keyring"
-    echo "deb [signed-by=$keyring] http://deb.xanmod.org $os_codename main" > "$list_file"
-    echo -e "\033[32m[√] XanMod APT 软件源配置完成 (系统代号: $os_codename)\033[0m"
+
+    # 动态获取当前系统发行版代号 (如 bookworm, trixie, jammy)
+    local sys_codename=""
+    if [ -f /etc/os-release ]; then
+        sys_codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+    fi
+    [ -z "$sys_codename" ] && sys_codename="releases"
+
+    echo "deb [signed-by=$keyring] http://deb.xanmod.org $sys_codename main" > "$list_file"
+    echo -e "\033[32m[√] XanMod APT 软件源配置完成 (系统代号: ${sys_codename})\033[0m"
 }
 
 xanmod_detect_psabi_level() {
-    local psabi_output=""
-    psabi_output=$(awk 'BEGIN {
-        while (!/flags/) if (getline < "/proc/cpuinfo" != 1) exit 1
-        if (/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level = 1
-        if (level == 1 && /cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level = 2
-        if (level == 2 && /avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level = 3
-        if (level == 3 && /avx512f/&&/avx512bw/&&/avx512cd/&&/avx512dq/&&/avx512vl/) level = 4
-        if (level > 0) { print level; exit }
-        exit 1
-    }' /proc/cpuinfo 2>/dev/null) || return 1
-    printf '%s' "$psabi_output" | tr -dc '0-9' | head -c 1
+    local level=""
+    local ld_so=""
+    
+    # 优先方法：使用系统 glibc 动态链接器权威获取 x86-64 架构级别
+    for f in /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2; do
+        if [ -x "$f" ]; then ld_so="$f"; break; fi
+    done
+
+    if [ -n "$ld_so" ]; then
+        level=$("$ld_so" --help 2>/dev/null | grep -oP 'x86-64-v\K[1-4](?= \(supported)' | tail -n1 || echo "")
+    fi
+
+    # 备用方法：最基础的 cpuinfo 常用指令集扫描
+    if [ -z "$level" ]; then
+        if grep -qE '\bavx512f\b' /proc/cpuinfo && grep -qE '\bavx512bw\b' /proc/cpuinfo; then level=4
+        elif grep -qE '\bavx2\b' /proc/cpuinfo; then level=3
+        elif grep -qE '\bsse4_2\b' /proc/cpuinfo; then level=2
+        elif grep -qE '\bsse2\b' /proc/cpuinfo; then level=1
+        fi
+    fi
+
+    echo "${level:-3}"
 }
 
 xanmod_package_available() {
@@ -88,30 +86,33 @@ xanmod_package_available() {
 
 xanmod_detect_package() {
     local psabi_level=""
-    local level=""
-    local package=""
-    local prefix_list="linux-xanmod linux-xanmod-lts"
-
-    psabi_level=$(xanmod_detect_psabi_level) || return 1
-    [ -n "$psabi_level" ] || return 1
-    [ "$psabi_level" -gt 3 ] && psabi_level=3
+    psabi_level=$(xanmod_detect_psabi_level)
 
     apt-get update -y >/dev/null 2>&1
 
-    for prefix in $prefix_list; do
-        level="$psabi_level"
-        while [ "$level" -ge 1 ]; do
-            package="${prefix}-x64v${level}"
-            if xanmod_package_available "$package"; then
-                echo -e "\033[32m[√] 自动匹配 CPU 微架构级别 (x64v${level})，最佳内核包: $package\033[0m" >&2
-                printf '%s\n' "$package"
+    # 依次检索 LTS 分支和标准分支，从识别出的最高级别向低级别匹配
+    local prefixes=("linux-xanmod-lts" "linux-xanmod")
+    for lvl in $(seq "$psabi_level" -1 1); do
+        for pfx in "${prefixes[@]}"; do
+            local pkg="${pfx}-x64v${lvl}"
+            if xanmod_package_available "$pkg"; then
+                echo -e "\033[32m[√] 成功匹配 CPU (x64v${lvl})，可用内核包: $pkg\033[0m" >&2
+                printf '%s\n' "$pkg"
                 return 0
             fi
-            level=$((level - 1))
         done
     done
 
-    echo -e "\033[31m[错误] 软件源中未找到适配此 CPU 的 XanMod 内核包！\033[0m" >&2
+    # 保底匹配：通用无级别后缀包
+    for fallback_pkg in linux-xanmod-lts linux-xanmod; do
+        if xanmod_package_available "$fallback_pkg"; then
+            echo -e "\033[32m[√] 保底匹配成功，可用内核包: $fallback_pkg\033[0m" >&2
+            printf '%s\n' "$fallback_pkg"
+            return 0
+        fi
+    done
+
+    echo -e "\033[31m[错误] 软件源中未找到任何可用的 XanMod 内核包！\033[0m" >&2
     return 1
 }
 
@@ -137,11 +138,11 @@ install_xanmod_bbr3() {
 
     local package=""
     package=$(xanmod_detect_package) || {
-        echo -e "\033[31m[错误] 无法识别当前 CPU 或未找到适配包，升级取消。\033[0m"
+        echo -e "\033[31m[错误] 无法获取可用软件包，升级取消。\033[0m"
         return 1
     }
 
-    echo -e "\033[32m[+] 正在下载并安装最佳架构内核包 ($package)... \033[0m"
+    echo -e "\033[32m[+] 正在下载并安装内核包 ($package)... \033[0m"
     apt-get update -y
     if apt-get install -y "$package"; then
         echo -e "\n\033[32m[√] XanMod 内核安装完成！\033[0m"
