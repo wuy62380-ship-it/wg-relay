@@ -501,7 +501,6 @@ export_token() {
     fi
     source /etc/sdn_hk_cluster.env
     
-    # 修复：使用安全的方式统计 Peer 数量，防止 0\n0 错误
     local PEER_COUNT=$(grep -c "\[Peer\]" /etc/wireguard/wg0.conf 2>/dev/null || true)
     PEER_COUNT=${PEER_COUNT:-0}
     
@@ -662,7 +661,8 @@ EOF
     iptables -I INPUT -p tcp --dport $FAKE_PORT -j ACCEPT || true
     netfilter-persistent save >/dev/null 2>&1 || true
 
-    cat > /etc/systemd/system/udp2raw-${NODE_TAG}.service <<EOF
+    # 修复: 使用纯数字的 IP 作为服务名后缀，彻底避开 systemd 不支持中文命名的坑
+    cat > /etc/systemd/system/udp2raw-${LAND_IP}.service <<EOF
 [Unit]
 Description=udp2raw server for $NODE_TAG
 After=network.target
@@ -675,7 +675,7 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now udp2raw-${NODE_TAG}.service
+    systemctl enable --now udp2raw-${LAND_IP}.service
 
     (
         flock -x 200
@@ -914,7 +914,7 @@ manage_nodes() {
             while IFS=: read -r prefix p1 p2 p3 p4 p5 p6; do
                 if [ "$prefix" = "NODE" ]; then
                     echo -e "${C}[$idx]${R} 内网落地: ${G}${p1}${R} (隧道IP: ${Y}${p2}${R})"
-                    nodes_list+=("NODE:${p1}")
+                    nodes_list+=("NODE:${p1}:${p2}")
                     ((idx++))
                 elif [ "$prefix" = "EXT" ]; then
                     local ext_type="$p1"
@@ -964,8 +964,17 @@ manage_nodes() {
             if [ "$del_idx" -ge 1 ] && [ "$del_idx" -le "${#nodes_list[@]}" ]; then
                 local target="${nodes_list[$((del_idx-1))]}"
                 local type=$(echo "$target" | cut -d':' -f1)
-                local tag=$(echo "$target" | cut -d':' -f3)
-                [ "$type" != "EXT" ] && tag=$(echo "$target" | cut -d':' -f2)
+                local tag=""
+                local node_ip=""
+                
+                if [ "$type" == "NODE" ]; then
+                    tag=$(echo "$target" | cut -d':' -f2)
+                    node_ip=$(echo "$target" | cut -d':' -f3)
+                elif [ "$type" == "EXT" ]; then
+                    tag=$(echo "$target" | cut -d':' -f3)
+                elif [ "$type" == "CHAIN" ]; then
+                    tag=$(echo "$target" | cut -d':' -f2)
+                fi
 
                 echo -e "${Y}正在删除节点: $tag ...${R}"
                 
@@ -973,9 +982,9 @@ manage_nodes() {
                     flock -x 200
                     if [ "$type" = "NODE" ]; then
                         sed -i "/^NODE:${tag}:/d" /etc/sdn_nodes_registry.list
-                        systemctl stop "udp2raw-${tag}.service" 2>/dev/null || true
-                        systemctl disable "udp2raw-${tag}.service" 2>/dev/null || true
-                        rm -f "/etc/systemd/system/udp2raw-${tag}.service"
+                        systemctl stop "udp2raw-${node_ip}.service" 2>/dev/null || true
+                        systemctl disable "udp2raw-${node_ip}.service" 2>/dev/null || true
+                        rm -f "/etc/systemd/system/udp2raw-${node_ip}.service"
                         systemctl daemon-reload
                         
                         awk -v t="$tag" '
@@ -1009,8 +1018,17 @@ manage_nodes() {
             if [ "$view_idx" -ge 1 ] && [ "$view_idx" -le "${#nodes_list[@]}" ]; then
                 local target="${nodes_list[$((view_idx-1))]}"
                 local type=$(echo "$target" | cut -d':' -f1)
-                local tag=$(echo "$target" | cut -d':' -f3)
-                [ "$type" != "EXT" ] && tag=$(echo "$target" | cut -d':' -f2)
+                local tag=""
+                local node_ip=""
+                
+                if [ "$type" == "NODE" ]; then
+                    tag=$(echo "$target" | cut -d':' -f2)
+                    node_ip=$(echo "$target" | cut -d':' -f3)
+                elif [ "$type" == "EXT" ]; then
+                    tag=$(echo "$target" | cut -d':' -f3)
+                elif [ "$type" == "CHAIN" ]; then
+                    tag=$(echo "$target" | cut -d':' -f2)
+                fi
                 
                 echo -e "\n${H}=== VLESS 接入链接 ===${R}"
                 if [ "$type" = "CHAIN" ]; then
@@ -1034,7 +1052,6 @@ manage_nodes() {
 }
 
 setup_chain_proxy() {
-    # 修复：使用安全的方式统计节点数量，防止 0\n0 错误
     local NODE_COUNT=$(grep -c "^NODE:" /etc/sdn_nodes_registry.list 2>/dev/null || true)
     NODE_COUNT=${NODE_COUNT:-0}
 
