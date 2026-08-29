@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (工业级最终加固版)
+# 跨境软件定义边缘网络系统 (工业级最终加固与修复版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合组网
 # ====================================================================================
@@ -76,7 +76,7 @@ install_dependencies() {
         local VER=""
         VER=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/' || true)
         if [ -z "$VER" ]; then
-            VER="1.8.8" # 默认备用版本
+            VER="1.8.8"
         fi
         wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${SB_ARCH}.tar.gz" || true
         if [ -f "sing-box.tar.gz" ]; then
@@ -104,7 +104,7 @@ get_pub_ip() {
 }
 
 # ====================================================================================
-# 模块一：香港中转总控
+# 模块一：香港中转总控初始化
 # ====================================================================================
 setup_hk_master() {
     apt-get update && apt-get install -y wireguard wireguard-tools curl jq iptables iproute2 uuid-runtime systemd
@@ -112,8 +112,8 @@ setup_hk_master() {
     apply_ultimate_kernel
     install_dependencies
 
-    read -p "请输入客户端连接香港总控的端口 [默认 443]: " CLIENT_PORT
-    CLIENT_PORT=${CLIENT_PORT:-443}
+    read -p "请输入客户端连接香港总控的端口 [默认 8443]: " CLIENT_PORT
+    CLIENT_PORT=${CLIENT_PORT:-8443}
     
     HK_IP=$(get_pub_ip)
     WG_PRIV=$(wg genkey)
@@ -164,6 +164,9 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
+    # 防火墙放行客户端入站端口
+    iptables -I INPUT -p tcp --dport $CLIENT_PORT -j ACCEPT || true
+
     systemctl daemon-reload
     systemctl enable --now wg-quick@wg0 sing-box
 
@@ -182,7 +185,7 @@ EOF
 
     echo -e "\n===================================================================="
     echo -e "\e[32m[√] 香港总控中心初始化完成！\e[0m"
-    echo -e "客户端配置参数 -> 地址: $HK_IP | 端口: $CLIENT_PORT | UUID: $UUID"
+    echo -e "客户端接入地址: $HK_IP | 端口: $CLIENT_PORT | UUID: $UUID"
     echo -e "===================================================================="
 }
 
@@ -195,8 +198,12 @@ export_token() {
         return
     fi
     source /etc/sdn_hk_cluster.env
-    read -p "为该落地机分配专用的中转隧道端口 [例如 25443]: " FAKE_PORT
-    FAKE_PORT=${FAKE_PORT:-25443}
+    
+    PEER_COUNT=$(grep -c "\[Peer\]" /etc/wireguard/wg0.conf 2>/dev/null || echo "0")
+    DEFAULT_FAKE_PORT=$((35001 + PEER_COUNT))
+
+    read -p "为该落地机分配专用的中转隧道端口 [默认 ${DEFAULT_FAKE_PORT}]: " FAKE_PORT
+    FAKE_PORT=${FAKE_PORT:-$DEFAULT_FAKE_PORT}
     
     DEPLOY_CODE=$(echo -n "${HK_IP}|${WG_PUB}|${U2R_PASS}|${SUBNET_PREFIX}|${FAKE_PORT}" | base64 -w 0 2>/dev/null || echo -n "${HK_IP}|${WG_PUB}|${U2R_PASS}|${SUBNET_PREFIX}|${FAKE_PORT}" | base64)
     echo -e "\n===================================================================="
@@ -223,7 +230,7 @@ setup_landing_node() {
     SUBNET_PREFIX=$(echo "$DECODED" | cut -d'|' -f4)
     FAKE_PORT=$(echo "$DECODED" | cut -d'|' -f5)
 
-    read -p "为此落地机起个名字 [例如: dynamic-home 或 static-node1]: " NODE_TAG
+    read -p "为此落地机起个名字 [例如: tw3 或 jp1]: " NODE_TAG
     read -p "分配内网编号 [例如 2 或 3]: " HOST_ID
     
     LAND_IP="${SUBNET_PREFIX}.${HOST_ID}"
@@ -232,17 +239,18 @@ setup_landing_node() {
     LOCAL_WG_PORT=$((RANDOM % 10000 + 40000))
 
     mkdir -p /etc/wireguard
+    # 修复 Bug 1: PersistentKeepalive 置于 [Peer] 下，且 Endpoint 指向本地 udp2raw
     cat > /etc/wireguard/wg0.conf <<EOF
 [Interface]
 PrivateKey = $WG_PRIV
-Address = $LAND_IP/24
+Address = $LAND_IP/32
 MTU = 1360
-PersistentKeepalive = 10
 
 [Peer]
 PublicKey = $HK_PUB
-Endpoint = $HK_IP:$FAKE_PORT
+Endpoint = 127.0.0.1:$LOCAL_WG_PORT
 AllowedIPs = ${SUBNET_PREFIX}.1/32
+PersistentKeepalive = 10
 EOF
 
     cat > /etc/systemd/system/udp2raw.service <<EOF
@@ -265,10 +273,24 @@ After=udp2raw.service
 Wants=udp2raw.service
 EOF
 
+    # 修复 Bug 3: 落地端必须配置 SOCKS5 监听，供香港总控分发流量
     mkdir -p /etc/sing-box
     cat > /etc/sing-box/config.json <<EOF
 {
-  "outbounds": [{ "type": "direct", "tag": "out-$NODE_TAG" }]
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "0.0.0.0",
+      "listen_port": 10808
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
 }
 EOF
 
@@ -287,7 +309,7 @@ EOF
     systemctl daemon-reload
     systemctl enable --now udp2raw wg-quick@wg0 sing-box
 
-    REG_PAYLOAD=$(echo -n "${WG_PUB}|${LAND_IP}|${NODE_TAG}" | base64 -w 0 2>/dev/null || echo -n "${WG_PUB}|${LAND_IP}|${NODE_TAG}" | base64)
+    REG_PAYLOAD=$(echo -n "${WG_PUB}|${LAND_IP}|${NODE_TAG}|${FAKE_PORT}" | base64 -w 0 2>/dev/null || echo -n "${WG_PUB}|${LAND_IP}|${NODE_TAG}|${FAKE_PORT}" | base64)
     echo -e "\n===================================================================="
     echo -e "\e[32m[√] 落地节点 ($NODE_TAG) 配置成功！\e[0m"
     echo -e "请复制以下【注册密文】，回到【香港总控】选择【选项 4】完成绑定："
@@ -310,21 +332,20 @@ register_node_to_hk() {
     LAND_PUB=$(echo "$DECODED_REG" | cut -d'|' -f1)
     LAND_IP=$(echo "$DECODED_REG" | cut -d'|' -f2)
     NODE_TAG=$(echo "$DECODED_REG" | cut -d'|' -f3)
+    FAKE_PORT=$(echo "$DECODED_REG" | cut -d'|' -f4)
 
+    # 修复 Bug 2: 保持 wg0 ListenPort 30000 不变，追加 Peer 记录
     cat >> /etc/wireguard/wg0.conf <<EOF
 
 [Peer]
+# Node: $NODE_TAG
 PublicKey = $LAND_PUB
 AllowedIPs = $LAND_IP/32
 EOF
     systemctl restart wg-quick@wg0
 
-    PEER_COUNT=$(grep -c "\[Peer\]" /etc/wireguard/wg0.conf || echo "1")
-    FAKE_PORT=$((35000 + PEER_COUNT))
-    WG_PEER_PORT=$((30000 + PEER_COUNT))
-
-    sed -i "s/ListenPort = .*/ListenPort = $WG_PEER_PORT/" /etc/wireguard/wg0.conf
-    systemctl restart wg-quick@wg0
+    # 修复 Bug 4: 自动放行防火墙端口，并将 udp2raw 解包数据转发给 WireGuard 30000 端口
+    iptables -I INPUT -p tcp --dport $FAKE_PORT -j ACCEPT || true
 
     cat > /etc/systemd/system/udp2raw-${NODE_TAG}.service <<EOF
 [Unit]
@@ -332,7 +353,7 @@ Description=udp2raw server for $NODE_TAG
 After=network.target
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/udp2raw -s -l 0.0.0.0:$FAKE_PORT -r 127.0.0.1:$WG_PEER_PORT -k "$U2R_PASS" --raw-mode faketcp -a --cipher-mode xor --auth-mode simple
+ExecStart=/usr/local/bin/udp2raw -s -l 0.0.0.0:$FAKE_PORT -r 127.0.0.1:30000 -k "$U2R_PASS" --raw-mode faketcp -a --cipher-mode xor --auth-mode simple
 Restart=on-failure
 LimitNOFILE=1048576
 [Install]
@@ -341,7 +362,7 @@ EOF
     systemctl daemon-reload
     systemctl enable --now udp2raw-${NODE_TAG}.service
 
-    # 使用文件锁安全追加注册信息，防止并发写入损坏文件
+    # 文件锁安全追加并重新构建矩阵
     (
         flock -x 200
         echo "NODE:${NODE_TAG}:${LAND_IP}" >> /etc/sdn_nodes_registry.list
@@ -351,6 +372,8 @@ EOF
 
     echo -e "\n===================================================================="
     echo -e "\e[32m[√] 落地节点 [$NODE_TAG] 成功加入集群！\e[0m"
+    echo -e "客户端节点链接如下，可直接导入客户端："
+    echo -e "\e[36mvless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${NODE_TAG}\e[0m"
     echo -e "===================================================================="
 }
 
@@ -358,10 +381,11 @@ rebuild_hk_sdn_matrix() {
     local outbounds_json=""
     local tags_array=""
 
+    # 修复 Bug 3: outbound 必须写为 socks 类型，连接落地机的 10808 端口
     if [ -f /etc/sdn_nodes_registry.list ]; then
         while IFS=: read -r prefix tag ip; do
             if [ "$prefix" = "NODE" ]; then
-                outbounds_json+="{ \"type\": \"direct\", \"tag\": \"out-$tag\", \"server\": \"$ip\", \"server_port\": 443 },"
+                outbounds_json+="{ \"type\": \"socks\", \"tag\": \"out-$tag\", \"server\": \"$ip\", \"server_port\": 10808 },"
                 tags_array+="\"out-$tag\","
             fi
         done < /etc/sdn_nodes_registry.list
@@ -427,7 +451,6 @@ while true; do
     echo "===================================================================="
     read -p "请选择对应操作的数字 [0-4]: " choice
 
-    # 清除用户输入可能带来的多余空格或不可见字符
     choice=$(echo "$choice" | tr -d '[:space:]')
 
     case $choice in
