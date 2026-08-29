@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================================
-# WireGuard + udp2raw + Sing-box 终极融合版 (反转架构 + 完整BBRv3)
-# 解决: 家宽无端口映射, UDP QoS封锁, 小白难部署
+# WireGuard + udp2raw + Sing-box 终极融合版 (反转架构 + 完整BBRv3 + 链式代理)
+# 解决: 家宽无端口映射, UDP QoS封锁, 小白难部署, 流量二次中转
 # ==========================================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -244,6 +244,44 @@ EOF
     UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null)
     SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
 
+    # === 链式代理配置询问 ===
+    OUTBOUND_JSON='{ "type": "direct" }'
+    echo -e "${YELLOW}[*] 配置出站模式:${NC}"
+    read -p "是否配置链式代理 (将落地机收到的流量转发给外部Socks5/Http代理)? [y/N]: " is_chain < /dev/tty
+    if [[ "$is_chain" =~ ^[Yy]$ ]]; then
+        echo -e "${CYAN}支持 socks5/http。示例: socks5://127.0.0.1:7890 或 socks5://user:pass@1.2.3.4:1080${NC}"
+        read -p "请输入前置代理链接: " chain_url < /dev/tty
+        
+        proto=$(echo "$chain_url" | awk -F'://' '{print $1}')
+        creds_host=$(echo "$chain_url" | sed -E 's#^[a-z0-9]+://##')
+        
+        creds=""; host_port="$creds_host"
+        if [[ "$creds_host" == *"@"* ]]; then
+            creds=$(echo "$creds_host" | cut -d'@' -f1)
+            host_port=$(echo "$creds_host" | cut -d'@' -f2)
+        fi
+        
+        host=$(echo "$host_port" | cut -d':' -f1)
+        port=$(echo "$host_port" | cut -d':' -f2)
+        
+        if [[ "$proto" =~ ^(socks5|http)$ ]] && [[ -n "$host" ]] && [[ "$port" =~ ^[0-9]+$ ]]; then
+            if [[ -n "$creds" ]]; then
+                user=$(echo "$creds" | cut -d':' -f1)
+                pass=$(echo "$creds" | cut -d':' -f2)
+                OUTBOUND_JSON=$(jq -nc \
+                  --arg p "$proto" --arg h "$host" --arg pt "$port" --arg u "$user" --arg pw "$pass" \
+                  '{type:$p, server:$h, server_port:($pt|tonumber), username:$u, password:$pw}')
+            else
+                OUTBOUND_JSON=$(jq -nc \
+                  --arg p "$proto" --arg h "$host" --arg pt "$port" \
+                  '{type:$p, server:$h, server_port:($pt|tonumber)}')
+            fi
+            echo -e "${GREEN}✓ 链式代理配置成功${NC}"
+        else
+            echo -e "${RED}解析失败，将使用直连。${NC}"
+        fi
+    fi
+
     cat > /etc/sing-box/config.json << EOF
 {
   "inbounds": [{
@@ -254,7 +292,7 @@ EOF
       "reality": { "enabled": true, "handshake": { "server": "${SNI}", "server_port": 443 }, "private_key": "$SB_PRIV", "short_id": ["$SHORT_ID"] }
     }
   }],
-  "outbounds": [{ "type": "direct" }]
+  "outbounds": [ $OUTBOUND_JSON ]
 }
 EOF
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
@@ -278,6 +316,72 @@ EOF
     echo -e " ${YELLOW}你的 VLESS 节点链接：${NC}"
     echo -e " ${GREEN}${VLESS_LINK}${NC}"
     echo -e "=========================================="
+    pause_return
+}
+
+# ==================== 链式代理管理模块 ====================
+manage_chain_proxy() {
+    clear; echo -e "${YELLOW}━━━ 6. 落地机-链式代理管理 ━━━${NC}"
+    if [ ! -f /etc/sing-box/config.json ]; then
+        echo -e "${RED}未找到 Sing-box 配置，请先部署落地机。${NC}"
+        pause_return; return
+    fi
+    
+    local cur_out=$(jq -r '.outbounds[0].type' /etc/sing-box/config.json 2>/dev/null)
+    if [ "$cur_out" == "direct" ]; then
+        echo -e "当前状态: ${GREEN}直连 (无链式代理)${NC}"
+    else
+        local cur_info=$(jq -r '.outbounds[0] | "\(.type)://\(.server):\(.server_port)"' /etc/sing-box/config.json 2>/dev/null)
+        echo -e "当前状态: ${GREEN}链式代理 -> ${cur_info}${NC}"
+    fi
+    
+    echo "1. 设置/修改链式代理"
+    echo "2. 恢复为直连"
+    echo "0. 返回主菜单"
+    read -p "选择 [0-2]: " c < /dev/tty
+    case $c in
+        1) 
+            echo -e "${YELLOW}支持 socks5/http。示例: socks5://127.0.0.1:7890 或 socks5://user:pass@1.2.3.4:1080${NC}"
+            read -p "请输入前置代理链接: " chain_url < /dev/tty
+            
+            proto=$(echo "$chain_url" | awk -F'://' '{print $1}')
+            creds_host=$(echo "$chain_url" | sed -E 's#^[a-z0-9]+://##')
+            
+            creds=""; host_port="$creds_host"
+            if [[ "$creds_host" == *"@"* ]]; then
+                creds=$(echo "$creds_host" | cut -d'@' -f1)
+                host_port=$(echo "$creds_host" | cut -d'@' -f2)
+            fi
+            
+            host=$(echo "$host_port" | cut -d':' -f1)
+            port=$(echo "$host_port" | cut -d':' -f2)
+            
+            if [[ "$proto" =~ ^(socks5|http)$ ]] && [[ -n "$host" ]] && [[ "$port" =~ ^[0-9]+$ ]]; then
+                if [[ -n "$creds" ]]; then
+                    user=$(echo "$creds" | cut -d':' -f1)
+                    pass=$(echo "$creds" | cut -d':' -f2)
+                    NEW_OUT=$(jq -nc \
+                      --arg p "$proto" --arg h "$host" --arg pt "$port" --arg u "$user" --arg pw "$pass" \
+                      '{type:$p, server:$h, server_port:($pt|tonumber), username:$u, password:$pw}')
+                else
+                    NEW_OUT=$(jq -nc \
+                      --arg p "$proto" --arg h "$host" --arg pt "$port" \
+                      '{type:$p, server:$h, server_port:($pt|tonumber)}')
+                fi
+                jq --argjson out "$NEW_OUT" '.outbounds = [$out]' /etc/sing-box/config.json > /tmp/sb_tmp.json && mv /tmp/sb_tmp.json /etc/sing-box/config.json
+                systemctl restart sing-box
+                echo -e "${GREEN}✓ 链式代理已更新并重启 Sing-box${NC}"
+            else
+                echo -e "${RED}解析失败，未作更改。${NC}"
+            fi
+            ;;
+        2)
+            jq '.outbounds = [{"type":"direct"}]' /etc/sing-box/config.json > /tmp/sb_tmp.json && mv /tmp/sb_tmp.json /etc/sing-box/config.json
+            systemctl restart sing-box
+            echo -e "${GREEN}✓ 已恢复直连并重启 Sing-box${NC}"
+            ;;
+        0) return ;;
+    esac
     pause_return
 }
 
@@ -398,7 +502,8 @@ while true; do
     echo -e "${CYAN}║${NC} ${GREEN}3${NC} VPS-绑定落地机(粘贴回传码)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 查看落地机节点链接           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}5${NC} 内核与 BBRv3 优化             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}6${NC} 一键卸载全部组件             ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}6${NC} 落地机-链式代理管理           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}7${NC} 一键卸载全部组件             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}0${NC} 退出                        ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
     
@@ -409,7 +514,8 @@ while true; do
         3) bind_landing;;
         4) clear; [ -f "$LAND_INFO" ] && cat "$LAND_INFO" || echo "无节点信息"; pause_return;;
         5) optimize_kernel;;
-        6) uninstall_all;;
+        6) manage_chain_proxy;;
+        7) uninstall_all;;
         0) exit 0;;
         *) echo "错误"; sleep 1;;
     esac
