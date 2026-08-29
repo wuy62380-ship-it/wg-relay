@@ -763,7 +763,10 @@ parse_proxy_link() {
             fi
             if [ "$security" = "reality" ]; then
                 json_str+=", \"tls\": { \"enabled\": true, \"server_name\": \"$sni\", \"reality\": { \"enabled\": true, \"public_key\": \"$pbk\", \"short_id\": \"$sid\" }"
-                if [ -n "$fp" ]; then json_str+=", \"utls\": { \"enabled\": true, \"fingerprint\": \"$fp\" }"; fi
+                # 修复: xtls-rprx-vision 流控下不能开启 utls，否则 sing-box 会崩溃
+                if [ -n "$fp" ] && [ "$flow" != "xtls-rprx-vision" ]; then
+                    json_str+=", \"utls\": { \"enabled\": true, \"fingerprint\": \"$fp\" }"
+                fi
                 json_str+=" }"
             elif [ "$security" = "tls" ]; then
                 json_str+=", \"tls\": { \"enabled\": true, \"server_name\": \"$sni\""
@@ -890,7 +893,9 @@ setup_external_proxy() {
 
     (
         flock -x 200
-        sed -i "/^EXT:${proxy_type}:${node_tag}:/d" /etc/sdn_nodes_registry.list 2>/dev/null || true
+        # 修复: 使用 grep -v 精确过滤，防止 sed 遇到特殊字符删不干净
+        grep -v "^EXT:${proxy_type}:${node_tag}:" /etc/sdn_nodes_registry.list > /tmp/ext_nodes.tmp 2>/dev/null || true
+        mv /tmp/ext_nodes.tmp /etc/sdn_nodes_registry.list
         echo "EXT:${proxy_type}:${node_tag}:${payload}" >> /etc/sdn_nodes_registry.list
         rebuild_hk_sdn_matrix
     ) 200>/var/lock/sdn_registry.lock
@@ -988,7 +993,10 @@ manage_nodes() {
                 (
                     flock -x 200
                     if [ "$type" = "NODE" ]; then
-                        sed -i "/^NODE:${tag}:/d" /etc/sdn_nodes_registry.list
+                        # 修复: 内网节点也使用 grep -v 精确过滤
+                        grep -v "^NODE:${tag}:" /etc/sdn_nodes_registry.list > /tmp/nodes.tmp 2>/dev/null || true
+                        mv /tmp/nodes.tmp /etc/sdn_nodes_registry.list
+                        
                         systemctl stop "udp2raw-${node_ip}.service" 2>/dev/null || true
                         systemctl disable "udp2raw-${node_ip}.service" 2>/dev/null || true
                         rm -f "/etc/systemd/system/udp2raw-${node_ip}.service"
@@ -1001,9 +1009,12 @@ manage_nodes() {
                         wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || systemctl reload wg-quick@wg0 2>/dev/null || true
 
                     elif [ "$type" = "EXT" ]; then
-                        sed -i "/^EXT:[^:]*:${tag}:/d" /etc/sdn_nodes_registry.list
+                        # 修复: 使用 grep -v 精确过滤
+                        grep -v "^EXT:[^:]*:${tag}:" /etc/sdn_nodes_registry.list > /tmp/ext_nodes.tmp 2>/dev/null || true
+                        mv /tmp/ext_nodes.tmp /etc/sdn_nodes_registry.list
                     elif [ "$type" = "CHAIN" ]; then
-                        sed -i "/^CHAIN:${tag}:/d" /etc/sdn_chains_registry.list
+                        grep -v "^CHAIN:${tag}:" /etc/sdn_chains_registry.list > /tmp/chains.tmp 2>/dev/null || true
+                        mv /tmp/chains.tmp /etc/sdn_chains_registry.list
                     fi
                     
                     rebuild_hk_sdn_matrix
