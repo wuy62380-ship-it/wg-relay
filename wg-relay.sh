@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (修复 BBRv3 模块识别与 XanMod 源/包匹配版)
+# 跨境软件定义边缘网络系统 (修复 XanMod 源与包匹配版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -38,27 +38,9 @@ xanmod_add_repo() {
     local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
     local list_file="/etc/apt/sources.list.d/xanmod-release.list"
     local key_url="https://dl.xanmod.org/archive.key"
-    local os_codename=""
-
-    if command -v lsb_release >/dev/null 2>&1; then
-        os_codename=$(lsb_release -sc)
-    elif [ -r /etc/os-release ]; then
-        os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-    fi
-
-    if ! echo "bookworm trixie forky sid noble plucky questing resolute faye gigi wilma xia zara zena" | grep -qw "$os_codename"; then
-        os_codename="releases"
-    fi
-
-    if echo "jammy focal bullseye buster" | grep -qw "$os_codename" || [ "$os_codename" = "releases" ]; then
-        echo -e "${RED}XanMod 官方已停止对当前系统($os_codename)的 APT 源支持，请升级至 Debian12 / Ubuntu24 或更高版本。${R}"
-        return 1
-    fi
-
-    if [ -z "$os_codename" ]; then
-        echo -e "${RED}无法获取系统代号，无法配置XanMod源${R}"
-        return 1
-    fi
+    
+    # 修复: 官方推荐统一使用 releases 分支，兼容所有 Debian/Ubuntu 版本，不再去猜系统代号
+    local os_codename="releases"
 
     echo -e "${Y}正在安装依赖并配置 XanMod 官方 HTTPS 源...${R}"
     apt-get update -y >/dev/null 2>&1 || true
@@ -73,7 +55,7 @@ xanmod_add_repo() {
     
     echo -e "${Y}正在刷新软件包索引...${R}"
     apt-get update -y
-    echo -e "${G}XanMod 源配置完成 (系统代号: $os_codename)${R}"
+    echo -e "${G}XanMod 源配置完成 (分支: $os_codename)${R}"
 }
 
 xanmod_detect_psabi_level() {
@@ -105,7 +87,10 @@ xanmod_detect_psabi_level() {
 
 xanmod_package_available() {
     local package="$1"
-    apt-cache policy "$package" 2>/dev/null | grep -q 'Candidate: [^ ]'
+    local candidate
+    # 修复: 准确判断候选版本是否有效，防止匹配到 (none) 误认为存在
+    candidate=$(apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ {print $2}')
+    [ -n "$candidate" ] && [ "$candidate" != "(none)" ]
 }
 
 xanmod_detect_package() {
@@ -370,7 +355,8 @@ apply_ultimate_kernel() {
         target_algo="bbr"
     fi
 
-    set_bbr_algo "$target_algo"
+    # 修复: 防止因不支持 BBR 导致 set -e 中断后续组网配置
+    set_bbr_algo "$target_algo" || true
 }
 
 # ================= 边缘网络组网与节点管理 =================
