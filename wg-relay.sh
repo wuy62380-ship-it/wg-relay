@@ -5,10 +5,21 @@
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合组网
 # ====================================================================================
 
+# 自动修复 Windows 换行符 (CRLF -> LF)，防止 case 匹配失效
+if grep -q $'\r' "$0" 2>/dev/null; then
+    if [[ "$0" == /dev/fd/* ]] || [[ "$0" == /tmp/* ]]; then
+        TMP_SCRIPT=$(mktemp)
+        sed 's/\r$//' "$0" > "$TMP_SCRIPT"
+        exec bash "$TMP_SCRIPT"
+    elif [[ -f "$0" ]]; then
+        sed -i 's/\r$//' "$0"
+        exec bash "$0"
+    fi
+fi
+
 set -euo pipefail
 
 check_root() {
-    # 修复: 原先 [[ $EUID -ne 0 ]] && ... 在 root 下返回 1，会导致 set -e 直接退出脚本
     if [[ $EUID -ne 0 ]]; then
         echo -e "\033[31m[错误] 必须使用 root 权限运行此脚本！\033[0m"
         exit 1
@@ -50,7 +61,6 @@ net.ipv4.tcp_wmem = 4096 65536 33554432
 net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_fin_timeout = 15
 EOF
-    # 修复: 某些系统可能不支持部分参数，防止 sysctl 返回非0导致脚本退出
     sysctl -p /etc/sysctl.d/99-sdn-ultimate.conf >/dev/null 2>&1 || true
 }
 
@@ -68,7 +78,6 @@ install_dependencies() {
     fi
 
     if [ ! -f "/usr/local/bin/sing-box" ]; then
-        # 修复: 网络问题或API限流可能导致 grep 返回非0，加 || true 防止 set -e 退出
         local VER=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/' || true)
         if [ -z "$VER" ]; then
             echo -e "\033[31m[错误] 获取 sing-box 版本失败，请检查网络或稍后重试！\033[0m"
@@ -82,7 +91,6 @@ install_dependencies() {
 get_pub_ip() {
     local ip=""
     for api in "ifconfig.me" "api.ipify.org" "icanhazip.com"; do
-        # 修复: curl 超时会返回非0状态码，加 || true 防止 set -e 退出
         ip=$(curl -s --connect-timeout 2 --max-time 3 -4 "$api" 2>/dev/null | tr -d '[:space:]' || true)
         if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "$ip"
@@ -179,7 +187,6 @@ EOF
 # 模块二：生成香港对接凭证
 # ====================================================================================
 export_token() {
-    # 修复: 使用 if 替代 && 防止 set -e 退出
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
         echo -e "\033[31m[错误] 请先初始化香港总控！\033[0m"
         return
@@ -258,11 +265,9 @@ EOF
     mkdir -p /etc/sing-box
     cat > /etc/sing-box/config.json <<EOF
 {
-  "outbounds": [{ "type": "direct", "direct" }]
+  "outbounds": [{ "type": "direct", "tag": "out-$NODE_TAG" }]
 }
 EOF
-    # 修复 json 笔误
-    sed -i 's/"type":direct/"type": "direct"/g' /etc/sing-box/config.json
 
     cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
@@ -291,7 +296,6 @@ EOF
 # 模块四：香港总控端纳管注册
 # ====================================================================================
 register_node_to_hk() {
-    # 修复: 使用 if 替代 && 防止 set -e 退出
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
         echo -e "\033[31m[错误] 请先初始化香港总控！\033[0m"
         return
@@ -415,6 +419,9 @@ while true; do
     echo " 0. 退出脚本"
     echo "===================================================================="
     read -p "请选择对应操作的数字 [0-4]: " choice
+
+    # 清除用户输入可能带来的多余空格或不可见字符
+    choice=$(echo "$choice" | tr -d '[:space:]')
 
     case $choice in
         1) setup_hk_master; read -p "按回车键继续..." ;;
