@@ -1114,7 +1114,8 @@ rebuild_hk_sdn_matrix() {
                 if [[ "$ext_type" == "vless" || "$ext_type" == "hysteria2" || "$ext_type" == "trojan" ]]; then
                     local link=$(echo "$ext_payload" | base64 -d 2>/dev/null)
                     if [ -n "$link" ]; then
-                        json_entry=$(parse_proxy_link "$link" "$ext_type" "$ext_tag")
+                        # 修复：将正确的节点名 $ext_tag 传给解析器，之前误传了 $ext_type
+                        json_entry=$(parse_proxy_link "$link" "$ext_tag")
                         if [ -n "$json_entry" ]; then
                             json_entry=$(echo "$json_entry" | jq -c . 2>/dev/null || echo "")
                         fi
