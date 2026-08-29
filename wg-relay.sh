@@ -371,7 +371,6 @@ install_dependencies() {
         fi
     fi
 
-    # 如果已经存在 sing-box，先删除旧的再装最新的，防止版本过老无法生成密钥
     if [ ! -f "/usr/local/bin/sing-box" ] || ! /usr/local/bin/sing-box version >/dev/null 2>&1; then
         rm -f /usr/local/bin/sing-box
         local LATEST_URL=$(curl -w "%{url_effective}" -I -L -s -S https://github.com/SagerNet/sing-box/releases/latest -o /dev/null || true)
@@ -430,7 +429,6 @@ MTU = 1360
 EOF
 
     UUID=$(uuidgen)
-    # 修复：兼容新版本 Sing-box 的无空格输出格式 (提取最后一列)
     KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null || echo "")
     PRIVATE_KEY=$(echo "$KEYS" | grep -i Private | awk '{print $NF}')
     PUBLIC_KEY=$(echo "$KEYS" | grep -i Public | awk '{print $NF}')
@@ -470,7 +468,6 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-    # 防重置持久化规则
     iptables -I INPUT -p tcp --dport $CLIENT_PORT -j ACCEPT || true
     netfilter-persistent save >/dev/null 2>&1 || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 
@@ -504,7 +501,10 @@ export_token() {
     fi
     source /etc/sdn_hk_cluster.env
     
-    PEER_COUNT=$(grep -c "\[Peer\]" /etc/wireguard/wg0.conf 2>/dev/null || echo "0")
+    # 修复：使用安全的方式统计 Peer 数量，防止 0\n0 错误
+    local PEER_COUNT=$(grep -c "\[Peer\]" /etc/wireguard/wg0.conf 2>/dev/null || true)
+    PEER_COUNT=${PEER_COUNT:-0}
+    
     DEFAULT_FAKE_PORT=$((35001 + PEER_COUNT))
 
     read -p "为该落地机分配专用的中转隧道端口 [默认 ${DEFAULT_FAKE_PORT}]: " FAKE_PORT
@@ -592,7 +592,6 @@ After=udp2raw.service
 Wants=udp2raw.service
 EOF
 
-    # 封堵 0.0.0.0 SOCKS 漏洞，严格限制为内网 IP 监听
     mkdir -p /etc/sing-box
     cat > /etc/sing-box/config.json <<EOF
 {
@@ -658,7 +657,6 @@ PublicKey = $LAND_PUB
 AllowedIPs = $LAND_IP/32
 EOF
     
-    # 无感热重载，替代 systemctl restart 防止大面积断流
     wg set wg0 peer "$LAND_PUB" allowed-ips "$LAND_IP/32" 2>/dev/null || systemctl reload wg-quick@wg0 2>/dev/null || true
 
     iptables -I INPUT -p tcp --dport $FAKE_PORT -j ACCEPT || true
@@ -693,7 +691,6 @@ EOF
 
 # ================= 多协议链接解析器 =================
 decode_url() {
-    # 彻底解决 Bash URL Decode 特殊字符替换崩溃问题
     python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1]))" "$1" 2>/dev/null || echo "$1"
 }
 
@@ -990,7 +987,6 @@ manage_nodes() {
                         !skip { print }
                         ' /etc/wireguard/wg0.conf > /tmp/wg0.conf.tmp && mv /tmp/wg0.conf.tmp /etc/wireguard/wg0.conf
                         
-                        # 同步并热重载 WireGuard 删除的节点，完全杜绝全局重置掉线
                         wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || systemctl reload wg-quick@wg0 2>/dev/null || true
 
                     elif [ "$type" = "EXT" ]; then
@@ -1038,7 +1034,11 @@ manage_nodes() {
 }
 
 setup_chain_proxy() {
-    if [ ! -f "/etc/sdn_nodes_registry.list" ] || [ $(grep -c "^NODE:" /etc/sdn_nodes_registry.list 2>/dev/null || echo 0) -lt 2 ]; then
+    # 修复：使用安全的方式统计节点数量，防止 0\n0 错误
+    local NODE_COUNT=$(grep -c "^NODE:" /etc/sdn_nodes_registry.list 2>/dev/null || true)
+    NODE_COUNT=${NODE_COUNT:-0}
+
+    if [ ! -f "/etc/sdn_nodes_registry.list" ] || [ "$NODE_COUNT" -lt 2 ]; then
         echo -e "${RED}[错误] 配置多级链式代理至少需要 2 个以上的内网落地节点！${R}"
         echo -e "${Y}[提示] 如果你只有1台落地机，请直接使用选项 5 导出单节点链接即可。${R}"
         return
