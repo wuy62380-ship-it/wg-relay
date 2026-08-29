@@ -169,7 +169,7 @@ bind_landing() {
     echo -e "\n# Landing\n[Peer]\nPublicKey = ${LANDING_PUB}\nAllowedIPs = ${LAND_IP}/32" >> "$WG_CONF"
     wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null
     
-    # 清理旧规则防累积
+    # 清理旧规则，防止重复累积
     while iptables -t nat -D PREROUTING -p tcp --dport "$MAP_PORT" 2>/dev/null; do :; done
     while iptables -t nat -D PREROUTING -p udp --dport "$MAP_PORT" 2>/dev/null; do :; done
     while iptables -D FORWARD -d "$LAND_IP" -j ACCEPT 2>/dev/null; do :; done
@@ -212,7 +212,6 @@ parse_chain_proxy() {
               '{type:$p, server:$h, server_port:($pt|tonumber)}'
         fi
     elif [[ "$proto" == "shadowsocks" ]] && [[ -n "$host" ]] && [[ "$port" =~ ^[0-9]+$ ]]; then
-        # SS 格式通常为: shadowsocks://method:password@server:port
         if [[ -n "$creds" ]]; then
             local decoded_creds=$(echo "$creds" | base64 -d 2>/dev/null || echo "$creds")
             local method=$(echo "$decoded_creds" | awk -F':' '{print $1}')
