@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (输入校验修复版)
+# 跨境软件定义边缘网络系统 (支持中文节点命名版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -538,13 +538,15 @@ setup_landing_node() {
     SUBNET_PREFIX=$(echo "$DECODED" | cut -d'|' -f4)
     FAKE_PORT=$(echo "$DECODED" | cut -d'|' -f5)
 
-    # 强制校验节点名称
+    # 强制校验节点名称 (支持中文，拦截破坏性特殊符号)
     while true; do
-        read -p "为此落地机起个名字 [例如: tw3 或 jp1]: " NODE_TAG
-        if [[ "$NODE_TAG" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-            break
+        read -p "为此落地机起个名字 [例如: 台湾 或 jp1]: " NODE_TAG
+        if [ -z "$NODE_TAG" ]; then
+            echo -e "${RED}节点名称不能为空，请重新输入！${R}"
+        elif [[ "$NODE_TAG" =~ [\"\'/\\|\&\;\$\:\ \\r] ]]; then
+            echo -e "${RED}节点名称不能包含引号、空格、斜杠、冒号等特殊符号，请重新输入！${R}"
         else
-            echo -e "${RED}节点名称只能包含字母、数字、下划线或横杠，请重新输入！${R}"
+            break
         fi
     done
 
@@ -716,7 +718,7 @@ parse_proxy_link() {
     fi
     
     [ -z "$tag" ] && tag="$link_tag"
-    tag=$(echo "$tag" | sed 's/[^a-zA-Z0-9_-]//g')
+    tag=$(echo "$tag" | sed 's/[^a-zA-Z0-9_\-\x80-\xff]//g')
     [ -z "$port" ] && return 1
 
     local json_str=""
@@ -824,16 +826,26 @@ setup_external_proxy() {
         fi
         
         local temp_tag="${proxy_link##*#}"
-        temp_tag=$(echo "$temp_tag" | sed 's/[^a-zA-Z0-9_-]//g')
+        temp_tag=$(echo "$temp_tag" | sed 's/[^a-zA-Z0-9_\-\x80-\xff]//g')
         if [ -z "$temp_tag" ]; then
-            read -p "请输入节点名称 [例如: us-vless]: " node_tag
+            read -p "请输入节点名称 [例如: 台湾-VLESS]: " node_tag
         else
             node_tag="$temp_tag"
         fi
         
         payload=$(echo -n "$proxy_link" | base64 -w 0)
     else
-        read -p "请输入外部代理节点名称 [例如: us-http]: " node_tag
+        while true; do
+            read -p "请输入外部代理节点名称 [例如: 台湾-http]: " node_tag
+            if [ -z "$node_tag" ]; then
+                echo -e "${RED}节点名称不能为空，请重新输入！${R}"
+            elif [[ "$node_tag" =~ [\"\'/\\|\&\;\$\:\ \r] ]]; then
+                echo -e "${RED}节点名称不能包含引号、空格、斜杠、冒号等特殊符号，请重新输入！${R}"
+            else
+                break
+            fi
+        done
+        
         read -p "请输入代理服务器IP或域名: " PROXY_SERVER
         if [ -z "$PROXY_SERVER" ]; then
             echo -e "${RED}[错误] IP不能为空！${R}"
@@ -1027,8 +1039,8 @@ setup_chain_proxy() {
     echo -e "\n${G}=== 可用的内网落地节点 ===${R}"
     grep "^NODE:" /etc/sdn_nodes_registry.list | cut -d':' -f2,3
 
-    read -p "请输入前置跳板节点 Tag [例如 tw3]: " NODE1_TAG
-    read -p "请输入最终出口节点 Tag [例如 jp1]: " NODE2_TAG
+    read -p "请输入前置跳板节点 Tag [例如 台湾]: " NODE1_TAG
+    read -p "请输入最终出口节点 Tag [例如 日本]: " NODE2_TAG
 
     if [ "$NODE1_TAG" = "$NODE2_TAG" ]; then
         echo -e "${RED}[错误] 跳板节点和出口节点不能相同！${R}"
@@ -1243,7 +1255,7 @@ while true; do
     echo " 3. 【第三步：落地机(动态/静态均可)】配置并加入集群"
     echo " 4. 【第四步：香港总控】输入落地机注册密文完成组网"
     echo " 5. 【香港总控】节点管理 (查看链接 / 删除节点)"
-    echo " 6. 【香港总控】配置多级链式代理 (例如: 香港->tw3->jp1)"
+    echo " 6. 【香港总控】配置多级链式代理 (例如: 香港->台湾->日本)"
     echo " 7. 【系统工具】BBR / BBRv3 算法独立切换与内核管理 (含卸载)"
     echo " 8. 【香港总控】添加外部代理 (支持 HTTP/SOCKS5/VLESS/Hysteria2/Trojan 链接导入)"
     echo " 9. 【系统工具】一键卸载所有组件与配置 (彻底清理)"
