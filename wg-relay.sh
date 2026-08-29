@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (修复 BBRv3 模块识别与 XanMod 源更新版)
+# 跨境软件定义边缘网络系统 (修复 BBRv3 模块识别与 XanMod 源/包匹配版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -112,7 +112,7 @@ xanmod_detect_package() {
     local psabi_level=""
     local level=""
     local package=""
-    local prefix_list="linux-xanmod-lts linux-xanmod linux-xanmod-mainline"
+    local prefix_list="linux-xanmod linux-xanmod-lts linux-xanmod-mainline"
 
     psabi_level=$(xanmod_detect_psabi_level) || psabi_level=3
     [ "$psabi_level" -gt 3 ] && psabi_level=3
@@ -129,6 +129,17 @@ xanmod_detect_package() {
             level=$((level - 1))
         done
     done
+
+    # 兜底支持
+    if xanmod_package_available "linux-xanmod-x64v3"; then
+        echo -e "${G}已匹配标准保底安装包: linux-xanmod-x64v3${R}" >&2
+        printf 'linux-xanmod-x64v3\n'
+        return 0
+    elif xanmod_package_available "linux-xanmod-x64v1"; then
+        echo -e "${G}已匹配兼容保底安装包: linux-xanmod-x64v1${R}" >&2
+        printf 'linux-xanmod-x64v1\n'
+        return 0
+    fi
 
     echo -e "${RED}软件源中未找到适配此CPU的XanMod内核包${R}" >&2
     return 1
