@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (节点管理面板版)
+# 跨境软件定义边缘网络系统 (防崩溃安全版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -668,7 +668,6 @@ EOF
         sed -i "/^NODE:${NODE_TAG}:/d" /etc/sdn_nodes_registry.list 2>/dev/null || true
         echo "NODE:${NODE_TAG}:${LAND_IP}" >> /etc/sdn_nodes_registry.list
         rebuild_hk_sdn_matrix
-        systemctl restart sing-box
     ) 200>/var/lock/sdn_registry.lock
 
     echo -e "\n===================================================================="
@@ -719,16 +718,21 @@ setup_external_proxy() {
         PROXY_USER="-"
     fi
 
+    # 安全过滤：防止用户输入的双引号破坏 JSON 结构导致 sing-box 崩溃断网
+    NODE_TAG=$(echo "$NODE_TAG" | tr -d '"')
+    PROXY_SERVER=$(echo "$PROXY_SERVER" | tr -d '"')
+    PROXY_USER=$(echo "$PROXY_USER" | tr -d '"')
+    PROXY_PASS=$(echo "$PROXY_PASS" | tr -d '"')
+
     (
         flock -x 200
         sed -i "/^EXT:${PROXY_TYPE}:${NODE_TAG}:/d" /etc/sdn_nodes_registry.list 2>/dev/null || true
         echo "EXT:${PROXY_TYPE}:${NODE_TAG}:${PROXY_SERVER}:${PROXY_PORT}:${PROXY_USER}:${PROXY_PASS}" >> /etc/sdn_nodes_registry.list
         rebuild_hk_sdn_matrix
-        systemctl restart sing-box
     ) 200>/var/lock/sdn_registry.lock
 
     echo -e "\n===================================================================="
-    echo -e "${G}[√] 外部代理节点 [$NODE_TAG] ($PROXY_TYPE) 成功加入集群！${R}"
+    echo -e "${G}[√] 外部代理节点 [$NODE_TAG] ($PROXY_TYPE) 处理完成！${R}"
     echo -e "===================================================================="
 }
 
@@ -807,7 +811,6 @@ manage_nodes() {
                         rm -f "/etc/systemd/system/udp2raw-${tag}.service"
                         systemctl daemon-reload
                         
-                        # 清理 WireGuard 配置
                         awk -v t="$tag" '
                         BEGIN { skip=0 }
                         /^# Node: / {
@@ -825,7 +828,6 @@ manage_nodes() {
                     fi
                     
                     rebuild_hk_sdn_matrix
-                    systemctl restart sing-box
                 ) 200>/var/lock/sdn_registry.lock
 
                 echo -e "${G}[√] 节点 $tag 已删除！${R}"
@@ -887,7 +889,6 @@ setup_chain_proxy() {
         sed -i "/^CHAIN:${CHAIN_TAG}:/d" /etc/sdn_chains_registry.list 2>/dev/null || true
         echo "CHAIN:${CHAIN_TAG}:${NODE1_TAG}:${NODE2_TAG}" >> /etc/sdn_chains_registry.list
         rebuild_hk_sdn_matrix
-        systemctl restart sing-box
     ) 200>/var/lock/sdn_registry.lock
 
     echo -e "\n===================================================================="
@@ -946,7 +947,8 @@ rebuild_hk_sdn_matrix() {
         outbounds_json+=", { \"type\": \"direct\", \"tag\": \"direct\" }"
     fi
 
-    cat > /etc/sing-box/config.json <<EOF
+    local temp_conf="/tmp/sing-box_config.tmp"
+    cat > "$temp_conf" <<EOF
 {
   "inbounds": [{
     "type": "vless", "tag": "vless-in", "listen": "0.0.0.0", "listen_port": $CLIENT_PORT,
@@ -978,6 +980,22 @@ rebuild_hk_sdn_matrix() {
   }
 }
 EOF
+
+    # 安全预检与防断网回滚机制
+    if /usr/local/bin/sing-box check -c "$temp_conf" >/dev/null 2>&1; then
+        cp "$temp_conf" /etc/sing-box/config.json
+        rm -f "$temp_conf"
+        systemctl restart sing-box
+        sleep 2
+        if ! systemctl is-active --quiet sing-box; then
+            echo -e "${RED}[严重警告] Sing-Box 重启失败，可能是环境异常！请检查日志：journalctl -u sing-box -n 10${R}"
+        fi
+    else
+        echo -e "${RED}[错误] 生成的配置文件语法校验失败！为防止断网，已放弃修改。${R}"
+        echo -e "${Y}错误详情：${R}"
+        /usr/local/bin/sing-box check -c "$temp_conf"
+        rm -f "$temp_conf"
+    fi
 }
 
 # 脚本主程序入口
