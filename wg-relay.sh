@@ -399,3 +399,6 @@ case $choice in
     0) exit 0 ;;
     *) echo -e "\033[31m[错误] 输入无效，请重新运行选择 0-4。\033[0m" ;;
 esac
+    done
+}
+menu
