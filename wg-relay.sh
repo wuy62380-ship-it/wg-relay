@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (工业级最终加固与完整功能版 - BBR/BBRv3可视管理版)
+# 跨境软件定义边缘网络系统 (工业级最终加固与完整功能版 - BBR/BBRv3交互选择版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -25,24 +25,44 @@ detect_hardware_and_bandwidth() {
 }
 
 apply_ultimate_kernel() {
-    echo -e "\033[32m[+] 正在检测并配置 BBR / BBRv3 极限网络调优...\033[0m"
+    local target_algo="${1:-auto}"
     
-    local BBR_ALGO="bbr"
-    # 优先检测与装载 BBRv3 模块
-    if modprobe tcp_bbr3 2>/dev/null; then
-        BBR_ALGO="bbr3"
-        echo "tcp_bbr3" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
-        echo -e "    -> \033[32m[🚀 性能飞跃] 检测到 BBRv3 支持，已成功激活 BBRv3 拥塞控制算法！\033[0m"
-    elif modprobe tcp_bbr 2>/dev/null; then
-        BBR_ALGO="bbr"
-        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
-        echo -e "    -> \033[36m[已激活] 标准 BBR 拥塞控制算法。\033[0m"
-    else
-        BBR_ALGO="cubic"
-        echo -e "    -> \033[33m[警告] 当前内核未包含 BBR 模块，退回 cubic 算法。\033[0m"
+    if [ "$target_algo" = "auto" ]; then
+        if modprobe tcp_bbr3 2>/dev/null; then
+            target_algo="bbr3"
+        elif modprobe tcp_bbr 2>/dev/null; then
+            target_algo="bbr"
+        else
+            target_algo="cubic"
+        fi
     fi
 
-    if [ "${TOTAL_MEM_MB:-1024}" -ge 4096 ]; then
+    set_bbr_algo "$target_algo"
+}
+
+set_bbr_algo() {
+    local target_algo="$1"
+    echo -e "\n\033[32m[+] 正在配置并切换 TCP 拥塞控制算法为: ${target_algo}...\033[0m"
+    
+    if [ "$target_algo" = "bbr3" ]; then
+        if ! modprobe tcp_bbr3 2>/dev/null; then
+            echo -e "\033[31m[错误] 当前系统内核不支持 BBRv3 模块 (tcp_bbr3)！\033[0m"
+            echo -e "\033[33m[提示] 请先选择【选项 3】一键安装 XanMod 内核后重试。\033[0m"
+            return 1
+        fi
+        echo "tcp_bbr3" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
+    elif [ "$target_algo" = "bbr" ]; then
+        if ! modprobe tcp_bbr 2>/dev/null; then
+            echo -e "\033[31m[错误] 当前系统内核无法加载 tcp_bbr 模块！\033[0m"
+            return 1
+        fi
+        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
+    fi
+
+    TOTAL_MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo "1048576")
+    TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
+
+    if [ "$TOTAL_MEM_MB" -ge 4096 ]; then
         CONTRACK_MAX=8388608
     else
         CONTRACK_MAX=2097152
@@ -50,7 +70,7 @@ apply_ultimate_kernel() {
 
     cat > /etc/sysctl.d/99-sdn-ultimate.conf <<EOF
 net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = $BBR_ALGO
+net.ipv4.tcp_congestion_control = $target_algo
 net.ipv4.ip_forward = 1
 net.netfilter.nf_conntrack_max = $CONTRACK_MAX
 net.netfilter.nf_conntrack_tcp_timeout_established = 43200
@@ -63,31 +83,86 @@ net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_fin_timeout = 15
 EOF
     sysctl -p /etc/sysctl.d/99-sdn-ultimate.conf >/dev/null 2>&1 || true
+    echo -e "\033[32m[√] TCP 拥塞控制算法已成功切换为: ${target_algo}\033[0m"
 }
 
-# 模块七：独立 BBR / BBRv3 检测与管理工具
-manage_bbr() {
+install_xanmod_bbr3() {
     echo -e "\n===================================================================="
-    echo -e "               📊 当前系统 BBR / BBRv3 运行状态                       "
+    echo -e "           🚀 一键升级 Linux 内核至 XanMod (含 BBRv3)              "
     echo -e "===================================================================="
-    
-    CURRENT_ALGO=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || echo "unknown")
-    CURRENT_QDISC=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}' || echo "unknown")
-
-    echo -e "当前 TCP 拥塞控制算法 : \033[32m${CURRENT_ALGO}\033[0m"
-    echo -e "当前队列调度算法     : \033[36m${CURRENT_QDISC}\033[0m"
-    
-    echo -e "\n--------------------------------------------------------------------"
-    lsmod | grep bbr || echo -e "\033[33m[提示] 内核未加载外部 BBR 模块（可能为内建或未开启）\033[0m"
-    echo -e "--------------------------------------------------------------------"
-
-    read -p "是否立即重新执行 BBR/BBRv3 内核优化注入？[y/N]: " RUN_OPT
-    if [[ "$RUN_OPT" =~ ^[Yy]$ ]]; then
-        TOTAL_MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo "1048576")
-        TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
-        apply_ultimate_kernel
-        echo -e "\033[32m[√] BBR 优化配置已成功注入并生效！\033[0m"
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo -e "\033[31m[错误] 目前一键内核升级仅支持 Debian / Ubuntu 系统 (apt)！\033[0m"
+        return 1
     fi
+
+    read -p "确认要开始安装 XanMod BBRv3 内核吗？安装后需要重启服务器 [y/N]: " confirm_install
+    if [[ ! "$confirm_install" =~ ^[Yy]$ ]]; then
+        return 0
+    fi
+
+    echo -e "\033[32m[+] 正在配置 XanMod 官方 APT 密钥与软件源...\033[0m"
+    apt-get update && apt-get install -y wget gnupg
+    wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --overwrite
+    echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
+
+    echo -e "\033[32m[+] 正在下载并安装包含 BBRv3 的最新 XanMod 内核...\033[0m"
+    apt-get update
+    if apt-get install -y linux-xanmod-x64v3; then
+        echo -e "\n\033[32m[√] XanMod 内核安装完成！\033[0m"
+        read -p "系统需要重启以加载新内核，是否立即重启？[y/N]: " reboot_now
+        if [[ "$reboot_now" =~ ^[Yy]$ ]]; then
+            echo -e "\033[33m正在重启系统，请稍后重新连接 SSH...\033[0m"
+            reboot
+        else
+            echo -e "\033[33m请稍后手动重启服务器 (`reboot`) 以激活新内核与 BBRv3。\033[0m"
+        fi
+    else
+        echo -e "\033[31m[错误] XanMod 内核安装失败，请检查网络连接。\033[0m"
+    fi
+}
+
+# 模块七：交互式 BBR / BBRv3 管理菜单
+manage_bbr() {
+    while true; do
+        clear
+        CURRENT_ALGO=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || echo "unknown")
+        CURRENT_QDISC=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}' || echo "unknown")
+
+        echo "===================================================================="
+        echo "               📊 当前系统 BBR / BBRv3 状态与管理                       "
+        echo "===================================================================="
+        echo -e "当前 TCP 拥塞控制算法 : \033[32m${CURRENT_ALGO}\033[0m"
+        echo -e "当前队列调度算法     : \033[36m${CURRENT_QDISC}\033[0m"
+        echo "--------------------------------------------------------------------"
+        lsmod | grep bbr || echo -e "\033[33m[提示] 当前未在 lsmod 中发现已加载的 bbr 模块\033[0m"
+        echo "===================================================================="
+        echo " 1. 切换/开启 原版标准 BBR (内核自带)"
+        echo " 2. 切换/开启 BBRv3 (需系统内核支持 tcp_bbr3)"
+        echo " 3. 一键安装 XanMod 内核 (升级系统以获得 BBRv3 支持)"
+        echo " 4. 还原为 CUBIC 默认算法"
+        echo " 0. 返回主菜单"
+        echo "===================================================================="
+        read -p "请选择具体操作 [0-4]: " bbr_choice
+
+        case $bbr_choice in
+            1)
+                set_bbr_algo "bbr"
+                read -p "按回车键继续..." ;;
+            2)
+                set_bbr_algo "bbr3"
+                read -p "按回车键继续..." ;;
+            3)
+                install_xanmod_bbr3
+                read -p "按回车键继续..." ;;
+            4)
+                set_bbr_algo "cubic"
+                read -p "按回车键继续..." ;;
+            0)
+                break ;;
+            *)
+                echo -e "\033[31m[错误] 输入无效，请重新选择。\033[0m"; sleep 1 ;;
+        esac
+    done
 }
 
 install_dependencies() {
@@ -147,7 +222,7 @@ get_pub_ip() {
 setup_hk_master() {
     apt-get update && apt-get install -y wireguard wireguard-tools curl jq iptables iproute2 uuid-runtime systemd
     detect_hardware_and_bandwidth
-    apply_ultimate_kernel
+    apply_ultimate_kernel "auto"
     install_dependencies
 
     read -p "请输入客户端连接香港总控的端口 [默认 8443]: " CLIENT_PORT
@@ -256,7 +331,7 @@ export_token() {
 setup_landing_node() {
     apt-get update && apt-get install -y wireguard wireguard-tools curl jq iptables uuid-runtime systemd
     detect_hardware_and_bandwidth
-    apply_ultimate_kernel
+    apply_ultimate_kernel "auto"
     install_dependencies
 
     read -p "请粘贴从香港总控复制的【对接凭证代码】: " DEPLOY_CODE
@@ -558,7 +633,7 @@ while true; do
     CURRENT_BBR=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || echo "未检测")
     echo "===================================================================="
     echo "    跨境软件定义边缘网络 (集群管理面板)"
-    echo "    当前内核拥塞控制算法: [ \033[32m${CURRENT_BBR}\033[0m ]"
+    echo -e "    当前内核拥塞控制算法: [ \033[32m${CURRENT_BBR}\033[0m ]"
     echo "===================================================================="
     echo " 1. 【第一步：香港中转机】初始化总控中心"
     echo " 2. 【第二步：香港中转机】生成落地机对接凭证代码"
@@ -566,7 +641,7 @@ while true; do
     echo " 4. 【第四步：香港总控】输入落地机注册密文完成组网"
     echo " 5. 【香港总控】查看/导出所有节点的 VLESS 接入链接"
     echo " 6. 【香港总控】配置多级链式代理 (例如: 香港->tw3->jp1)"
-    echo " 7. 【系统工具】查看 / 一键开启 BBR 或 BBRv3 算法"
+    echo " 7. 【系统工具】BBR / BBRv3 算法独立切换与内核管理"
     echo " 0. 退出脚本"
     echo "===================================================================="
     read -p "请选择对应操作的数字 [0-7]: " choice
@@ -580,7 +655,7 @@ while true; do
         4) register_node_to_hk; read -p "按回车键继续..." ;;
         5) show_node_links; read -p "按回车键继续..." ;;
         6) setup_chain_proxy; read -p "按回车键继续..." ;;
-        7) manage_bbr; read -p "按回车键继续..." ;;
+        7) manage_bbr ;;
         0) exit 0 ;;
         *) echo -e "\033[31m[错误] 输入无效，请重新选择。\033[0m"; sleep 2 ;;
     esac
