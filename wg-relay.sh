@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (修复 XanMod 源与包匹配版)
+# 跨境软件定义边缘网络系统 (完美修复 XanMod 源版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -38,9 +38,30 @@ xanmod_add_repo() {
     local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
     local list_file="/etc/apt/sources.list.d/xanmod-release.list"
     local key_url="https://dl.xanmod.org/archive.key"
-    
-    # 修复: 官方推荐统一使用 releases 分支，兼容所有 Debian/Ubuntu 版本，不再去猜系统代号
-    local os_codename="releases"
+    local os_codename=""
+
+    # 获取系统真实代号
+    if command -v lsb_release >/dev/null 2>&1; then
+        os_codename=$(lsb_release -sc)
+    elif [ -r /etc/os-release ]; then
+        os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+    fi
+
+    # 如果不在白名单，则使用 releases
+    if ! echo "bookworm trixie forky sid noble plucky questing resolute faye gigi wilma xia zara zena" | grep -qw "$os_codename"; then
+        os_codename="releases"
+    fi
+
+    # 黑名单拦截
+    if echo "jammy focal bullseye buster" | grep -qw "$os_codename" || [ "$os_codename" = "releases" ]; then
+        echo -e "${RED}XanMod 官方已停止对当前系统($os_codename)的 APT 源支持，请升级至 Debian12 / Ubuntu24 或更高版本。${R}"
+        return 1
+    fi
+
+    if [ -z "$os_codename" ]; then
+        echo -e "${RED}无法获取系统代号，无法配置XanMod源${R}"
+        return 1
+    fi
 
     echo -e "${Y}正在安装依赖并配置 XanMod 官方 HTTPS 源...${R}"
     apt-get update -y >/dev/null 2>&1 || true
@@ -51,56 +72,44 @@ xanmod_add_repo() {
         return 1
     fi
     chmod 644 "$keyring"
-    echo "deb [signed-by=$keyring] https://deb.xanmod.org $os_codename main" > "$list_file"
+    echo "deb [signed-by=$keyring] http://deb.xanmod.org $os_codename main" > "$list_file"
     
     echo -e "${Y}正在刷新软件包索引...${R}"
     apt-get update -y
-    echo -e "${G}XanMod 源配置完成 (分支: $os_codename)${R}"
+    echo -e "${G}XanMod 源配置完成 (系统代号: $os_codename)${R}"
 }
 
 xanmod_detect_psabi_level() {
-    local level=""
-    local ld_so=""
-    
-    for f in /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2; do
-        if [ -x "$f" ]; then ld_so="$f"; break; fi
-    done
-
-    if [ -n "$ld_so" ]; then
-        level=$("$ld_so" --help 2>/dev/null | grep -oP 'x86-64-v\K[1-4](?= \(supported)' | tail -n1 || echo "")
-    fi
-
-    if [ -z "$level" ]; then
-        level=$(awk 'BEGIN {
-            while (!/flags/) if (getline < "/proc/cpuinfo" != 1) exit 1
-            if (/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) lvl = 1
-            if (lvl == 1 && /cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) lvl = 2
-            if (lvl == 2 && /avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) lvl = 3
-            if (lvl == 3 && /avx512f/&&/avx512bw/&&/avx512cd/&&/avx512dq/&&/avx512vl/) lvl = 4
-            if (lvl > 0) { print lvl; exit }
-            exit 1
-        }' /proc/cpuinfo 2>/dev/null || echo "3")
-    fi
-
-    printf '%s' "$level"
+    local psabi_output=""
+    psabi_output=$(awk 'BEGIN {
+        while (!/flags/) if (getline < "/proc/cpuinfo" != 1) exit 1
+        if (/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level = 1
+        if (level == 1 && /cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level = 2
+        if (level == 2 && /avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level = 3
+        if (level == 3 && /avx512f/&&/avx512bw/&&/avx512cd/&&/avx512dq/&&/avx512vl/) level = 4
+        if (level > 0) { print level; exit }
+        exit 1
+    }' /proc/cpuinfo 2>/dev/null) || return 1
+    printf '%s' "$psabi_output" | tr -dc '0-9' | head -c 1
 }
 
 xanmod_package_available() {
     local package="$1"
-    local candidate
-    # 修复: 准确判断候选版本是否有效，防止匹配到 (none) 误认为存在
-    candidate=$(apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ {print $2}')
-    [ -n "$candidate" ] && [ "$candidate" != "(none)" ]
+    apt-cache policy "$package" 2>/dev/null | grep -q 'Candidate: [^ ]'
 }
 
 xanmod_detect_package() {
     local psabi_level=""
     local level=""
     local package=""
-    local prefix_list="linux-xanmod linux-xanmod-lts linux-xanmod-mainline"
+    local prefix_list="linux-xanmod linux-xanmod-lts"
 
     psabi_level=$(xanmod_detect_psabi_level) || psabi_level=3
+    [ -n "$psabi_level" ] || psabi_level=3
     [ "$psabi_level" -gt 3 ] && psabi_level=3
+
+    # 关键修复：在执行 apt-cache policy 之前，确保源已更新
+    apt-get update -y >/dev/null 2>&1
 
     for prefix in $prefix_list; do
         level="$psabi_level"
