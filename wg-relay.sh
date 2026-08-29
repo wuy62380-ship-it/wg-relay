@@ -1203,19 +1203,34 @@ rebuild_hk_sdn_matrix() {
 }
 EOF
 
+    # 安全预检与防断网回滚机制
     if /usr/local/bin/sing-box check -c "$temp_conf" >/dev/null 2>&1; then
+        # 备份当前正常配置
+        cp /etc/sing-box/config.json /etc/sing-box/config.json.bak 2>/dev/null || true
         cp "$temp_conf" /etc/sing-box/config.json
         rm -f "$temp_conf"
         systemctl restart sing-box
         sleep 2
         if ! systemctl is-active --quiet sing-box; then
-            echo -e "${RED}[严重警告] Sing-Box 重启失败，可能是环境异常！请检查日志：journalctl -u sing-box -n 10${R}"
+            echo -e "${RED}[严重警告] Sing-Box 重启失败！正在自动回滚上一份可用配置以防断网...${R}"
+            cp /etc/sing-box/config.json.bak /etc/sing-box/config.json 2>/dev/null || true
+            systemctl restart sing-box
+            sleep 2
+            if ! systemctl is-active --quiet sing-box; then
+                echo -e "${RED}[致命错误] 回滚失败！Sing-Box 依然无法启动，请手动检查日志：journalctl -u sing-box -n 10${R}"
+            else
+                echo -e "${G}[√] 已成功回滚。本次修改的配置被放弃，请检查节点格式是否兼容。${R}"
+            fi
+            rm -f /etc/sing-box/config.json.bak
+            return 1
         fi
+        rm -f /etc/sing-box/config.json.bak
     else
         echo -e "${RED}[错误] 生成的配置文件语法校验失败！为防止断网，已放弃修改。${R}"
         echo -e "${Y}错误详情：${R}"
         /usr/local/bin/sing-box check -c "$temp_conf"
         rm -f "$temp_conf"
+        return 1
     fi
 }
 
