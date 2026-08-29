@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (工业级最终加固与完整功能版)
+# 跨境软件定义边缘网络系统 (工业级最终加固与完整功能版 - BBR/BBRv3可视管理版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -25,11 +25,24 @@ detect_hardware_and_bandwidth() {
 }
 
 apply_ultimate_kernel() {
-    echo -e "\033[32m[+] 正在注入网络极限内核调优...\033[0m"
-    modprobe tcp_bbr 2>/dev/null || true
-    echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
+    echo -e "\033[32m[+] 正在检测并配置 BBR / BBRv3 极限网络调优...\033[0m"
     
-    if [ "$TOTAL_MEM_MB" -ge 4096 ]; then
+    local BBR_ALGO="bbr"
+    # 优先检测与装载 BBRv3 模块
+    if modprobe tcp_bbr3 2>/dev/null; then
+        BBR_ALGO="bbr3"
+        echo "tcp_bbr3" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
+        echo -e "    -> \033[32m[🚀 性能飞跃] 检测到 BBRv3 支持，已成功激活 BBRv3 拥塞控制算法！\033[0m"
+    elif modprobe tcp_bbr 2>/dev/null; then
+        BBR_ALGO="bbr"
+        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
+        echo -e "    -> \033[36m[已激活] 标准 BBR 拥塞控制算法。\033[0m"
+    else
+        BBR_ALGO="cubic"
+        echo -e "    -> \033[33m[警告] 当前内核未包含 BBR 模块，退回 cubic 算法。\033[0m"
+    fi
+
+    if [ "${TOTAL_MEM_MB:-1024}" -ge 4096 ]; then
         CONTRACK_MAX=8388608
     else
         CONTRACK_MAX=2097152
@@ -37,7 +50,7 @@ apply_ultimate_kernel() {
 
     cat > /etc/sysctl.d/99-sdn-ultimate.conf <<EOF
 net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_congestion_control = $BBR_ALGO
 net.ipv4.ip_forward = 1
 net.netfilter.nf_conntrack_max = $CONTRACK_MAX
 net.netfilter.nf_conntrack_tcp_timeout_established = 43200
@@ -50,6 +63,31 @@ net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_fin_timeout = 15
 EOF
     sysctl -p /etc/sysctl.d/99-sdn-ultimate.conf >/dev/null 2>&1 || true
+}
+
+# 模块七：独立 BBR / BBRv3 检测与管理工具
+manage_bbr() {
+    echo -e "\n===================================================================="
+    echo -e "               📊 当前系统 BBR / BBRv3 运行状态                       "
+    echo -e "===================================================================="
+    
+    CURRENT_ALGO=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || echo "unknown")
+    CURRENT_QDISC=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}' || echo "unknown")
+
+    echo -e "当前 TCP 拥塞控制算法 : \033[32m${CURRENT_ALGO}\033[0m"
+    echo -e "当前队列调度算法     : \033[36m${CURRENT_QDISC}\033[0m"
+    
+    echo -e "\n--------------------------------------------------------------------"
+    lsmod | grep bbr || echo -e "\033[33m[提示] 内核未加载外部 BBR 模块（可能为内建或未开启）\033[0m"
+    echo -e "--------------------------------------------------------------------"
+
+    read -p "是否立即重新执行 BBR/BBRv3 内核优化注入？[y/N]: " RUN_OPT
+    if [[ "$RUN_OPT" =~ ^[Yy]$ ]]; then
+        TOTAL_MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo "1048576")
+        TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
+        apply_ultimate_kernel
+        echo -e "\033[32m[√] BBR 优化配置已成功注入并生效！\033[0m"
+    fi
 }
 
 install_dependencies() {
@@ -432,7 +470,6 @@ setup_chain_proxy() {
 
     (
         flock -x 200
-        # 移除已有的同名链条
         sed -i "/^CHAIN:${CHAIN_TAG}:/d" /etc/sdn_chains_registry.list 2>/dev/null || true
         echo "CHAIN:${CHAIN_TAG}:${NODE1_TAG}:${NODE2_TAG}" >> /etc/sdn_chains_registry.list
         rebuild_hk_sdn_matrix
@@ -441,7 +478,6 @@ setup_chain_proxy() {
 
     echo -e "\n===================================================================="
     echo -e "\e[32m[√] 多级链式代理 [香港 -> $NODE1_TAG -> $NODE2_TAG] 构建完成！\e[0m"
-    echo -e "已自动写入 Sing-box 路由规则矩阵并重启服务。"
     echo -e "===================================================================="
 }
 
@@ -449,7 +485,6 @@ rebuild_hk_sdn_matrix() {
     local outbounds_json=""
     local tags_array=""
 
-    # 1. 组装单跳基础 Outbounds
     if [ -f /etc/sdn_nodes_registry.list ]; then
         while IFS=: read -r prefix tag ip; do
             if [ "$prefix" = "NODE" ]; then
@@ -459,11 +494,9 @@ rebuild_hk_sdn_matrix() {
         done < /etc/sdn_nodes_registry.list
     fi
 
-    # 2. 组装多级链式 Outbounds (利用 sing-box 的 detour 属性实现链式代理)
     if [ -f /etc/sdn_chains_registry.list ]; then
         while IFS=: read -r prefix chain_tag node1 node2; do
             if [ "$prefix" = "CHAIN" ]; then
-                # 获取 node2 的内网 IP
                 node2_ip=$(grep "^NODE:${node2}:" /etc/sdn_nodes_registry.list | cut -d':' -f3)
                 if [ -n "$node2_ip" ]; then
                     outbounds_json+="{ \"type\": \"socks\", \"tag\": \"out-chain-$chain_tag\", \"server\": \"$node2_ip\", \"server_port\": 10808, \"detour\": \"out-$node1\" },"
@@ -522,8 +555,10 @@ check_root
 
 while true; do
     clear
+    CURRENT_BBR=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || echo "未检测")
     echo "===================================================================="
     echo "    跨境软件定义边缘网络 (集群管理面板)"
+    echo "    当前内核拥塞控制算法: [ \033[32m${CURRENT_BBR}\033[0m ]"
     echo "===================================================================="
     echo " 1. 【第一步：香港中转机】初始化总控中心"
     echo " 2. 【第二步：香港中转机】生成落地机对接凭证代码"
@@ -531,9 +566,10 @@ while true; do
     echo " 4. 【第四步：香港总控】输入落地机注册密文完成组网"
     echo " 5. 【香港总控】查看/导出所有节点的 VLESS 接入链接"
     echo " 6. 【香港总控】配置多级链式代理 (例如: 香港->tw3->jp1)"
+    echo " 7. 【系统工具】查看 / 一键开启 BBR 或 BBRv3 算法"
     echo " 0. 退出脚本"
     echo "===================================================================="
-    read -p "请选择对应操作的数字 [0-6]: " choice
+    read -p "请选择对应操作的数字 [0-7]: " choice
 
     choice=$(echo "$choice" | tr -d '[:space:]')
 
@@ -544,6 +580,7 @@ while true; do
         4) register_node_to_hk; read -p "按回车键继续..." ;;
         5) show_node_links; read -p "按回车键继续..." ;;
         6) setup_chain_proxy; read -p "按回车键继续..." ;;
+        7) manage_bbr; read -p "按回车键继续..." ;;
         0) exit 0 ;;
         *) echo -e "\033[31m[错误] 输入无效，请重新选择。\033[0m"; sleep 2 ;;
     esac
