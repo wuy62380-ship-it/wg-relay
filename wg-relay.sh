@@ -1,8 +1,8 @@
 #!/bin/bash
 # ====================================================================================
 # 跨境软件定义边缘网络系统 (工业级最终加固与完整功能版)
-# 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾
-# 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合组网
+# 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
+# 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
 
 set -euo pipefail
@@ -181,6 +181,7 @@ PUBLIC_KEY="$PUBLIC_KEY"
 SHORT_ID="$SHORT_ID"
 EOF
     touch /etc/sdn_nodes_registry.list
+    touch /etc/sdn_chains_registry.list
 
     echo -e "\n===================================================================="
     echo -e "\e[32m[√] 香港总控中心初始化完成！\e[0m"
@@ -366,13 +367,11 @@ EOF
 
     echo -e "\n===================================================================="
     echo -e "\e[32m[√] 落地节点 [$NODE_TAG] 成功加入集群！\e[0m"
-    echo -e "客户端节点链接如下："
-    echo -e "\e[36mvless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${NODE_TAG}\e[0m"
     echo -e "===================================================================="
 }
 
 # ====================================================================================
-# 模块五：查看/导出所有已注册节点的客户端链接 (新增模块)
+# 模块五：查看/导出所有节点 VLESS 链接
 # ====================================================================================
 show_node_links() {
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
@@ -388,20 +387,69 @@ show_node_links() {
     if [ ! -f "/etc/sdn_nodes_registry.list" ] || [ ! -s "/etc/sdn_nodes_registry.list" ]; then
         echo -e "\033[33m[提示] 暂未注册任何落地节点。\033[0m"
     else
+        echo -e "\n\033[35m=== 直连落地节点 ===\033[0m"
         while IFS=: read -r prefix tag ip; do
             if [ "$prefix" = "NODE" ]; then
                 echo -e "\n📌 节点标识: \033[32m${tag}\033[0m  |  隧道 IP: \033[33m${ip}\033[0m"
                 echo -e "\033[36mvless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${tag}\033[0m"
             fi
         done < /etc/sdn_nodes_registry.list
+
+        if [ -f "/etc/sdn_chains_registry.list" ] && [ -s "/etc/sdn_chains_registry.list" ]; then
+            echo -e "\n\033[35m=== 多级链式级联节点 ===\033[0m"
+            while IFS=: read -r prefix chain_tag node1 node2; do
+                if [ "$prefix" = "CHAIN" ]; then
+                    echo -e "\n🔗 链式组合: \033[32m${chain_tag}\033[0m  |  链路: 香港 -> \033[33m${node1}\033[0m -> \033[33m${node2}\033[0m -> 目标"
+                    echo -e "\033[36mvless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-Chain-${chain_tag}\033[0m"
+                fi
+            done < /etc/sdn_chains_registry.list
+        fi
     fi
     echo -e "\n===================================================================="
+}
+
+# ====================================================================================
+# 模块六：配置多级链式代理 (Chain Proxy / Detour)
+# ====================================================================================
+setup_chain_proxy() {
+    if [ ! -f "/etc/sdn_nodes_registry.list" ] || [ $(grep -c "^NODE:" /etc/sdn_nodes_registry.list 2>/dev/null || echo 0) -lt 2 ]; then
+        echo -e "\033[31m[错误] 配置多级链式代理至少需要注册 2 个以上的落地节点！\033[0m"
+        return
+    fi
+
+    echo -e "\n\033[32m=== 可用的落地节点 ===\033[0m"
+    grep "^NODE:" /etc/sdn_nodes_registry.list | cut -d':' -f2,3
+
+    read -p "请输入前置跳板节点 Tag [例如 tw3]: " NODE1_TAG
+    read -p "请输入最终出口节点 Tag [例如 jp1]: " NODE2_TAG
+
+    if [ "$NODE1_TAG" = "$NODE2_TAG" ]; then
+        echo -e "\033[31m[错误] 跳板节点和出口节点不能相同！\033[0m"
+        return
+    fi
+
+    CHAIN_TAG="${NODE1_TAG}-to-${NODE2_TAG}"
+
+    (
+        flock -x 200
+        # 移除已有的同名链条
+        sed -i "/^CHAIN:${CHAIN_TAG}:/d" /etc/sdn_chains_registry.list 2>/dev/null || true
+        echo "CHAIN:${CHAIN_TAG}:${NODE1_TAG}:${NODE2_TAG}" >> /etc/sdn_chains_registry.list
+        rebuild_hk_sdn_matrix
+        systemctl restart sing-box
+    ) 200>/var/lock/sdn_registry.lock
+
+    echo -e "\n===================================================================="
+    echo -e "\e[32m[√] 多级链式代理 [香港 -> $NODE1_TAG -> $NODE2_TAG] 构建完成！\e[0m"
+    echo -e "已自动写入 Sing-box 路由规则矩阵并重启服务。"
+    echo -e "===================================================================="
 }
 
 rebuild_hk_sdn_matrix() {
     local outbounds_json=""
     local tags_array=""
 
+    # 1. 组装单跳基础 Outbounds
     if [ -f /etc/sdn_nodes_registry.list ]; then
         while IFS=: read -r prefix tag ip; do
             if [ "$prefix" = "NODE" ]; then
@@ -409,6 +457,20 @@ rebuild_hk_sdn_matrix() {
                 tags_array+="\"out-$tag\","
             fi
         done < /etc/sdn_nodes_registry.list
+    fi
+
+    # 2. 组装多级链式 Outbounds (利用 sing-box 的 detour 属性实现链式代理)
+    if [ -f /etc/sdn_chains_registry.list ]; then
+        while IFS=: read -r prefix chain_tag node1 node2; do
+            if [ "$prefix" = "CHAIN" ]; then
+                # 获取 node2 的内网 IP
+                node2_ip=$(grep "^NODE:${node2}:" /etc/sdn_nodes_registry.list | cut -d':' -f3)
+                if [ -n "$node2_ip" ]; then
+                    outbounds_json+="{ \"type\": \"socks\", \"tag\": \"out-chain-$chain_tag\", \"server\": \"$node2_ip\", \"server_port\": 10808, \"detour\": \"out-$node1\" },"
+                    tags_array+="\"out-chain-$chain_tag\","
+                fi
+            fi
+        done < /etc/sdn_chains_registry.list
     fi
 
     outbounds_json=${outbounds_json%,}
@@ -467,10 +529,11 @@ while true; do
     echo " 2. 【第二步：香港中转机】生成落地机对接凭证代码"
     echo " 3. 【第三步：落地机(动态/静态均可)】配置并加入集群"
     echo " 4. 【第四步：香港总控】输入落地机注册密文完成组网"
-    echo " 5. 【香港总控】查看/导出所有已注册节点的 VLESS 链接"
+    echo " 5. 【香港总控】查看/导出所有节点的 VLESS 接入链接"
+    echo " 6. 【香港总控】配置多级链式代理 (例如: 香港->tw3->jp1)"
     echo " 0. 退出脚本"
     echo "===================================================================="
-    read -p "请选择对应操作的数字 [0-5]: " choice
+    read -p "请选择对应操作的数字 [0-6]: " choice
 
     choice=$(echo "$choice" | tr -d '[:space:]')
 
@@ -480,6 +543,7 @@ while true; do
         3) setup_landing_node; read -p "按回车键继续..." ;;
         4) register_node_to_hk; read -p "按回车键继续..." ;;
         5) show_node_links; read -p "按回车键继续..." ;;
+        6) setup_chain_proxy; read -p "按回车键继续..." ;;
         0) exit 0 ;;
         *) echo -e "\033[31m[错误] 输入无效，请重新选择。\033[0m"; sleep 2 ;;
     esac
