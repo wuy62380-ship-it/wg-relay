@@ -692,10 +692,11 @@ EOF
 
 # ================= 多协议链接解析器 =================
 decode_url() {
-    python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1]))" "$1" 2>/dev/null || echo "$1"
+    # 修复: 使用 sys.stdout.write 彻底去除 Python 默认的换行符，防止破坏 JSON 结构
+    python3 -c "import urllib.parse, sys; sys.stdout.write(urllib.parse.unquote(sys.argv[1]))" "$1" 2>/dev/null || printf '%s' "$1"
 }
 
-# 清理节点名称，仅保留安全字符（修复 sed 十六进制范围报错）
+# 清理节点名称，仅保留安全字符
 sanitize_tag() {
     echo "$1" | tr -d '[:space:]"'\''/\\|&;$:'
 }
@@ -895,7 +896,7 @@ setup_external_proxy() {
 
     (
         flock -x 200
-        # 修复: 使用 grep -v 精确过滤，防止 sed 遇到特殊字符删不干净
+        # 使用 grep -v 精确过滤
         grep -v "^EXT:${proxy_type}:${node_tag}:" /etc/sdn_nodes_registry.list > /tmp/ext_nodes.tmp 2>/dev/null || true
         mv /tmp/ext_nodes.tmp /etc/sdn_nodes_registry.list
         echo "EXT:${proxy_type}:${node_tag}:${payload}" >> /etc/sdn_nodes_registry.list
@@ -995,7 +996,6 @@ manage_nodes() {
                 (
                     flock -x 200
                     if [ "$type" = "NODE" ]; then
-                        # 修复: 内网节点也使用 grep -v 精确过滤
                         grep -v "^NODE:${tag}:" /etc/sdn_nodes_registry.list > /tmp/nodes.tmp 2>/dev/null || true
                         mv /tmp/nodes.tmp /etc/sdn_nodes_registry.list
                         
@@ -1011,7 +1011,6 @@ manage_nodes() {
                         wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || systemctl reload wg-quick@wg0 2>/dev/null || true
 
                     elif [ "$type" = "EXT" ]; then
-                        # 修复: 使用 grep -v 精确过滤
                         grep -v "^EXT:[^:]*:${tag}:" /etc/sdn_nodes_registry.list > /tmp/ext_nodes.tmp 2>/dev/null || true
                         mv /tmp/ext_nodes.tmp /etc/sdn_nodes_registry.list
                     elif [ "$type" = "CHAIN" ]; then
@@ -1190,7 +1189,7 @@ rebuild_hk_sdn_matrix() {
     "users": [{ "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
     "tls": {
       "enabled": true, "server_name": "www.apple.com",
-      "reality": { "enabled\": true, \"handshake\": { \"server\": \"www.apple.com\", \"server_port\": 443 }, \"private_key\": \"$PRIVATE_KEY\", \"short_id\": [\"$SHORT_ID\"] }
+      "reality": { "enabled": true, "handshake": { "server": "www.apple.com", "server_port": 443 }, "private_key": "$PRIVATE_KEY", "short_id": ["$SHORT_ID"] }
     }
   }],
   "outbounds": [
