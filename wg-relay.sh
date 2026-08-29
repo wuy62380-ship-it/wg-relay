@@ -692,11 +692,9 @@ EOF
 
 # ================= 多协议链接解析器 =================
 decode_url() {
-    # 修复: 使用 sys.stdout.write 彻底去除 Python 默认的换行符，防止破坏 JSON 结构
     python3 -c "import urllib.parse, sys; sys.stdout.write(urllib.parse.unquote(sys.argv[1]))" "$1" 2>/dev/null || printf '%s' "$1"
 }
 
-# 清理节点名称，仅保留安全字符
 sanitize_tag() {
     echo "$1" | tr -d '[:space:]"'\''/\\|&;$:'
 }
@@ -764,7 +762,6 @@ parse_proxy_link() {
             fi
             if [ "$security" = "reality" ]; then
                 json_str+=", \"tls\": { \"enabled\": true, \"server_name\": \"$sni\", \"reality\": { \"enabled\": true, \"public_key\": \"$pbk\", \"short_id\": \"$sid\" }"
-                # 修复: Reality 强制要求 uTLS。如果链接带了 fp 就用指定的，没带就默认给 chrome
                 if [ -n "$fp" ]; then
                     json_str+=", \"utls\": { \"enabled\": true, \"fingerprint\": \"$fp\" }"
                 else
@@ -896,7 +893,6 @@ setup_external_proxy() {
 
     (
         flock -x 200
-        # 使用 grep -v 精确过滤
         grep -v "^EXT:${proxy_type}:${node_tag}:" /etc/sdn_nodes_registry.list > /tmp/ext_nodes.tmp 2>/dev/null || true
         mv /tmp/ext_nodes.tmp /etc/sdn_nodes_registry.list
         echo "EXT:${proxy_type}:${node_tag}:${payload}" >> /etc/sdn_nodes_registry.list
@@ -1217,7 +1213,6 @@ EOF
 
     # 安全预检与防断网回滚机制
     if /usr/local/bin/sing-box check -c "$temp_conf" >/dev/null 2>&1; then
-        # 备份当前正常配置
         cp /etc/sing-box/config.json /etc/sing-box/config.json.bak 2>/dev/null || true
         
         systemctl stop sing-box 2>/dev/null || true
@@ -1226,10 +1221,13 @@ EOF
         
         systemctl reset-failed sing-box 2>/dev/null || true
         systemctl start sing-box
-        sleep 2
+        sleep 3
         
         if ! systemctl is-active --quiet sing-box; then
             echo -e "${RED}[严重警告] Sing-Box 启动失败！正在自动回滚上一份可用配置以防断网...${R}"
+            echo -e "${Y}>>> 启动失败日志如下 (最后10行) <<<${R}"
+            journalctl -u sing-box -n 10 --no-pager 2>/dev/null | tail -n 10
+            
             cp /etc/sing-box/config.json.bak /etc/sing-box/config.json 2>/dev/null || true
             systemctl reset-failed sing-box 2>/dev/null || true
             systemctl start sing-box
