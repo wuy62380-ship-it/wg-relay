@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (支持外部 SOCKS5 节点导入版)
+# 跨境软件定义边缘网络系统 (支持外部 HTTP/SOCKS5 节点导入版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -676,7 +676,7 @@ EOF
     echo -e "===================================================================="
 }
 
-# ================= 外部 SOCKS5 代理导入模块 =================
+# ================= 外部 HTTP/SOCKS5 代理导入模块 =================
 setup_external_proxy() {
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
         echo -e "${RED}[错误] 请先初始化香港总控！${R}"
@@ -684,10 +684,16 @@ setup_external_proxy() {
     fi
     source /etc/sdn_hk_cluster.env
 
-    echo -e "\n${G}=== 添加外部现成 SOCKS5 代理节点 ===${R}"
-    echo -e "适用于直接购买的静态 SOCKS5 代理 (无需在目标机安装脚本)。"
+    echo -e "\n${G}=== 添加外部现成 HTTP / SOCKS5 代理节点 ===${R}"
+    echo -e "适用于直接购买的静态代理 IP (无需在目标机安装脚本)。"
     
-    read -p "请输入外部代理节点名称 [例如: us-socks5]: " NODE_TAG
+    read -p "请选择代理类型 (1: HTTP  2: SOCKS5) [默认 2]: " type_choice
+    case "$type_choice" in
+        1) PROXY_TYPE="http" ;;
+        *) PROXY_TYPE="socks" ;;
+    esac
+
+    read -p "请输入外部代理节点名称 [例如: us-http]: " NODE_TAG
     
     read -p "请输入代理服务器IP或域名: " PROXY_SERVER
     if [ -z "$PROXY_SERVER" ]; then
@@ -715,14 +721,17 @@ setup_external_proxy() {
 
     (
         flock -x 200
+        # 兼容旧版数据清理
         sed -i "/^EXT:${NODE_TAG}:/d" /etc/sdn_nodes_registry.list 2>/dev/null || true
-        echo "EXT:${NODE_TAG}:${PROXY_SERVER}:${PROXY_PORT}:${PROXY_USER}:${PROXY_PASS}" >> /etc/sdn_nodes_registry.list
+        # 新增带有类型标记的数据格式: EXT:type:tag:server:port:user:pass
+        sed -i "/^EXT:[^:]*:${NODE_TAG}:/d" /etc/sdn_nodes_registry.list 2>/dev/null || true
+        echo "EXT:${PROXY_TYPE}:${NODE_TAG}:${PROXY_SERVER}:${PROXY_PORT}:${PROXY_USER}:${PROXY_PASS}" >> /etc/sdn_nodes_registry.list
         rebuild_hk_sdn_matrix
         systemctl restart sing-box
     ) 200>/var/lock/sdn_registry.lock
 
     echo -e "\n===================================================================="
-    echo -e "${G}[√] 外部代理节点 [$NODE_TAG] 成功加入集群！${R}"
+    echo -e "${G}[√] 外部代理节点 [$NODE_TAG] ($PROXY_TYPE) 成功加入集群！${R}"
     echo -e "你可以通过选项 5 导出该节点的 VLESS 链接。"
     echo -e "===================================================================="
 }
@@ -742,18 +751,18 @@ show_node_links() {
         echo -e "${Y}[提示] 暂未注册任何落地节点。${R}"
     else
         echo -e "\n${H}=== 直连落地节点 (需服务器部署) ===${R}"
-        while IFS=: read -r prefix p1 p2 p3 p4 p5; do
+        while IFS=: read -r prefix p1 p2 p3 p4 p5 p6; do
             if [ "$prefix" = "NODE" ]; then
                 echo -e "\n📌 节点标识: ${G}${p1}${R}  |  隧道 IP: ${Y}${p2}${R}"
                 echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${p1}${R}"
             fi
         done < /etc/sdn_nodes_registry.list
 
-        echo -e "\n${H}=== 外部 SOCKS5 代理节点 (现成IP导入) ===${R}"
-        while IFS=: read -r prefix p1 p2 p3 p4 p5; do
+        echo -e "\n${H}=== 外部 HTTP / SOCKS5 代理节点 (现成IP导入) ===${R}"
+        while IFS=: read -r prefix p1 p2 p3 p4 p5 p6; do
             if [ "$prefix" = "EXT" ]; then
-                echo -e "\n🌍 外部代理: ${G}${p1}${R}  |  目标: ${Y}${p2}:${p3}${R}"
-                echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-EXT-${p1}${R}"
+                echo -e "\n🌍 外部代理: ${G}${p2}${R}  |  协议: ${Y}${p1}${R} | 目标: ${Y}${p3}:${p4}${R}"
+                echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-EXT-${p2}${R}"
             fi
         done < /etc/sdn_nodes_registry.list
 
@@ -808,22 +817,23 @@ rebuild_hk_sdn_matrix() {
     local tags_array=""
 
     if [ -f /etc/sdn_nodes_registry.list ]; then
-        while IFS=: read -r prefix p1 p2 p3 p4 p5; do
+        while IFS=: read -r prefix p1 p2 p3 p4 p5 p6; do
             if [ "$prefix" = "NODE" ]; then
                 outbounds_json+="{ \"type\": \"socks\", \"tag\": \"out-$p1\", \"server\": \"$p2\", \"server_port\": 10808 },"
                 tags_array+="\"out-$p1\","
             elif [ "$prefix" = "EXT" ]; then
-                local ext_tag="$p1"
-                local ext_server="$p2"
-                local ext_port="$p3"
-                local ext_user="$p4"
-                local ext_pass="$p5"
+                local ext_type="$p1"
+                local ext_tag="$p2"
+                local ext_server="$p3"
+                local ext_port="$p4"
+                local ext_user="$p5"
+                local ext_pass="$p6"
                 
                 local json_entry=""
                 if [ "$ext_user" = "-" ] || [ -z "$ext_user" ]; then
-                    json_entry="{ \"type\": \"socks\", \"tag\": \"out-ext-$ext_tag\", \"server\": \"$ext_server\", \"server_port\": $ext_port }"
+                    json_entry="{ \"type\": \"$ext_type\", \"tag\": \"out-ext-$ext_tag\", \"server\": \"$ext_server\", \"server_port\": $ext_port }"
                 else
-                    json_entry="{ \"type\": \"socks\", \"tag\": \"out-ext-$ext_tag\", \"server\": \"$ext_server\", \"server_port\": $ext_port, \"username\": \"$ext_user\", \"password\": \"$ext_pass\" }"
+                    json_entry="{ \"type\": \"$ext_type\", \"tag\": \"out-ext-$ext_tag\", \"server\": \"$ext_server\", \"server_port\": $ext_port, \"username\": \"$ext_user\", \"password\": \"$ext_pass\" }"
                 fi
                 outbounds_json+="${json_entry},"
                 tags_array+="\"out-ext-$ext_tag\","
@@ -904,7 +914,7 @@ while true; do
     echo " 5. 【香港总控】查看/导出所有节点的 VLESS 接入链接"
     echo " 6. 【香港总控】配置多级链式代理 (例如: 香港->tw3->jp1)"
     echo " 7. 【系统工具】BBR / BBRv3 算法独立切换与内核管理 (含卸载)"
-    echo " 8. 【香港总控】添加外部 SOCKS5 代理节点 (直接使用现成IP)"
+    echo " 8. 【香港总控】添加外部 HTTP / SOCKS5 代理节点 (直接使用现成IP)"
     echo " 0. 退出脚本"
     echo "===================================================================="
     read -p "请选择对应操作的数字 [0-8]: " choice
