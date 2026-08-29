@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================================
-# WireGuard + udp2raw + Sing-box 终极融合版 (反转架构)
+# WireGuard + udp2raw + Sing-box 终极融合版 (反转架构 + 完整BBRv3)
 # 解决: 家宽无端口映射, UDP QoS封锁, 小白难部署
 # ==========================================================
 
@@ -16,6 +16,8 @@ UDP2RAW_DIR="/etc/udp2raw"
 WG_PORT="51820"
 FAKE_PORT="20022"
 LAND_INFO="/etc/wireguard/landing_info.txt"
+SYSCTL_CONF="/etc/sysctl.d/99-wireguard-tuning.conf"
+BBR_CONF="/etc/sysctl.d/99-bbr.conf"
 
 check_root() { [ "$EUID" -ne 0 ] && echo -e "${RED}请使用root运行${NC}" && exit 1; }
 pause_return() { echo -e "${YELLOW}按 Enter 键返回...${NC}"; read -r < /dev/tty; }
@@ -33,7 +35,7 @@ prepare_env() {
     apt-get update -y > /dev/null 2>&1
     apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl coreutils iproute2 iputils-ping util-linux > /dev/null 2>&1
     
-    # 修复: 强制切换 iptables 至 legacy 模式，否则 udp2raw 在新版系统会失效
+    # 修复: 强制切换 iptables 至 legacy 模式
     if update-alternatives --list iptables &>/dev/null; then
         update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
         update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
@@ -42,7 +44,6 @@ prepare_env() {
     modprobe nf_conntrack 2>/dev/null
     mkdir -p "$WG_DIR" "$UDP2RAW_DIR"
     
-    # 安装 udp2raw
     if ! command -v udp2raw &>/dev/null; then
         echo -e "${CYAN}[*] 下载 udp2raw...${NC}"
         local arch=$(dpkg --print-architecture)
@@ -117,7 +118,6 @@ init_vps_server() {
     U2R_PASS=$(head -c 16 /dev/urandom | base64)
     VPS_IP=$(get_pub_ip); [ -z "$VPS_IP" ] && { echo -e "${RED}无法获取公网IP${NC}"; return; }
     
-    # 开启转发
     echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ip-forward.conf
     sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
     
@@ -131,11 +131,11 @@ EOF
     systemctl enable wg-quick@wg0 > /dev/null 2>&1
     wg-quick down wg0 >/dev/null 2>&1; wg-quick up wg0 >/dev/null 2>&1
     
-    # 启动 udp2raw 服务端 (监听公网 20022，转发给本地 WG 51820)
     cat > /etc/systemd/system/udp2raw.service << EOF
 [Unit]
 Description=udp2raw Server
-After=network.target
+After=network.target network-online.target
+Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/udp2raw -s -l 0.0.0.0:${FAKE_PORT} -r 127.0.0.1:${WG_PORT} --raw-mode faketcp -a -k "${U2R_PASS}"
@@ -165,11 +165,9 @@ bind_landing() {
     LANDING_PUB=$(echo $CODE_RAW | cut -d'|' -f1); LAND_IP=$(echo $CODE_RAW | cut -d'|' -f2)
     MAP_PORT=$(echo $CODE_RAW | cut -d'|' -f3); LAND_PORT=$(echo $CODE_RAW | cut -d'|' -f4)
     
-    # 添加 WG Peer
     echo -e "\n# Landing\n[Peer]\nPublicKey = ${LANDING_PUB}\nAllowedIPs = ${LAND_IP}/32" >> "$WG_CONF"
     wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null
     
-    # 配置 iptables 转发
     while iptables -t nat -D PREROUTING -p tcp --dport "$MAP_PORT" 2>/dev/null; do :; done
     while iptables -t nat -D PREROUTING -p udp --dport "$MAP_PORT" 2>/dev/null; do :; done
     iptables -t nat -I PREROUTING 1 -p tcp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
@@ -209,7 +207,7 @@ deploy_landing() {
     SNI=$(select_best_sni)
 
     WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey)
-    LAND_IP="10.0.0.2" # 默认分配给家里的机器
+    LAND_IP="10.0.0.2"
 
     cat > $WG_CONF << EOF
 [Interface]
@@ -224,11 +222,11 @@ AllowedIPs = 10.0.0.0/24
 PersistentKeepalive = 25
 EOF
     
-    # 启动 udp2raw 客户端 (监听本地 51820，伪装连向 VPS 的 20022)
     cat > /etc/systemd/system/udp2raw.service << EOF
 [Unit]
 Description=udp2raw Client
-After=network.target
+After=network.target network-online.target
+Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/udp2raw -c -l 127.0.0.1:${WG_PORT} -r ${VPS_IP}:${FAKE_PORT} --raw-mode faketcp -a -k "${U2R_PASS}"
@@ -240,7 +238,6 @@ EOF
     systemctl enable wg-quick@wg0 > /dev/null 2>&1
     wg-quick down wg0 >/dev/null 2>&1; wg-quick up wg0 >/dev/null 2>&1
     
-    # 生成 Sing-box 配置
     REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null)
     SB_PRIV=$(echo "$REALITY_KEYS" | awk '/PrivateKey/{print $2}')
     SB_PUB=$(echo "$REALITY_KEYS" | awk '/PublicKey/{print $2}')
@@ -284,23 +281,96 @@ EOF
     pause_return
 }
 
-# ==================== 系统优化与卸载 ====================
-tune_system() {
-    clear; echo -e "${YELLOW}━━━ 系统优化 (原版BBR) ━━━${NC}"
-    modprobe tcp_bbr 2>/dev/null
-    cat > /etc/sysctl.d/99-tune.conf << EOF
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 32768 16777216
-net.ipv4.tcp_wmem = 4096 32768 16777216
-net.ipv4.ip_forward = 1
-EOF
-    sysctl -p /etc/sysctl.d/99-tune.conf > /dev/null 2>&1
-    echo -e "${GREEN}✓ BBR 优化完成${NC}"
-    pause_return
+# ==================== BBRv3 与系统优化模块 ====================
+optimize_kernel() {
+    while true; do
+        clear
+        local cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+        local cur_kr=$(uname -r); local xm="否"; [[ "$cur_kr" == *xanmod* ]] && xm="是"
+        echo -e "${CYAN}===== 内核与 BBR 优化 =====${NC}"
+        echo -e "内核: ${cur_kr} | XanMod: ${xm} | 算法: ${cur_cc}"
+        echo "1. 标准 BBR (v1，免重启)"
+        echo "2. BBRv3 (安装 XanMod，需重启)"
+        echo "3. 深度网络栈调优 (高并发推荐)"
+        echo "0. 返回主菜单"
+        read -rp "选择 [0-3]: " c
+        case $c in
+            1) _enable_bbr; echo; read -n 1 -s -r -p "按任意键返回菜单..." < /dev/tty ;;
+            2) _enable_bbrv3; echo; read -n 1 -s -r -p "按任意键返回菜单..." < /dev/tty ;;
+            3) _deep_tune; echo; read -n 1 -s -r -p "按任意键返回菜单..." < /dev/tty ;;
+            0) return ;;
+            *) echo -e "${RED}无效输入${NC}"; sleep 1 ;;
+        esac
+    done
 }
 
+_enable_bbr() {
+    modprobe tcp_bbr 2>/dev/null || true
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then echo -e "${RED}内核不支持 BBR${NC}"; return 1; fi
+    cat > "$BBR_CONF" <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    sysctl --system > /dev/null 2>&1 || true; echo -e "${GREEN}标准 BBR 已启用${NC}"
+}
+
+_enable_bbrv3() {
+    if [[ "$(uname -r)" == *xanmod* ]]; then _enable_bbr; return; fi
+    local arch=$(dpkg --print-architecture 2>/dev/null || true)
+    [[ "$arch" != "amd64" ]] && { echo -e "${RED}XanMod 仅支持 amd64${NC}"; return; }
+    . /etc/os-release; local codename="${VERSION_CODENAME:-}"
+    
+    case "$codename" in
+        focal|jammy|noble|resolute|bullseye|bookworm|trixie) ;;
+        *) echo -e "${RED}XanMod 不支持当前系统版本 (${codename})${NC}"; return 1 ;;
+    esac
+
+    if command -v mokutil &>/dev/null && mokutil --sb-state 2>/dev/null | grep -qi enabled; then echo -e "${RED}请先关闭 Secure Boot${NC}"; return; fi
+    cd /tmp || return
+    curl -fsSLO https://dl.xanmod.org/check_x86-64_psabi.sh 2>/dev/null || wget -qO check_x86-64_psabi.sh https://dl.xanmod.org/check_x86-64_psabi.sh || true
+    local cpu
+    if [[ -f ./check_x86-64_psabi.sh ]]; then
+        chmod +x check_x86-64_psabi.sh; cpu=$(./check_x86-64_psabi.sh 2>/dev/null | grep -oE 'x86-64-v[0-9]' | tail -n1 || true); rm -f check_x86-64_psabi.sh
+    fi
+    local suffix="x64v2"; [[ "$cpu" == "x86-64-v3" ]] && suffix="x64v3"
+    echo "选择分支: 1) LTS 2) MAIN"; read -rp "[1]: " br; br=${br:-1}
+    local pkg="linux-xanmod-lts-${suffix}"; [[ "$br" == "2" ]] && pkg="linux-xanmod-${suffix}"
+    apt-get install -y ca-certificates curl gpg; install -m 0755 -d /etc/apt/keyrings
+    if ! curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null; then echo -e "${RED}密钥下载失败${NC}"; return 1; fi
+    cat > /etc/apt/sources.list.d/xanmod.sources <<EOF
+Types: deb
+URIs: https://deb.xanmod.org
+Suites: ${codename}
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/xanmod-archive-keyring.gpg
+EOF
+    apt-get update -y; apt-get install -y "$pkg" || { echo -e "${RED}安装失败${NC}"; return; }
+    echo -e "${YELLOW}需重启。重启后再次运行此项启用 BBRv3${NC}"; read -rp "立即重启, [y/N]: " rb; [[ "$rb" =~ ^[Yy]$ ]] && reboot
+}
+
+_deep_tune() {
+    echo -e "${CYAN}应用深度网络栈调优...${NC}"
+    modprobe nf_conntrack 2>/dev/null || true
+    cat > "$SYSCTL_CONF" <<'EOF'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.netdev_max_backlog = 250000
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65535
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+EOF
+    sysctl --system > /dev/null 2>&1 || true; echo -e "${GREEN}深度调优完成${NC}"
+}
+
+# ==================== 卸载模块 ====================
 uninstall_all() {
     read -p "${RED}确定卸载所有组件？[y/N]: ${NC}" c < /dev/tty
     [[ ! "$c" =~ ^[Yy]$ ]] && return
@@ -327,7 +397,7 @@ while true; do
     echo -e "${CYAN}║${NC} ${GREEN}2${NC} 家里-部署落地机(生成节点链接)   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}3${NC} VPS-绑定落地机(粘贴回传码)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 查看落地机节点链接           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}5${NC} 系统BBR优化                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}5${NC} 内核与 BBRv3 优化             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}6${NC} 一键卸载全部组件             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}0${NC} 退出                        ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
@@ -338,7 +408,7 @@ while true; do
         2) deploy_landing;;
         3) bind_landing;;
         4) clear; [ -f "$LAND_INFO" ] && cat "$LAND_INFO" || echo "无节点信息"; pause_return;;
-        5) tune_system;;
+        5) optimize_kernel;;
         6) uninstall_all;;
         0) exit 0;;
         *) echo "错误"; sleep 1;;
