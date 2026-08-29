@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (安全加固与无感热载生产版)
+# 跨境软件定义边缘网络系统 (生产级深度修复版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -46,13 +46,8 @@ xanmod_add_repo() {
         os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
     fi
 
-    if echo "focal buster" | grep -qw "$os_codename"; then
-        echo -e "${Y}[警告] 当前系统($os_codename)可能已不在 XanMod 官方主线支持列表中。如遇安装失败请考虑升级系统。${R}"
-    fi
-
     if [ -z "$os_codename" ]; then
-        echo -e "${RED}无法获取系统代号，无法配置XanMod源${R}"
-        return 1
+        os_codename="releases"
     fi
 
     echo -e "${Y}正在安装依赖并配置 XanMod 官方 HTTPS 源...${R}"
@@ -376,8 +371,9 @@ install_dependencies() {
         fi
     fi
 
-    if [ ! -f "/usr/local/bin/sing-box" ]; then
-        # 防 API 限流策略，通过解析重定向链接获取最新版本号
+    # 如果已经存在 sing-box，先删除旧的再装最新的，防止版本过老无法生成密钥
+    if [ ! -f "/usr/local/bin/sing-box" ] || ! /usr/local/bin/sing-box version >/dev/null 2>&1; then
+        rm -f /usr/local/bin/sing-box
         local LATEST_URL=$(curl -w "%{url_effective}" -I -L -s -S https://github.com/SagerNet/sing-box/releases/latest -o /dev/null || true)
         local VER=$(echo "$LATEST_URL" | awk -F'/v' '{print $NF}')
         if [ -z "$VER" ] || [[ ! "$VER" =~ ^[0-9] ]]; then
@@ -434,9 +430,10 @@ MTU = 1360
 EOF
 
     UUID=$(uuidgen)
-    KEYS=$(sing-box generate reality-keypair 2>/dev/null || echo "")
-    PRIVATE_KEY=$(echo "$KEYS" | grep Private | awk '{print $3}' || echo "")
-    PUBLIC_KEY=$(echo "$KEYS" | grep Public | awk '{print $3}' || echo "")
+    # 修复：兼容新版本 Sing-box 的无空格输出格式 (提取最后一列)
+    KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null || echo "")
+    PRIVATE_KEY=$(echo "$KEYS" | grep -i Private | awk '{print $NF}')
+    PUBLIC_KEY=$(echo "$KEYS" | grep -i Public | awk '{print $NF}')
     
     if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
         echo -e "${RED}[致命错误] Sing-box Reality 证书生成失败！可能是 Sing-box 下载不完整或服务器环境不兼容。${R}"
@@ -727,7 +724,7 @@ parse_proxy_link() {
     [ -z "$port" ] && return 1
 
     local json_str=""
-    local flow="" security="" sni="" fp="" pbk="" sid="" type="tcp" path="" host="" alpn="" insecure="" pass=""
+    local flow="" security="" sni="" fp="" pbk="" sid="" type="tcp" path="" host="" alpn="" insecure="" pass="" obfs="" obfs_pwd=""
 
     local IFS='&'
     for kv in $query; do
@@ -745,6 +742,8 @@ parse_proxy_link() {
             host) host=$(decode_url "$v") ;;
             alpn) alpn="$v" ;;
             insecure) insecure="$v" ;;
+            obfs) obfs="$v" ;;
+            obfs-password) obfs_pwd=$(decode_url "$v") ;;
         esac
     done
 
@@ -776,7 +775,11 @@ parse_proxy_link() {
             json_str+=", \"tls\": { \"enabled\": true, \"server_name\": \"$sni\""
             if [ "$insecure" = "1" ]; then json_str+=", \"insecure\": true"; fi
             if [ -n "$alpn" ]; then json_str+=", \"alpn\": [\"$alpn\"]"; fi
-            json_str+=" } }"
+            json_str+=" }"
+            if [ -n "$obfs" ]; then
+                json_str+=", \"obfs\": { \"type\": \"$obfs\", \"password\": \"$obfs_pwd\" }"
+            fi
+            json_str+=" }"
             ;;
         trojan)
             json_str="{ \"type\": \"trojan\", \"tag\": \"out-ext-$tag\", \"server\": \"$server\", \"server_port\": $port, \"password\": \"$auth\""
