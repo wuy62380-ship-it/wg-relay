@@ -695,6 +695,11 @@ decode_url() {
     python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1]))" "$1" 2>/dev/null || echo "$1"
 }
 
+# 清理节点名称，仅保留安全字符（修复 sed 十六进制范围报错）
+sanitize_tag() {
+    echo "$1" | tr -d '[:space:]"'\''/\\|&;$:'
+}
+
 parse_proxy_link() {
     local link="$1"
     local tag="$2"
@@ -718,7 +723,7 @@ parse_proxy_link() {
     fi
     
     [ -z "$tag" ] && tag="$(decode_url "$link_tag")"
-    tag=$(echo "$tag" | sed 's/[^a-zA-Z0-9_\-\x80-\xff]//g')
+    tag=$(sanitize_tag "$tag")
     [ -z "$port" ] && return 1
 
     local json_str=""
@@ -830,9 +835,10 @@ setup_external_proxy() {
         fi
         
         local temp_tag="${proxy_link##*#}"
-        temp_tag=$(decode_url "$temp_tag" | sed 's/[^a-zA-Z0-9_\-\x80-\xff]//g')
+        temp_tag=$(sanitize_tag "$(decode_url "$temp_tag")")
         if [ -z "$temp_tag" ]; then
             read -p "请输入节点名称 [例如: 台湾-VLESS]: " node_tag
+            node_tag=$(sanitize_tag "$node_tag")
         else
             node_tag="$temp_tag"
         fi
@@ -988,9 +994,7 @@ manage_nodes() {
                         rm -f "/etc/systemd/system/udp2raw-${node_ip}.service"
                         systemctl daemon-reload
                         
-                        # 修复：按块精准删除节点，彻底杜绝残留空 [Peer] 导致断网
                         awk -v RS='' -v ORS='\n\n' -v t="$tag" 'index($0, "# Node: " t) { next } { print }' /etc/wireguard/wg0.conf > /tmp/wg0.conf.tmp
-                        # 清理可能残留的多个连续空行
                         sed -i '/^$/N;/^\n$/D' /tmp/wg0.conf.tmp
                         mv /tmp/wg0.conf.tmp /etc/wireguard/wg0.conf
                         
