@@ -763,9 +763,11 @@ parse_proxy_link() {
             fi
             if [ "$security" = "reality" ]; then
                 json_str+=", \"tls\": { \"enabled\": true, \"server_name\": \"$sni\", \"reality\": { \"enabled\": true, \"public_key\": \"$pbk\", \"short_id\": \"$sid\" }"
-                # 修复: xtls-rprx-vision 流控下不能开启 utls，否则 sing-box 会崩溃
-                if [ -n "$fp" ] && [ "$flow" != "xtls-rprx-vision" ]; then
+                # 修复: Reality 强制要求 uTLS。如果链接带了 fp 就用指定的，没带就默认给 chrome
+                if [ -n "$fp" ]; then
                     json_str+=", \"utls\": { \"enabled\": true, \"fingerprint\": \"$fp\" }"
+                else
+                    json_str+=", \"utls\": { \"enabled\": true, \"fingerprint\": \"chrome\" }"
                 fi
                 json_str+=" }"
             elif [ "$security" = "tls" ]; then
@@ -1188,7 +1190,7 @@ rebuild_hk_sdn_matrix() {
     "users": [{ "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
     "tls": {
       "enabled": true, "server_name": "www.apple.com",
-      "reality": { "enabled": true, "handshake": { "server": "www.apple.com", "server_port": 443 }, "private_key": "$PRIVATE_KEY", "short_id": ["$SHORT_ID"] }
+      "reality": { "enabled\": true, \"handshake\": { \"server\": \"www.apple.com\", \"server_port\": 443 }, \"private_key\": \"$PRIVATE_KEY\", \"short_id\": [\"$SHORT_ID\"] }
     }
   }],
   "outbounds": [
@@ -1218,17 +1220,23 @@ EOF
     if /usr/local/bin/sing-box check -c "$temp_conf" >/dev/null 2>&1; then
         # 备份当前正常配置
         cp /etc/sing-box/config.json /etc/sing-box/config.json.bak 2>/dev/null || true
+        
+        systemctl stop sing-box 2>/dev/null || true
         cp "$temp_conf" /etc/sing-box/config.json
         rm -f "$temp_conf"
-        systemctl restart sing-box
+        
+        systemctl reset-failed sing-box 2>/dev/null || true
+        systemctl start sing-box
         sleep 2
+        
         if ! systemctl is-active --quiet sing-box; then
-            echo -e "${RED}[严重警告] Sing-Box 重启失败！正在自动回滚上一份可用配置以防断网...${R}"
+            echo -e "${RED}[严重警告] Sing-Box 启动失败！正在自动回滚上一份可用配置以防断网...${R}"
             cp /etc/sing-box/config.json.bak /etc/sing-box/config.json 2>/dev/null || true
-            systemctl restart sing-box
+            systemctl reset-failed sing-box 2>/dev/null || true
+            systemctl start sing-box
             sleep 2
             if ! systemctl is-active --quiet sing-box; then
-                echo -e "${RED}[致命错误] 回滚失败！Sing-Box 依然无法启动，请手动检查日志：journalctl -u sing-box -n 10${R}"
+                echo -e "${RED}[致命错误] 回滚后依然无法启动！请手动检查日志：journalctl -u sing-box -n 10${R}"
             else
                 echo -e "${G}[√] 已成功回滚。本次修改的配置被放弃，请检查节点格式是否兼容。${R}"
             fi
