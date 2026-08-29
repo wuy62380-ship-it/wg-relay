@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (绝对生产环境工业级完整代码)
+# 跨境软件定义边缘网络系统 (工业级修复版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合组网
 # ====================================================================================
@@ -12,25 +12,17 @@ check_root() {
 }
 
 detect_hardware_and_bandwidth() {
-    echo -e "\n\033[32m[+] 正在扫描服务器硬件与 Tbps 级吞吐指标...\033[0m"
+    echo -e "\n\033[32m[+] 正在扫描服务器硬件与吞吐指标...\033[0m"
     CPU_CORES=$(nproc)
     TOTAL_MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
     TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
     TOTAL_MEM_GB=$(awk "BEGIN {printf \"%.1f\", $TOTAL_MEM_MB / 1024}")
     
     echo -e "    -> CPU核心: \033[36m${CPU_CORES}核 | 物理内存: ${TOTAL_MEM_GB}GB\033[0m"
-    
-    SPEED_TEST=$(curl -s --max-time 4 -w "%{speed_download}" -o /dev/null "https://speed.hetzner.de/100MB.bin" 2>/dev/null || echo "0")
-    if [ "$SPEED_TEST" != "0" ] && [ -n "$SPEED_TEST" ]; then
-        BW_MBPS=$(awk "BEGIN {printf \"%.0f\", $SPEED_TEST * 8 / 1048576}")
-        echo -e "    -> 链路实测带宽上限: \033[36m~${BW_MBPS} Mbps\033[0m"
-    else
-        echo -e "    -> 链路实测带宽上限: \033[36m自适应千兆/万兆专线管道\033[0m"
-    fi
 }
 
 apply_ultimate_kernel() {
-    echo -e "\033[32m[+] 正在注入面向 1080p 60fps 极清直播防掉帧与游戏零卡顿的极限内核调优...\033[0m"
+    echo -e "\033[32m[+] 正在注入网络极限内核调优...\033[0m"
     modprobe tcp_bbr 2>/dev/null || true
     echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null
     
@@ -79,9 +71,12 @@ install_dependencies() {
 
 get_pub_ip() {
     local ip=""
-    for api in "ifconfig.me" "api.ipify.org" "ipinfo.io/ip"; do
-        ip=$(curl -s --connect-timeout 2 --max-time 3 -4 "$api" 2>/dev/null | tr -d '[:space:]' | grep -oP '^\d+\.\d+\.\d+\.\d+$')
-        [ -n "$ip" ] && echo "$ip" && return 0
+    for api in "ifconfig.me" "api.ipify.org" "icanhazip.com"; do
+        ip=$(curl -s --connect-timeout 2 --max-time 3 -4 "$api" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return 0
+        fi
     done
     echo "127.0.0.1"
 }
@@ -180,13 +175,13 @@ export_token() {
     
     DEPLOY_CODE=$(echo -n "${HK_IP}|${WG_PUB}|${U2R_PASS}|${SUBNET_PREFIX}|${FAKE_PORT}" | base64 -w 0)
     echo -e "\n===================================================================="
-    echo -e "请复制以下【对接凭证代码】到你的落地机（动态家宽或静态服务器均可）："
+    echo -e "请复制以下【对接凭证代码】到你的落地机："
     echo -e "\n\e[36m$DEPLOY_CODE\e[0m\n"
     echo -e "===================================================================="
 }
 
 # ====================================================================================
-# 模块三：配置落地机（自动适配静态/动态 IP，10秒心跳自愈防断流）
+# 模块三：配置落地机
 # ====================================================================================
 setup_landing_node() {
     apt-get update && apt-get install -y wireguard wireguard-tools curl jq iptables uuid-runtime systemd
@@ -203,7 +198,7 @@ setup_landing_node() {
     SUBNET_PREFIX=$(echo "$DECODED" | cut -d'|' -f4)
     FAKE_PORT=$(echo "$DECODED" | cut -d'|' -f5)
 
-    read -p "为此落地机起个名字 [例如: dynamic-tiktok-home 或 static-us1]: " NODE_TAG
+    read -p "为此落地机起个名字 [例如: dynamic-home 或 static-node1]: " NODE_TAG
     read -p "分配内网编号 [例如 2 或 3]: " HOST_ID
     
     LAND_IP="${SUBNET_PREFIX}.${HOST_ID}"
@@ -217,7 +212,6 @@ setup_landing_node() {
 PrivateKey = $WG_PRIV
 Address = $LAND_IP/24
 MTU = 1360
-# 10秒保活心跳：确保直播推流及游戏期间，绝不因 NAT 超时或动态 IP 变动而掉线
 PersistentKeepalive = 10
 
 [Peer]
@@ -270,8 +264,8 @@ EOF
 
     REG_PAYLOAD=$(echo -n "${WG_PUB}|${LAND_IP}|${NODE_TAG}" | base64 -w 0)
     echo -e "\n===================================================================="
-    echo -e "\e[32m[√] 落地节点 ($NODE_TAG) 配置成功！(完美支持动态/静态 IP)\e[0m"
-    echo -e "请复制以下【注册密文】，回到【香港总控】运行脚本并选择【选项 4】完成绑定："
+    echo -e "\e[32m[√] 落地节点 ($NODE_TAG) 配置成功！\e[0m"
+    echo -e "请复制以下【注册密文】，回到【香港总控】选择【选项 4】完成绑定："
     echo -e "\n\e[36m$REG_PAYLOAD\e[0m\n"
     echo -e "===================================================================="
 }
@@ -324,7 +318,7 @@ EOF
     systemctl restart sing-box
 
     echo -e "\n===================================================================="
-    echo -e "\e[32m[√] 落地节点 [$NODE_TAG] 成功加入智能负载均衡集群！\e[0m"
+    echo -e "\e[32m[√] 落地节点 [$NODE_TAG] 成功加入集群！\e[0m"
     echo -e "===================================================================="
 }
 
@@ -332,17 +326,24 @@ rebuild_hk_sdn_matrix() {
     local outbounds_json=""
     local tags_array=""
 
-    while IFS=: read -r prefix tag ip; do
-        if [ "$prefix" = "NODE" ]; then
-            outbounds_json+="{ \"type\": \"direct\", \"tag\": \"out-$tag\", \"server\": \"$ip\", \"server_port\": 443 },"
-            tags_array+="\"out-$tag\","
-        fi
-    done < /etc/sdn_nodes_registry.list
+    if [ -f /etc/sdn_nodes_registry.list ]; then
+        while IFS=: read -r prefix tag ip; do
+            if [ "$prefix" = "NODE" ]; then
+                outbounds_json+="{ \"type\": \"direct\", \"tag\": \"out-$tag\", \"server\": \"$ip\", \"server_port\": 443 },"
+                tags_array+="\"out-$tag\","
+            fi
+        done < /etc/sdn_nodes_registry.list
+    fi
 
     outbounds_json=${outbounds_json%,}
     tags_array=${tags_array%,}
 
-    [ -z "$outbounds_json" ] && outbounds_json="{ \"type\": \"direct\", \"tag\": \"direct\" }" && tags_array="\"direct\"" || outbounds_json+=", { \"type\": \"direct\", \"tag\": \"direct\" }"
+    if [ -z "$outbounds_json" ]; then
+        outbounds_json="{ \"type\": \"direct\", \"tag\": \"direct\" }"
+        tags_array="\"direct\""
+    else
+        outbounds_json+=", { \"type\": \"direct\", \"tag\": \"direct\" }"
+    fi
 
     cat > /etc/sing-box/config.json <<EOF
 {
