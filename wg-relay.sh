@@ -392,13 +392,11 @@ echo "===================================================================="
 read -p "请选择对应操作的数字 [0-4]: " choice
 
 case $choice in
-    1) setup_hk_master ;;
-    2) export_token ;;
-    3) setup_landing_node ;;
-    4) register_node_to_hk ;;
-    0) exit 0 ;;
-    *) echo -e "\033[31m[错误] 输入无效，请重新运行选择 0-4。\033[0m" ;;
-esac
-    done
-}
-menu
+        1) setup_hk_master; read -p "按回车键继续..." ;;
+        2) export_token; read -p "按回车键继续..." ;;
+        3) setup_landing_node; read -p "按回车键继续..." ;;
+        4) register_node_to_hk; read -p "按回车键继续..." ;;
+        0) exit 0 ;;
+        *) echo -e "\033[31m[错误] 输入无效，请重新选择。\033[0m"; sleep 2 ;;
+    esac
+done
