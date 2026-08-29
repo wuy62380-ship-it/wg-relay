@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (支持外部 HTTP/SOCKS5 节点导入版)
+# 跨境软件定义边缘网络系统 (节点管理面板版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -721,10 +721,7 @@ setup_external_proxy() {
 
     (
         flock -x 200
-        # 兼容旧版数据清理
-        sed -i "/^EXT:${NODE_TAG}:/d" /etc/sdn_nodes_registry.list 2>/dev/null || true
-        # 新增带有类型标记的数据格式: EXT:type:tag:server:port:user:pass
-        sed -i "/^EXT:[^:]*:${NODE_TAG}:/d" /etc/sdn_nodes_registry.list 2>/dev/null || true
+        sed -i "/^EXT:${PROXY_TYPE}:${NODE_TAG}:/d" /etc/sdn_nodes_registry.list 2>/dev/null || true
         echo "EXT:${PROXY_TYPE}:${NODE_TAG}:${PROXY_SERVER}:${PROXY_PORT}:${PROXY_USER}:${PROXY_PASS}" >> /etc/sdn_nodes_registry.list
         rebuild_hk_sdn_matrix
         systemctl restart sing-box
@@ -732,51 +729,137 @@ setup_external_proxy() {
 
     echo -e "\n===================================================================="
     echo -e "${G}[√] 外部代理节点 [$NODE_TAG] ($PROXY_TYPE) 成功加入集群！${R}"
-    echo -e "你可以通过选项 5 导出该节点的 VLESS 链接。"
     echo -e "===================================================================="
 }
 
-show_node_links() {
+# ================= 节点管理与链接导出模块 =================
+manage_nodes() {
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
         echo -e "${RED}[错误] 当前服务器未初始化香港总控，或找不到配置文件！${R}"
         return
     fi
     source /etc/sdn_hk_cluster.env
 
-    echo -e "\n===================================================================="
-    echo -e "                   🌐 集群节点 VLESS 接入链接                        "
-    echo -e "===================================================================="
+    while true; do
+        clear
+        echo -e "${G}====================================================================${R}"
+        echo -e "${G}                   🌐 集群节点管理与链接导出                        ${R}"
+        echo -e "${G}====================================================================${R}"
+        
+        local nodes_list=()
+        local idx=1
+        
+        if [ -f /etc/sdn_nodes_registry.list ]; then
+            while IFS=: read -r prefix p1 p2 p3 p4 p5 p6; do
+                if [ "$prefix" = "NODE" ]; then
+                    echo -e "${C}[$idx]${R} 内网落地: ${G}${p1}${R} (隧道IP: ${Y}${p2}${R})"
+                    nodes_list+=("NODE:${p1}")
+                    ((idx++))
+                elif [ "$prefix" = "EXT" ]; then
+                    echo -e "${C}[$idx]${R} 外部代理: ${G}${p2}${R} (${Y}${p1}://${p3}:${p4}${R})"
+                    nodes_list+=("EXT:${p2}")
+                    ((idx++))
+                fi
+            done < /etc/sdn_nodes_registry.list
+        fi
 
-    if [ ! -f "/etc/sdn_nodes_registry.list" ] || [ ! -s "/etc/sdn_nodes_registry.list" ]; then
-        echo -e "${Y}[提示] 暂未注册任何落地节点。${R}"
-    else
-        echo -e "\n${H}=== 直连落地节点 (需服务器部署) ===${R}"
-        while IFS=: read -r prefix p1 p2 p3 p4 p5 p6; do
-            if [ "$prefix" = "NODE" ]; then
-                echo -e "\n📌 节点标识: ${G}${p1}${R}  |  隧道 IP: ${Y}${p2}${R}"
-                echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${p1}${R}"
-            fi
-        done < /etc/sdn_nodes_registry.list
-
-        echo -e "\n${H}=== 外部 HTTP / SOCKS5 代理节点 (现成IP导入) ===${R}"
-        while IFS=: read -r prefix p1 p2 p3 p4 p5 p6; do
-            if [ "$prefix" = "EXT" ]; then
-                echo -e "\n🌍 外部代理: ${G}${p2}${R}  |  协议: ${Y}${p1}${R} | 目标: ${Y}${p3}:${p4}${R}"
-                echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-EXT-${p2}${R}"
-            fi
-        done < /etc/sdn_nodes_registry.list
-
-        if [ -f "/etc/sdn_chains_registry.list" ] && [ -s "/etc/sdn_chains_registry.list" ]; then
-            echo -e "\n${H}=== 多级链式级联节点 ===${R}"
+        if [ -f /etc/sdn_chains_registry.list ]; then
             while IFS=: read -r prefix chain_tag node1 node2; do
                 if [ "$prefix" = "CHAIN" ]; then
-                    echo -e "\n🔗 链式组合: ${G}${chain_tag}${R}  |  链路: 香港 -> ${Y}${node1}${R} -> ${Y}${node2}${R} -> 目标"
-                    echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-Chain-${chain_tag}${R}"
+                    echo -e "${C}[$idx]${R} 链式代理: ${G}${chain_tag}${R} (${Y}${node1} -> ${node2}${R})"
+                    nodes_list+=("CHAIN:${chain_tag}")
+                    ((idx++))
                 fi
             done < /etc/sdn_chains_registry.list
         fi
-    fi
-    echo -e "\n===================================================================="
+        
+        if [ ${#nodes_list[@]} -eq 0 ]; then
+            echo -e "${Y}当前没有任何节点。${R}"
+            echo -e "===================================================================="
+            read -p "按回车键返回主菜单..."
+            break
+        fi
+
+        echo -e "${G}====================================================================${R}"
+        echo -e "输入序号查看对应节点 VLESS 链接"
+        echo -e "输入 ${RED}d 序号${G} 删除节点 (例如 d 2)"
+        echo -e "输入 0 返回主菜单"
+        echo -e "===================================================================="
+        read -p "操作: " input
+
+        if [[ "$input" == "0" ]] || [ -z "$input" ]; then
+            break
+        elif [[ "$input" =~ ^d\ ([0-9]+)$ ]]; then
+            local del_idx=${BASH_REMATCH[1]}
+            if [ "$del_idx" -ge 1 ] && [ "$del_idx" -le "${#nodes_list[@]}" ]; then
+                local target="${nodes_list[$((del_idx-1))]}"
+                local type=$(echo "$target" | cut -d':' -f1)
+                local tag=$(echo "$target" | cut -d':' -f2)
+
+                echo -e "${Y}正在删除节点: $tag ...${R}"
+                
+                (
+                    flock -x 200
+                    if [ "$type" = "NODE" ]; then
+                        sed -i "/^NODE:${tag}:/d" /etc/sdn_nodes_registry.list
+                        systemctl stop "udp2raw-${tag}.service" 2>/dev/null || true
+                        systemctl disable "udp2raw-${tag}.service" 2>/dev/null || true
+                        rm -f "/etc/systemd/system/udp2raw-${tag}.service"
+                        systemctl daemon-reload
+                        
+                        # 清理 WireGuard 配置
+                        awk -v t="$tag" '
+                        BEGIN { skip=0 }
+                        /^# Node: / {
+                            if ($0 == "# Node: " t) { skip=1; next }
+                        }
+                        /^\[Peer\]/ { skip=0 }
+                        !skip { print }
+                        ' /etc/wireguard/wg0.conf > /tmp/wg0.conf.tmp && mv /tmp/wg0.conf.tmp /etc/wireguard/wg0.conf
+                        systemctl restart wg-quick@wg0 2>/dev/null || true
+
+                    elif [ "$type" = "EXT" ]; then
+                        sed -i "/^EXT:[^:]*:${tag}:/d" /etc/sdn_nodes_registry.list
+                    elif [ "$type" = "CHAIN" ]; then
+                        sed -i "/^CHAIN:${tag}:/d" /etc/sdn_chains_registry.list
+                    fi
+                    
+                    rebuild_hk_sdn_matrix
+                    systemctl restart sing-box
+                ) 200>/var/lock/sdn_registry.lock
+
+                echo -e "${G}[√] 节点 $tag 已删除！${R}"
+                sleep 1
+            else
+                echo -e "${RED}无效的序号！${R}"
+                sleep 1
+            fi
+        elif [[ "$input" =~ ^[0-9]+$ ]]; then
+            local view_idx=$input
+            if [ "$view_idx" -ge 1 ] && [ "$view_idx" -le "${#nodes_list[@]}" ]; then
+                local target="${nodes_list[$((view_idx-1))]}"
+                local type=$(echo "$target" | cut -d':' -f1)
+                local tag=$(echo "$target" | cut -d':' -f2)
+                
+                echo -e "\n${H}=== VLESS 接入链接 ===${R}"
+                if [ "$type" = "CHAIN" ]; then
+                    echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-Chain-${tag}${R}"
+                elif [ "$type" = "EXT" ]; then
+                    echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-EXT-${tag}${R}"
+                elif [ "$type" = "NODE" ]; then
+                    echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${tag}${R}"
+                fi
+                echo ""
+                read -p "按回车键继续..."
+            else
+                echo -e "${RED}无效的序号！${R}"
+                sleep 1
+            fi
+        else
+            echo -e "${RED}输入无效！${R}"
+            sleep 1
+        fi
+    done
 }
 
 setup_chain_proxy() {
@@ -911,7 +994,7 @@ while true; do
     echo " 2. 【第二步：香港中转机】生成落地机对接凭证代码"
     echo " 3. 【第三步：落地机(动态/静态均可)】配置并加入集群"
     echo " 4. 【第四步：香港总控】输入落地机注册密文完成组网"
-    echo " 5. 【香港总控】查看/导出所有节点的 VLESS 接入链接"
+    echo " 5. 【香港总控】节点管理 (查看链接 / 删除节点)"
     echo " 6. 【香港总控】配置多级链式代理 (例如: 香港->tw3->jp1)"
     echo " 7. 【系统工具】BBR / BBRv3 算法独立切换与内核管理 (含卸载)"
     echo " 8. 【香港总控】添加外部 HTTP / SOCKS5 代理节点 (直接使用现成IP)"
@@ -926,7 +1009,7 @@ while true; do
         2) export_token; read -p "按回车键继续..." ;;
         3) setup_landing_node; read -p "按回车键继续..." ;;
         4) register_node_to_hk; read -p "按回车键继续..." ;;
-        5) show_node_links; read -p "按回车键继续..." ;;
+        5) manage_nodes ;;
         6) setup_chain_proxy; read -p "按回车键继续..." ;;
         7) manage_bbr ;;
         8) setup_external_proxy; read -p "按回车键继续..." ;;
