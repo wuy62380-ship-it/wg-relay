@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (工业级最终加固与完整功能版 - 修复 GPG 参数 bug)
+# 跨境软件定义边缘网络系统 (集成 XanMod BBRv3 架构级适配版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -22,6 +22,139 @@ detect_hardware_and_bandwidth() {
     TOTAL_MEM_GB=$(awk "BEGIN {printf \"%.1f\", $TOTAL_MEM_MB / 1024}")
     
     echo -e "    -> CPU核心: \033[36m${CPU_CORES}核 | 物理内存: ${TOTAL_MEM_GB}GB\033[0m"
+}
+
+# ================= XanMod & BBRv3 核心检测与安装逻辑 =================
+
+xanmod_add_repo() {
+    local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
+    local list_file="/etc/apt/sources.list.d/xanmod-release.list"
+    local key_url="https://dl.xanmod.org/archive.key"
+    local os_codename=""
+
+    if command -v lsb_release >/dev/null 2>&1; then
+        os_codename=$(lsb_release -sc)
+    elif [ -r /etc/os-release ]; then
+        os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+    fi
+
+    if ! echo "bookworm trixie forky sid noble plucky questing resolute faye gigi wilma xia zara zena" | grep -qw "$os_codename"; then
+        os_codename="releases"
+    fi
+
+    if echo "jammy focal bullseye buster" | grep -qw "$os_codename"; then
+        echo -e "\033[31m[错误] XanMod 官方已停止对当前系统 ($os_codename) 的 APT 源支持，请升级至 Debian 12 / Ubuntu 24.04 或更高版本。\033[0m"
+        return 1
+    fi
+
+    if [ -z "$os_codename" ]; then
+        echo -e "\033[31m[错误] 无法获取系统版本代号，无法配置 XanMod 源。\033[0m"
+        return 1
+    fi
+
+    echo -e "\033[32m[+] 正在安装系统基础依赖并导入 XanMod GPG 密钥...\033[0m"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y wget gnupg ca-certificates >/dev/null 2>&1
+    
+    mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+    if ! wget -qO - "$key_url" | gpg --dearmor -o "$keyring" --yes; then
+        echo -e "\033[31m[错误] XanMod 官方密钥下载失败，请检查网络连接！\033[0m"
+        return 1
+    fi
+    chmod 644 "$keyring"
+    echo "deb [signed-by=$keyring] http://deb.xanmod.org $os_codename main" > "$list_file"
+    echo -e "\033[32m[√] XanMod APT 软件源配置完成 (系统代号: $os_codename)\033[0m"
+}
+
+xanmod_detect_psabi_level() {
+    local psabi_output=""
+    psabi_output=$(awk 'BEGIN {
+        while (!/flags/) if (getline < "/proc/cpuinfo" != 1) exit 1
+        if (/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level = 1
+        if (level == 1 && /cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level = 2
+        if (level == 2 && /avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level = 3
+        if (level == 3 && /avx512f/&&/avx512bw/&&/avx512cd/&&/avx512dq/&&/avx512vl/) level = 4
+        if (level > 0) { print level; exit }
+        exit 1
+    }' /proc/cpuinfo 2>/dev/null) || return 1
+    printf '%s' "$psabi_output" | tr -dc '0-9' | head -c 1
+}
+
+xanmod_package_available() {
+    local package="$1"
+    apt-cache policy "$package" 2>/dev/null | grep -q 'Candidate: [^ ]'
+}
+
+xanmod_detect_package() {
+    local psabi_level=""
+    local level=""
+    local package=""
+    local prefix_list="linux-xanmod linux-xanmod-lts"
+
+    psabi_level=$(xanmod_detect_psabi_level) || return 1
+    [ -n "$psabi_level" ] || return 1
+    [ "$psabi_level" -gt 3 ] && psabi_level=3
+
+    apt-get update -y >/dev/null 2>&1
+
+    for prefix in $prefix_list; do
+        level="$psabi_level"
+        while [ "$level" -ge 1 ]; do
+            package="${prefix}-x64v${level}"
+            if xanmod_package_available "$package"; then
+                echo -e "\033[32m[√] 自动匹配 CPU 微架构级别 (x64v${level})，最佳内核包: $package\033[0m" >&2
+                printf '%s\n' "$package"
+                return 0
+            fi
+            level=$((level - 1))
+        done
+    done
+
+    echo -e "\033[31m[错误] 软件源中未找到适配此 CPU 的 XanMod 内核包！\033[0m" >&2
+    return 1
+}
+
+xanmod_installed() {
+    dpkg-query -W -f='${Package}\n' 'linux-*xanmod*' 2>/dev/null | grep -q '^linux-.*xanmod'
+}
+
+install_xanmod_bbr3() {
+    echo -e "\n===================================================================="
+    echo -e "           🚀 一键升级 Linux 内核至 XanMod (支持 BBRv3)              "
+    echo -e "===================================================================="
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo -e "\033[31m[错误] 目前一键内核升级仅支持 Debian / Ubuntu 系统 (apt)！\033[0m"
+        return 1
+    fi
+
+    read -p "确认要开始安装/升级 XanMod BBRv3 内核吗？安装后需要重启服务器 [y/N]: " confirm_install
+    if [[ ! "$confirm_install" =~ ^[Yy]$ ]]; then
+        return 0
+    fi
+
+    xanmod_add_repo || return 1
+
+    local package=""
+    package=$(xanmod_detect_package) || {
+        echo -e "\033[31m[错误] 无法识别当前 CPU 或未找到适配包，升级取消。\033[0m"
+        return 1
+    }
+
+    echo -e "\033[32m[+] 正在下载并安装最佳架构内核包 ($package)... \033[0m"
+    apt-get update -y
+    if apt-get install -y "$package"; then
+        echo -e "\n\033[32m[√] XanMod 内核安装完成！\033[0m"
+        read -p "系统需要重启以加载新内核，是否立即重启？[y/N]: " reboot_now
+        if [[ "$reboot_now" =~ ^[Yy]$ ]]; then
+            echo -e "\033[33m正在重启系统，请稍后重新连接 SSH...\033[0m"
+            reboot
+        else
+            echo -e "\033[33m请稍后手动重启服务器 (\`reboot\`) 以激活新内核与 BBRv3。\033[0m"
+        fi
+    else
+        echo -e "\033[31m[错误] XanMod 内核安装失败，请检查网络连接或兼容性。\033[0m"
+    fi
 }
 
 apply_ultimate_kernel() {
@@ -86,43 +219,6 @@ EOF
     echo -e "\033[32m[√] TCP 拥塞控制算法已成功切换为: ${target_algo}\033[0m"
 }
 
-install_xanmod_bbr3() {
-    echo -e "\n===================================================================="
-    echo -e "           🚀 一键升级 Linux 内核至 XanMod (含 BBRv3)              "
-    echo -e "===================================================================="
-    if ! command -v apt-get >/dev/null 2>&1; then
-        echo -e "\033[31m[错误] 目前一键内核升级仅支持 Debian / Ubuntu 系统 (apt)！\033[0m"
-        return 1
-    fi
-
-    read -p "确认要开始安装 XanMod BBRv3 内核吗？安装后需要重启服务器 [y/N]: " confirm_install
-    if [[ ! "$confirm_install" =~ ^[Yy]$ ]]; then
-        return 0
-    fi
-
-    echo -e "\033[32m[+] 正在配置 XanMod 官方 APT 密钥与软件源...\033[0m"
-    apt-get update && apt-get install -y wget gnupg
-    
-    # 修正 gpg 覆盖参数 --yes
-    wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o /usr/share/keyrings/xanmod-archive-keyring.gpg
-    echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
-
-    echo -e "\033[32m[+] 正在下载并安装包含 BBRv3 的最新 XanMod 内核...\033[0m"
-    apt-get update
-    if apt-get install -y linux-xanmod-x64v3 || apt-get install -y linux-xanmod-x64v2; then
-        echo -e "\n\033[32m[√] XanMod 内核安装完成！\033[0m"
-        read -p "系统需要重启以加载新内核，是否立即重启？[y/N]: " reboot_now
-        if [[ "$reboot_now" =~ ^[Yy]$ ]]; then
-            echo -e "\033[33m正在重启系统，请稍后重新连接 SSH...\033[0m"
-            reboot
-        else
-            echo -e "\033[33m请稍后手动重启服务器 (`reboot`) 以激活新内核与 BBRv3。\033[0m"
-        fi
-    else
-        echo -e "\033[31m[错误] XanMod 内核安装失败，请检查网络连接或服务器架构兼容性。\033[0m"
-    fi
-}
-
 manage_bbr() {
     while true; do
         clear
@@ -134,12 +230,17 @@ manage_bbr() {
         echo "===================================================================="
         echo -e "当前 TCP 拥塞控制算法 : \033[32m${CURRENT_ALGO}\033[0m"
         echo -e "当前队列调度算法     : \033[36m${CURRENT_QDISC}\033[0m"
+        if xanmod_installed; then
+            echo -e "XanMod 内核状态      : \033[32m已安装 (已支持 BBRv3)\033[0m"
+        else
+            echo -e "XanMod 内核状态      : \033[33m未安装\033[0m"
+        fi
         echo "--------------------------------------------------------------------"
         lsmod | grep bbr || echo -e "\033[33m[提示] 当前未在 lsmod 中发现已加载的 bbr 模块\033[0m"
         echo "===================================================================="
         echo " 1. 切换/开启 原版标准 BBR (内核自带)"
         echo " 2. 切换/开启 BBRv3 (需系统内核支持 tcp_bbr3)"
-        echo " 3. 一键安装 XanMod 内核 (升级系统以获得 BBRv3 支持)"
+        echo " 3. 一键安装/更新 XanMod 内核 (智能匹配 CPU x64v1~v4)"
         echo " 4. 还原为 CUBIC 默认算法"
         echo " 0. 返回主菜单"
         echo "===================================================================="
@@ -608,7 +709,7 @@ rebuild_hk_sdn_matrix() {
 EOF
 }
 
-# 脚本入口
+# 脚本主程序入口
 check_root
 
 while true; do
