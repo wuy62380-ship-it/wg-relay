@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (修复策略组逻辑版)
+# 跨境软件定义边缘网络系统 (安全加固与无感热载生产版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -46,13 +46,8 @@ xanmod_add_repo() {
         os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
     fi
 
-    if ! echo "bookworm trixie forky sid noble plucky questing resolute faye gigi wilma xia zara zena" | grep -qw "$os_codename"; then
-        os_codename="releases"
-    fi
-
-    if echo "jammy focal bullseye buster" | grep -qw "$os_codename" || [ "$os_codename" = "releases" ]; then
-        echo -e "${RED}XanMod 官方已停止对当前系统($os_codename)的 APT 源支持，请升级至 Debian12 / Ubuntu24 或更高版本。${R}"
-        return 1
+    if echo "focal buster" | grep -qw "$os_codename"; then
+        echo -e "${Y}[警告] 当前系统($os_codename)可能已不在 XanMod 官方主线支持列表中。如遇安装失败请考虑升级系统。${R}"
     fi
 
     if [ -z "$os_codename" ]; then
@@ -61,8 +56,9 @@ xanmod_add_repo() {
     fi
 
     echo -e "${Y}正在安装依赖并配置 XanMod 官方 HTTPS 源...${R}"
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y wget gnupg ca-certificates apt-transport-https >/dev/null 2>&1 || true
+    apt-get install -yq wget gnupg ca-certificates apt-transport-https >/dev/null 2>&1 || true
     mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
     if ! wget -qO - "$key_url" | gpg --dearmor -o "$keyring" --yes; then
         echo -e "${RED}官方密钥下载失败${R}"
@@ -159,6 +155,7 @@ ask_reboot() {
 xanmod_install_or_update() {
     local action="$1"
     local package=""
+    export DEBIAN_FRONTEND=noninteractive
 
     xanmod_add_repo || {
         echo -e "${RED}XanMod官方仓库配置失败，请稍后重试${R}"
@@ -172,12 +169,12 @@ xanmod_install_or_update() {
 
     echo -e "${Y}正在更新软件源并安装内核 (包大小约100MB，请耐心等待)...${R}"
     if [ "$action" = "update" ]; then
-        apt-get install -y --only-upgrade "$package" || apt-get install -y "$package" || {
+        apt-get install -yq --only-upgrade "$package" || apt-get install -yq "$package" || {
             echo -e "${RED}XanMod内核更新失败，请检查软件源或稍后重试${R}"
             return 1
         }
     else
-        apt-get install -y "$package" || {
+        apt-get install -yq "$package" || {
             echo -e "${RED}XanMod内核安装失败，请检查软件源或稍后重试${R}"
             return 1
         }
@@ -191,8 +188,9 @@ xanmod_install_or_update() {
 
 xanmod_uninstall() {
     echo -e "${Y}正在卸载 XanMod 内核...${R}"
-    apt-get purge -y 'linux-*xanmod*'
-    apt-get autoremove -y
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get purge -yq 'linux-*xanmod*'
+    apt-get autoremove -yq
     if command -v update-grub >/dev/null 2>&1; then
         sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=0/g' /etc/default/grub
         update-grub
@@ -338,32 +336,21 @@ manage_bbr() {
         read -p "请选择具体操作 [0-4]: " bbr_choice
 
         case $bbr_choice in
-            1)
-                set_bbr_algo "bbr"
-                read -p "按回车键继续..." ;;
-            2)
-                set_bbr_algo "bbr3"
-                read -p "按回车键继续..." ;;
-            3)
-                xanmod_manage ;;
-            4)
-                set_bbr_algo "cubic"
-                read -p "按回车键继续..." ;;
-            0)
-                break ;;
-            *)
-                echo -e "${RED}[错误] 输入无效，请重新选择。${R}"; sleep 1 ;;
+            1) set_bbr_algo "bbr"; read -p "按回车键继续..." ;;
+            2) set_bbr_algo "bbr3"; read -p "按回车键继续..." ;;
+            3) xanmod_manage ;;
+            4) set_bbr_algo "cubic"; read -p "按回车键继续..." ;;
+            0) break ;;
+            *) echo -e "${RED}[错误] 输入无效，请重新选择。${R}"; sleep 1 ;;
         esac
     done
 }
 
 apply_ultimate_kernel() {
     local target_algo="${1:-auto}"
-    
     if [ "$target_algo" = "auto" ]; then
         target_algo="bbr"
     fi
-
     set_bbr_algo "$target_algo" || true
 }
 
@@ -390,10 +377,11 @@ install_dependencies() {
     fi
 
     if [ ! -f "/usr/local/bin/sing-box" ]; then
-        local VER=""
-        VER=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/' || true)
-        if [ -z "$VER" ]; then
-            VER="1.8.8"
+        # 防 API 限流策略，通过解析重定向链接获取最新版本号
+        local LATEST_URL=$(curl -w "%{url_effective}" -I -L -s -S https://github.com/SagerNet/sing-box/releases/latest -o /dev/null || true)
+        local VER=$(echo "$LATEST_URL" | awk -F'/v' '{print $NF}')
+        if [ -z "$VER" ] || [[ ! "$VER" =~ ^[0-9] ]]; then
+            VER="1.9.3" # 保底稳定版本
         fi
         wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${SB_ARCH}.tar.gz" || true
         if [ -f "sing-box.tar.gz" ]; then
@@ -421,7 +409,8 @@ get_pub_ip() {
 }
 
 setup_hk_master() {
-    apt-get update && apt-get install -y wireguard wireguard-tools curl jq iptables iproute2 uuid-runtime systemd
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -yq wireguard wireguard-tools curl jq iptables iproute2 uuid-runtime systemd iptables-persistent python3
     detect_hardware_and_bandwidth
     apply_ultimate_kernel "auto"
     install_dependencies
@@ -448,6 +437,12 @@ EOF
     KEYS=$(sing-box generate reality-keypair 2>/dev/null || echo "")
     PRIVATE_KEY=$(echo "$KEYS" | grep Private | awk '{print $3}' || echo "")
     PUBLIC_KEY=$(echo "$KEYS" | grep Public | awk '{print $3}' || echo "")
+    
+    if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+        echo -e "${RED}[致命错误] Sing-box Reality 证书生成失败！可能是 Sing-box 下载不完整或服务器环境不兼容。${R}"
+        exit 1
+    fi
+    
     SHORT_ID=$(openssl rand -hex 8)
 
     mkdir -p /etc/sing-box
@@ -478,7 +473,9 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
+    # 防重置持久化规则
     iptables -I INPUT -p tcp --dport $CLIENT_PORT -j ACCEPT || true
+    netfilter-persistent save >/dev/null 2>&1 || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 
     systemctl daemon-reload
     systemctl enable --now wg-quick@wg0 sing-box
@@ -524,7 +521,8 @@ export_token() {
 }
 
 setup_landing_node() {
-    apt-get update && apt-get install -y wireguard wireguard-tools curl jq iptables uuid-runtime systemd
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -yq wireguard wireguard-tools curl jq iptables uuid-runtime systemd iptables-persistent python3
     detect_hardware_and_bandwidth
     apply_ultimate_kernel "auto"
     install_dependencies
@@ -538,7 +536,6 @@ setup_landing_node() {
     SUBNET_PREFIX=$(echo "$DECODED" | cut -d'|' -f4)
     FAKE_PORT=$(echo "$DECODED" | cut -d'|' -f5)
 
-    # 强制校验节点名称 (支持中文，拦截破坏性特殊符号)
     while true; do
         read -p "为此落地机起个名字 [例如: 台湾 或 jp1]: " NODE_TAG
         if [ -z "$NODE_TAG" ]; then
@@ -550,7 +547,6 @@ setup_landing_node() {
         fi
     done
 
-    # 强制校验内网编号
     while true; do
         read -p "分配内网编号 [2-254]: " HOST_ID
         if [[ "$HOST_ID" =~ ^[0-9]+$ ]] && [ "$HOST_ID" -ge 2 ] && [ "$HOST_ID" -le 254 ]; then
@@ -599,6 +595,7 @@ After=udp2raw.service
 Wants=udp2raw.service
 EOF
 
+    # 封堵 0.0.0.0 SOCKS 漏洞，严格限制为内网 IP 监听
     mkdir -p /etc/sing-box
     cat > /etc/sing-box/config.json <<EOF
 {
@@ -606,7 +603,7 @@ EOF
     {
       "type": "socks",
       "tag": "socks-in",
-      "listen": "0.0.0.0",
+      "listen": "$LAND_IP",
       "listen_port": 10808
     }
   ],
@@ -663,9 +660,12 @@ register_node_to_hk() {
 PublicKey = $LAND_PUB
 AllowedIPs = $LAND_IP/32
 EOF
-    systemctl restart wg-quick@wg0
+    
+    # 无感热重载，替代 systemctl restart 防止大面积断流
+    wg set wg0 peer "$LAND_PUB" allowed-ips "$LAND_IP/32" 2>/dev/null || systemctl reload wg-quick@wg0 2>/dev/null || true
 
     iptables -I INPUT -p tcp --dport $FAKE_PORT -j ACCEPT || true
+    netfilter-persistent save >/dev/null 2>&1 || true
 
     cat > /etc/systemd/system/udp2raw-${NODE_TAG}.service <<EOF
 [Unit]
@@ -695,6 +695,11 @@ EOF
 }
 
 # ================= 多协议链接解析器 =================
+decode_url() {
+    # 彻底解决 Bash URL Decode 特殊字符替换崩溃问题
+    python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1]))" "$1" 2>/dev/null || echo "$1"
+}
+
 parse_proxy_link() {
     local link="$1"
     local tag="$2"
@@ -717,7 +722,7 @@ parse_proxy_link() {
         query="$query_tag"
     fi
     
-    [ -z "$tag" ] && tag="$link_tag"
+    [ -z "$tag" ] && tag="$(decode_url "$link_tag")"
     tag=$(echo "$tag" | sed 's/[^a-zA-Z0-9_\-\x80-\xff]//g')
     [ -z "$port" ] && return 1
 
@@ -731,13 +736,13 @@ parse_proxy_link() {
         case "$k" in
             flow) flow="$v" ;;
             security) security="$v" ;;
-            sni) sni="$v" ;;
+            sni) sni=$(decode_url "$v") ;;
             fp) fp="$v" ;;
             pbk) pbk="$v" ;;
             sid) sid="$v" ;;
             type) type="$v" ;;
-            path) path=$(printf '%b' "${v//%/\\x}") ;;
-            host) host="$v" ;;
+            path) path=$(decode_url "$v") ;;
+            host) host=$(decode_url "$v") ;;
             alpn) alpn="$v" ;;
             insecure) insecure="$v" ;;
         esac
@@ -782,9 +787,7 @@ parse_proxy_link() {
             fi
             json_str+=" }"
             ;;
-        *)
-            return 1
-            ;;
+        *) return 1 ;;
     esac
     echo "$json_str"
 }
@@ -826,7 +829,7 @@ setup_external_proxy() {
         fi
         
         local temp_tag="${proxy_link##*#}"
-        temp_tag=$(echo "$temp_tag" | sed 's/[^a-zA-Z0-9_\-\x80-\xff]//g')
+        temp_tag=$(decode_url "$temp_tag" | sed 's/[^a-zA-Z0-9_\-\x80-\xff]//g')
         if [ -z "$temp_tag" ]; then
             read -p "请输入节点名称 [例如: 台湾-VLESS]: " node_tag
         else
@@ -983,7 +986,9 @@ manage_nodes() {
                         /^\[Peer\]/ { skip=0 }
                         !skip { print }
                         ' /etc/wireguard/wg0.conf > /tmp/wg0.conf.tmp && mv /tmp/wg0.conf.tmp /etc/wireguard/wg0.conf
-                        systemctl restart wg-quick@wg0 2>/dev/null || true
+                        
+                        # 同步并热重载 WireGuard 删除的节点，完全杜绝全局重置掉线
+                        wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || systemctl reload wg-quick@wg0 2>/dev/null || true
 
                     elif [ "$type" = "EXT" ]; then
                         sed -i "/^EXT:[^:]*:${tag}:/d" /etc/sdn_nodes_registry.list
@@ -1123,7 +1128,6 @@ rebuild_hk_sdn_matrix() {
     outbounds_json=${outbounds_json%,}
     tags_array=${tags_array%,}
 
-    # 构建策略组的 outbounds 数组
     local urltest_tag="🚀 智能测速自动优选"
     local selector_tag="🎯 手动指定切换节点"
     
@@ -1177,7 +1181,6 @@ rebuild_hk_sdn_matrix() {
 }
 EOF
 
-    # 安全预检与防断网回滚机制
     if /usr/local/bin/sing-box check -c "$temp_conf" >/dev/null 2>&1; then
         cp "$temp_conf" /etc/sing-box/config.json
         rm -f "$temp_conf"
@@ -1260,7 +1263,7 @@ while true; do
     clear
     CURRENT_BBR=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || echo "未检测")
     echo "===================================================================="
-    echo "    跨境软件定义边缘网络 (集群管理面板)"
+    echo "    跨境软件定义边缘网络 (集群管理面板 - 生产修复版)"
     echo -e "    当前内核拥塞控制算法: [ ${G}${CURRENT_BBR}${R} ]"
     echo "===================================================================="
     echo " 1. 【第一步：香港中转机】初始化总控中心"
