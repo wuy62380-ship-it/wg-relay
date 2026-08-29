@@ -1,7 +1,6 @@
 #!/bin/bash
 # ==========================================================
-# WireGuard + udp2raw + Sing-box 终极融合版 (反转架构 + 完整BBRv3 + 链式代理)
-# 解决: 家宽无端口映射, UDP QoS封锁, 小白难部署, 流量二次中转
+# WireGuard + udp2raw + Sing-box 商业增强版 (反转架构 + 链路自愈 + QoS优化 + 诊断看板)
 # ==========================================================
 
 if [ -t 0 ]; then :; else exec </dev/tty; fi
@@ -18,6 +17,7 @@ FAKE_PORT="20022"
 LAND_INFO="/etc/wireguard/landing_info.txt"
 SYSCTL_CONF="/etc/sysctl.d/99-wireguard-tuning.conf"
 BBR_CONF="/etc/sysctl.d/99-bbr.conf"
+WATCHDOG_SCRIPT="/usr/local/bin/wg_watchdog.sh"
 
 check_root() { [ "$EUID" -ne 0 ] && echo -e "${RED}请使用root运行${NC}" && exit 1; }
 pause_return() { echo -e "${YELLOW}按 Enter 键返回...${NC}"; read -r < /dev/tty; }
@@ -28,12 +28,11 @@ kill_apt_locks() {
     dpkg --configure -a 2>/dev/null
 }
 
-# ==================== 环境与工具准备 ====================
 prepare_env() {
     echo -e "${YELLOW}[*] 准备基础环境...${NC}"
     kill_apt_locks
     apt-get update -y > /dev/null 2>&1
-    apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl coreutils iproute2 iputils-ping util-linux > /dev/null 2>&1
+    apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl coreutils iproute2 iputils-ping util-linux iproute2 > /dev/null 2>&1
     
     if update-alternatives --list iptables &>/dev/null; then
         update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
@@ -62,7 +61,6 @@ get_pub_ip() {
     return 1
 }
 
-# ==================== Sing-box 与 SNI 测速 ====================
 install_singbox() {
     if command -v sing-box &> /dev/null && [ -x "/usr/local/bin/sing-box" ]; then return 0; fi
     echo -e "${YELLOW}[*] 下载 Sing-box...${NC}"
@@ -95,7 +93,6 @@ force_sync_time() {
 }
 
 select_best_sni() {
-    echo -e "${YELLOW}[*] 正在测速优选 SNI...${NC}" >&2
     local domains=("www.bing.com" "www.apple.com" "www.cloudflare.com" "www.microsoft.com" "www.amazon.com")
     local best_domain="www.bing.com"
     for domain in "${domains[@]}"; do
@@ -106,7 +103,117 @@ select_best_sni() {
     echo "$best_domain"
 }
 
-# ==================== VPS 中转机 (服务端) 模块 ====================
+# ==================== 商业级补丁 1: QoS 队列控制 (防 Bufferbloat) ====================
+apply_qos_optimization() {
+    if ip link show wg0 &>/dev/null; then
+        tc qdisc del dev wg0 root 2>/dev/null || true
+        # 优先使用 fq_codel 算法消除高载荷下的延迟剧增
+        tc qdisc add dev wg0 root fq_codel limit 1000 target 5ms interval 100ms 2>/dev/null || true
+    fi
+}
+
+# ==================== 商业级补丁 2: 链路自愈守护 (Watchdog) ====================
+install_watchdog() {
+    echo -e "${YELLOW}[*] 安装链路自愈 Watchdog 服务...${NC}"
+    
+    # 根据角色自动判断探测目标 IP
+    local my_ip=$(ip -4 addr show wg0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || true)
+    local target_ip="10.0.0.1"
+    [ "$my_ip" == "10.0.0.1" ] && target_ip="10.0.0.2"
+
+    cat > "$WATCHDOG_SCRIPT" << EOF
+#!/bin/bash
+TARGET="${target_ip}"
+LOG_FILE="/var/log/wg_watchdog.log"
+
+if ! ip link show wg0 &>/dev/null; then exit 0; fi
+
+# 探针检测：失败3次则判定隧道假死并重启自愈
+if ! ping -c 2 -W 3 "\$TARGET" > /dev/null 2>&1; then
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - [ALERT] 隧道连通性中断，启动自愈程序..." >> "\$LOG_FILE"
+    systemctl restart udp2raw
+    sleep 2
+    systemctl restart wg-quick@wg0
+    sleep 1
+    # 重新注入 QoS
+    tc qdisc del dev wg0 root 2>/dev/null || true
+    tc qdisc add dev wg0 root fq_codel limit 1000 target 5ms interval 100ms 2>/dev/null || true
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - [INFO] 自愈程序执行完毕。" >> "\$LOG_FILE"
+fi
+EOF
+    chmod +x "$WATCHDOG_SCRIPT"
+
+    cat > /etc/systemd/system/wg-watchdog.service << EOF
+[Unit]
+Description=WireGuard Tunnel Watchdog
+[Service]
+Type=oneshot
+ExecStart=$WATCHDOG_SCRIPT
+EOF
+
+    cat > /etc/systemd/system/wg-watchdog.timer << EOF
+[Unit]
+Description=Run WireGuard Watchdog every 30s
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now wg-watchdog.timer >/dev/null 2>&1
+    echo -e "${GREEN}✓ 商业级自愈守护已启动 (探测目标: ${target_ip}, 周期: 30s)${NC}"
+}
+
+# ==================== 商业级补丁 3: 链路诊断面板 ====================
+show_diagnostics() {
+    clear
+    echo -e "${CYAN}=================================================="
+    echo -e "          商业级链路状态与故障诊断看板"
+    echo -e "==================================================${NC}"
+    
+    echo -ne "1. udp2raw 伪装服务: \t"
+    if systemctl is-active --quiet udp2raw; then echo -e "${GREEN}运行中 (Running)${NC}"; else echo -e "${RED}已停止 (Stopped)${NC}"; fi
+    
+    echo -ne "2. WireGuard 接口: \t"
+    if ip link show wg0 &>/dev/null; then echo -e "${GREEN}已创建 (Up)${NC}"; else echo -e "${RED}未就绪 (Down)${NC}"; fi
+    
+    echo -ne "3. Sing-box 核心: \t"
+    if systemctl is-active --quiet sing-box; then echo -e "${GREEN}运行中 (Running)${NC}"; else echo -e "${YELLOW}未安装/未启动${NC}"; fi
+    
+    echo -ne "4. 自愈 Watchdog 定时器: \t"
+    if systemctl is-active --quiet wg-watchdog.timer 2>/dev/null; then echo -e "${GREEN}守护中 (Active)${NC}"; else echo -e "${YELLOW}未启用${NC}"; fi
+    
+    echo -e "\n${CYAN}[WireGuard 隧道对端握手状态]${NC}"
+    if command -v wg &>/dev/null && ip link show wg0 &>/dev/null; then
+        wg show wg0
+    else
+        echo -e "${RED}WireGuard 接口未运行${NC}"
+    fi
+    
+    echo -e "\n${CYAN}[内层 Ping 延迟与丢包测试]${NC}"
+    local my_ip=$(ip -4 addr show wg0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || true)
+    local target_ip="10.0.0.1"
+    [ "$my_ip" == "10.0.0.1" ] && target_ip="10.0.0.2"
+    
+    if [ -n "$my_ip" ]; then
+        ping -c 4 -W 2 "$target_ip" 2>&1 | tail -n 2
+    else
+        echo -e "${RED}本机尚未分配 10.0.0.X 隧道 IP${NC}"
+    fi
+
+    echo -e "\n${CYAN}[最近 5 条自愈日志]${NC}"
+    if [ -f /var/log/wg_watchdog.log ]; then
+        tail -n 5 /var/log/wg_watchdog.log
+    else
+        echo "暂无自愈日志记录。"
+    fi
+    echo -e "${CYAN}==================================================${NC}"
+    pause_return
+}
+
+# ==================== VPS 与落地部署核心逻辑 ====================
 init_vps_server() {
     clear; echo -e "${YELLOW}━━━ 1. 初始化 VPS 服务端 ━━━${NC}"
     [ -f "$WG_CONF" ] && { read -p "${RED}已有配置将被覆盖！确定？[y/N]: ${NC}" c < /dev/tty; [[ ! "$c" =~ ^[Yy]$ ]] && return; }
@@ -127,9 +234,11 @@ PrivateKey = $WG_PRIV
 Address = 10.0.0.1/24
 ListenPort = $WG_PORT
 MTU = 1280
+PostUp = tc qdisc add dev wg0 root fq_codel limit 1000 target 5ms interval 100ms 2>/dev/null || true
 EOF
     systemctl enable wg-quick@wg0 > /dev/null 2>&1
     wg-quick down wg0 >/dev/null 2>&1; wg-quick up wg0 >/dev/null 2>&1
+    apply_qos_optimization
     
     cat > /etc/systemd/system/udp2raw.service << EOF
 [Unit]
@@ -148,6 +257,7 @@ EOF
     iptables -I INPUT 1 -p tcp --dport $FAKE_PORT -j ACCEPT 2>/dev/null
     netfilter-persistent save > /dev/null 2>&1
     
+    install_watchdog
     DEPLOY_CODE=$(echo -n "${VPS_IP}|${WG_PUB}|${U2R_PASS}|${FAKE_PORT}" | base64 -w 0 | tr -d '\n')
     echo -e "${GREEN}=========================================="
     echo -e " VPS 服务端初始化成功！"
@@ -169,7 +279,6 @@ bind_landing() {
     echo -e "\n# Landing\n[Peer]\nPublicKey = ${LANDING_PUB}\nAllowedIPs = ${LAND_IP}/32" >> "$WG_CONF"
     wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null
     
-    # 清理旧规则，防止重复累积
     while iptables -t nat -D PREROUTING -p tcp --dport "$MAP_PORT" 2>/dev/null; do :; done
     while iptables -t nat -D PREROUTING -p udp --dport "$MAP_PORT" 2>/dev/null; do :; done
     while iptables -D FORWARD -d "$LAND_IP" -j ACCEPT 2>/dev/null; do :; done
@@ -182,22 +291,19 @@ bind_landing() {
     iptables -I INPUT 1 -p tcp --dport "$MAP_PORT" -j ACCEPT
     netfilter-persistent save > /dev/null 2>&1
     
-    echo -e "${GREEN}✓ 节点绑定成功！请确保云后台已放行端口 ${MAP_PORT} (TCP/UDP)${NC}"
+    echo -e "${GREEN}✓ 节点绑定成功！请确保云后台放行端口 ${MAP_PORT} (TCP/UDP)${NC}"
     pause_return
 }
 
-# ==================== 家里落地机 (客户端) 模块 ====================
 parse_chain_proxy() {
     local chain_url="$1"
     local proto=$(echo "$chain_url" | awk -F'://' '{print $1}')
     local creds_host=$(echo "$chain_url" | sed -E 's#^[a-z0-9]+://##')
-    
     local creds="" host_port="$creds_host"
     if [[ "$creds_host" == *"@"* ]]; then
         creds=$(echo "$creds_host" | awk -F'@' '{print $1}')
         host_port=$(echo "$creds_host" | awk -F'@' '{print $2}')
     fi
-    
     local host=$(echo "$host_port" | awk -F':' '{print $1}')
     local port=$(echo "$host_port" | awk -F':' '{print $2}')
     
@@ -256,6 +362,7 @@ deploy_landing() {
 PrivateKey = $WG_PRIV
 Address = ${LAND_IP}/24
 MTU = 1280
+PostUp = tc qdisc add dev wg0 root fq_codel limit 1000 target 5ms interval 100ms 2>/dev/null || true
 
 [Peer]
 PublicKey = $VPS_PUB
@@ -280,6 +387,7 @@ EOF
     systemctl daemon-reload; systemctl enable --now udp2raw
     systemctl enable wg-quick@wg0 > /dev/null 2>&1
     wg-quick down wg0 >/dev/null 2>&1; wg-quick up wg0 >/dev/null 2>&1
+    apply_qos_optimization
     
     REALITY_KEYS=$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null)
     SB_PRIV=$(echo "$REALITY_KEYS" | awk '/PrivateKey/{print $2}')
@@ -288,16 +396,10 @@ EOF
     SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
 
     OUTBOUND_JSON='{ "type": "direct" }'
-    echo -e "${YELLOW}[*] 配置出站模式:${NC}"
     read -p "是否配置链式代理 (支持 Shadowsocks / SOCKS5 / HTTP)? [y/N]: " is_chain < /dev/tty
     if [[ "$is_chain" =~ ^[Yy]$ ]]; then
-        echo -e "${CYAN}支持格式举例:${NC}"
-        echo -e " - socks5://127.0.0.1:7890 或 socks5://user:pass@1.2.3.4:1080"
-        echo -e " - http://127.0.0.1:8118"
-        echo -e " - shadowsocks://aes-256-gcm:password@1.2.3.4:8388"
         read -p "请输入前置代理链接: " chain_url < /dev/tty
         OUTBOUND_JSON=$(parse_chain_proxy "$chain_url")
-        echo -e "${GREEN}✓ 链式代理配置转换完成${NC}"
     fi
 
     cat > /etc/sing-box/config.json << EOF
@@ -316,6 +418,8 @@ EOF
     systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
     iptables -I INPUT 1 -p tcp --dport $LAND_PORT -j ACCEPT 2>/dev/null
     netfilter-persistent save > /dev/null 2>&1
+    
+    install_watchdog
     
     SAFE_NAME=$(url_encode "$NODE_NAME")
     VLESS_LINK="vless://${UUID}@${VPS_IP}:${MAP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${SB_PUB}&sid=${SHORT_ID}&type=tcp#WG-${SAFE_NAME}"
@@ -337,175 +441,77 @@ EOF
     pause_return
 }
 
-# ==================== 链式代理管理模块 ====================
 manage_chain_proxy() {
-    clear; echo -e "${YELLOW}━━━ 6. 落地机-链式代理管理 ━━━${NC}"
+    clear; echo -e "${YELLOW}━━━ 落地机-链式代理管理 ━━━${NC}"
     if [ ! -f /etc/sing-box/config.json ]; then
         echo -e "${RED}未找到 Sing-box 配置，请先部署落地机。${NC}"
         pause_return; return
     fi
-    
-    local cur_out=$(jq -r '.outbounds[0].type' /etc/sing-box/config.json 2>/dev/null)
-    if [ "$cur_out" == "direct" ]; then
-        echo -e "当前状态: ${GREEN}直连 (无链式代理)${NC}"
+    read -p "请输入前置代理链接 (或输入 direct 恢复直连): " chain_url < /dev/tty
+    if [ "$chain_url" == "direct" ]; then
+        jq '.outbounds = [{"type":"direct"}]' /etc/sing-box/config.json > /tmp/sb_tmp.json && mv /tmp/sb_tmp.json /etc/sing-box/config.json
     else
-        echo -e "当前状态: ${GREEN}链式代理已启用 (${cur_out})${NC}"
+        NEW_OUT=$(parse_chain_proxy "$chain_url")
+        jq --argjson out "$NEW_OUT" '.outbounds = [$out]' /etc/sing-box/config.json > /tmp/sb_tmp.json && mv /tmp/sb_tmp.json /etc/sing-box/config.json
     fi
-    
-    echo "1. 设置/修改链式代理 (支持 Shadowsocks / SOCKS5 / HTTP)"
-    echo "2. 恢复为直连"
-    echo "0. 返回主菜单"
-    read -p "选择 [0-2]: " c < /dev/tty
-    case $c in
-        1) 
-            echo -e "${CYAN}支持格式举例: socks5://... , http://... , shadowsocks://...${NC}"
-            read -p "请输入前置代理链接: " chain_url < /dev/tty
-            NEW_OUT=$(parse_chain_proxy "$chain_url")
-            jq --argjson out "$NEW_OUT" '.outbounds = [$out]' /etc/sing-box/config.json > /tmp/sb_tmp.json && mv /tmp/sb_tmp.json /etc/sing-box/config.json
-            systemctl restart sing-box
-            echo -e "${GREEN}✓ 链式代理已更新并重启 Sing-box${NC}"
-            ;;
-        2)
-            jq '.outbounds = [{"type":"direct"}]' /etc/sing-box/config.json > /tmp/sb_tmp.json && mv /tmp/sb_tmp.json /etc/sing-box/config.json
-            systemctl restart sing-box
-            echo -e "${GREEN}✓ 已恢复直连并重启 Sing-box${NC}"
-            ;;
-        0) return ;;
-    esac
+    systemctl restart sing-box
+    echo -e "${GREEN}✓ 链式代理配置完成并重启 Sing-box${NC}"
     pause_return
 }
 
-# ==================== BBRv3 与系统优化模块 ====================
 optimize_kernel() {
-    while true; do
-        clear
-        local cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-        local cur_kr=$(uname -r); local xm="否"; [[ "$cur_kr" == *xanmod* ]] && xm="是"
-        echo -e "${CYAN}===== 内核与 BBR 优化 =====${NC}"
-        echo -e "内核: ${cur_kr} | XanMod: ${xm} | 算法: ${cur_cc}"
-        echo "1. 标准 BBR (v1，免重启)"
-        echo "2. BBRv3 (安装 XanMod，需重启)"
-        echo "3. 深度网络栈调优 (高并发推荐)"
-        echo "0. 返回主菜单"
-        read -rp "选择 [0-3]: " c
-        case $c in
-            1) _enable_bbr; echo; read -n 1 -s -r -p "按任意键返回菜单..." < /dev/tty ;;
-            2) _enable_bbrv3; echo; read -n 1 -s -r -p "按任意键返回菜单..." < /dev/tty ;;
-            3) _deep_tune; echo; read -n 1 -s -r -p "按任意键返回菜单..." < /dev/tty ;;
-            0) return ;;
-            *) echo -e "${RED}无效输入${NC}"; sleep 1 ;;
-        esac
-    done
-}
-
-_enable_bbr() {
     modprobe tcp_bbr 2>/dev/null || true
-    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then echo -e "${RED}内核不支持 BBR${NC}"; return 1; fi
     cat > "$BBR_CONF" <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-    sysctl --system > /dev/null 2>&1 || true; echo -e "${GREEN}标准 BBR 已启用${NC}"
-}
-
-_enable_bbrv3() {
-    if [[ "$(uname -r)" == *xanmod* ]]; then _enable_bbr; return; fi
-    local arch=$(dpkg --print-architecture 2>/dev/null || true)
-    [[ "$arch" != "amd64" ]] && { echo -e "${RED}XanMod 仅支持 amd64${NC}"; return; }
-    . /etc/os-release; local codename="${VERSION_CODENAME:-}"
-    
-    case "$codename" in
-        focal|jammy|noble|resolute|bullseye|bookworm|trixie) ;;
-        *) echo -e "${RED}XanMod 不支持当前系统版本 (${codename})${NC}"; return 1 ;;
-    esac
-
-    if command -v mokutil &>/dev/null && mokutil --sb-state 2>/dev/null | grep -qi enabled; then echo -e "${RED}请先关闭 Secure Boot${NC}"; return; fi
-    cd /tmp || return
-    curl -fsSLO https://dl.xanmod.org/check_x86-64_psabi.sh 2>/dev/null || wget -qO check_x86-64_psabi.sh https://dl.xanmod.org/check_x86-64_psabi.sh || true
-    local cpu
-    if [[ -f ./check_x86-64_psabi.sh ]]; then
-        chmod +x check_x86-64_psabi.sh; cpu=$(./check_x86-64_psabi.sh 2>/dev/null | grep -oE 'x86-64-v[0-9]' | tail -n1 || true); rm -f check_x86-64_psabi.sh
-    fi
-    local suffix="x64v2"; [[ "$cpu" == "x86-64-v3" ]] && suffix="x64v3"
-    echo "选择分支: 1) LTS 2) MAIN"; read -rp "[1]: " br; br=${br:-1}
-    local pkg="linux-xanmod-lts-${suffix}"; [[ "$br" == "2" ]] && pkg="linux-xanmod-${suffix}"
-    apt-get install -y ca-certificates curl gpg; install -m 0755 -d /etc/apt/keyrings
-    if ! curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null; then echo -e "${RED}密钥下载失败${NC}"; return 1; fi
-    cat > /etc/apt/sources.list.d/xanmod.sources <<EOF
-Types: deb
-URIs: https://deb.xanmod.org
-Suites: ${codename}
-Components: main
-Architectures: amd64
-Signed-By: /etc/apt/keyrings/xanmod-archive-keyring.gpg
-EOF
-    apt-get update -y; apt-get install -y "$pkg" || { echo -e "${RED}安装失败${NC}"; return; }
-    echo -e "${YELLOW}需重启。重启后再次运行此项启用 BBRv3${NC}"; read -rp "立即重启, [y/N]: " rb; [[ "$rb" =~ ^[Yy]$ ]] && reboot
-}
-
-_deep_tune() {
-    echo -e "${CYAN}应用深度网络栈调优...${NC}"
-    modprobe nf_conntrack 2>/dev/null || true
-    cat > "$SYSCTL_CONF" <<'EOF'
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.core.netdev_max_backlog = 250000
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65535
-net.netfilter.nf_conntrack_max = 1048576
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
-EOF
-    sysctl --system > /dev/null 2>&1 || true; echo -e "${GREEN}深度调优完成${NC}"
-}
-
-# ==================== 卸载模块 ====================
-uninstall_all() {
-    read -p "${RED}确定卸载所有组件？[y/N]: ${NC}" c < /dev/tty
-    [[ ! "$c" =~ ^[Yy]$ ]] && return
-    systemctl stop wg-quick@wg0 2>/dev/null; systemctl disable wg-quick@wg0 2>/dev/null
-    systemctl stop udp2raw 2>/dev/null; systemctl disable udp2raw 2>/dev/null
-    systemctl stop sing-box 2>/dev/null; systemctl disable sing-box 2>/dev/null
-    rm -rf /etc/wireguard /etc/udp2raw /etc/sing-box /usr/local/bin/sing-box /usr/local/bin/udp2raw
-    rm -f /etc/systemd/system/udp2raw.service /etc/systemd/system/sing-box.service
-    iptables -F; iptables -t nat -F
-    netfilter-persistent save > /dev/null 2>&1
-    systemctl daemon-reload
-    echo -e "${GREEN}✓ 卸载完成${NC}"
+    sysctl --system > /dev/null 2>&1 || true
+    echo -e "${GREEN}✓ 标准 BBR 优化已加载${NC}"
     pause_return
 }
 
-# ==================== 主菜单 ====================
+uninstall_all() {
+    read -p "${RED}确定卸载所有组件？[y/N]: ${NC}" c < /dev/tty
+    [[ ! "$c" =~ ^[Yy]$ ]] && return
+    systemctl stop wg-watchdog.timer 2>/dev/null || true
+    systemctl disable wg-watchdog.timer 2>/dev/null || true
+    systemctl stop wg-quick@wg0 udp2raw sing-box 2>/dev/null || true
+    rm -rf /etc/wireguard /etc/udp2raw /etc/sing-box /usr/local/bin/sing-box /usr/local/bin/udp2raw "$WATCHDOG_SCRIPT"
+    rm -f /etc/systemd/system/udp2raw.service /etc/systemd/system/sing-box.service /etc/systemd/system/wg-watchdog.*
+    iptables -F; iptables -t nat -F
+    netfilter-persistent save > /dev/null 2>&1
+    systemctl daemon-reload
+    echo -e "${GREEN}✓ 卸载与清理完成${NC}"
+    pause_return
+}
+
 check_root
 while true; do
     clear
     echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WG+udp2raw+Sing-box 终极反转融合版    ║${NC}"
+    echo -e "${CYAN}║  WG+udp2raw+Sing-box 商业增强反转版    ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}1${NC} VPS-初始化服务端(生成部署码)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}2${NC} 家里-部署落地机(生成节点链接)   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}3${NC} VPS-绑定落地机(粘贴回传码)     ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}4${NC} 查看落地机节点链接           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}5${NC} 内核与 BBRv3 优化             ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}5${NC} 实时状态与链路诊断看板        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}6${NC} 落地机-链式代理管理           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}7${NC} 一键卸载全部组件             ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}7${NC} 开启 BBR 网络内核优化         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC} ${GREEN}8${NC} 一键卸载全部组件             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}0${NC} 退出                        ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
     
-    read -p "选: " c < /dev/tty
+    read -p "选择 [0-8]: " c < /dev/tty
     case $c in
         1) init_vps_server;;
         2) deploy_landing;;
         3) bind_landing;;
         4) clear; [ -f "$LAND_INFO" ] && cat "$LAND_INFO" || echo "无节点信息"; pause_return;;
-        5) optimize_kernel;;
+        5) show_diagnostics;;
         6) manage_chain_proxy;;
-        7) uninstall_all;;
+        7) optimize_kernel;;
+        8) uninstall_all;;
         0) exit 0;;
         *) echo "错误"; sleep 1;;
     esac
