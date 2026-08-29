@@ -35,7 +35,6 @@ prepare_env() {
     apt-get update -y > /dev/null 2>&1
     apt-get install -y curl wget gnupg ca-certificates iptables iptables-persistent tar jq openssl coreutils iproute2 iputils-ping util-linux > /dev/null 2>&1
     
-    # 修复: 强制切换 iptables 至 legacy 模式
     if update-alternatives --list iptables &>/dev/null; then
         update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
         update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
@@ -82,6 +81,7 @@ After=network.target
 Type=simple
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 Restart=on-failure
+RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -140,6 +140,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/local/bin/udp2raw -s -l 0.0.0.0:${FAKE_PORT} -r 127.0.0.1:${WG_PORT} --raw-mode faketcp -a -k "${U2R_PASS}"
 Restart=always
+RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -168,13 +169,16 @@ bind_landing() {
     echo -e "\n# Landing\n[Peer]\nPublicKey = ${LANDING_PUB}\nAllowedIPs = ${LAND_IP}/32" >> "$WG_CONF"
     wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null
     
+    # 清理旧规则防累积
     while iptables -t nat -D PREROUTING -p tcp --dport "$MAP_PORT" 2>/dev/null; do :; done
     while iptables -t nat -D PREROUTING -p udp --dport "$MAP_PORT" 2>/dev/null; do :; done
+    while iptables -D FORWARD -d "$LAND_IP" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D INPUT -p tcp --dport "$MAP_PORT" -j ACCEPT 2>/dev/null; do :; done
+
     iptables -t nat -I PREROUTING 1 -p tcp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
     iptables -t nat -I PREROUTING 1 -p udp --dport "$MAP_PORT" -j DNAT --to-destination "${LAND_IP}:${LAND_PORT}"
     iptables -t nat -I POSTROUTING 1 -d "$LAND_IP" -j MASQUERADE
     iptables -I FORWARD 1 -d "$LAND_IP" -j ACCEPT
-    
     iptables -I INPUT 1 -p tcp --dport "$MAP_PORT" -j ACCEPT
     netfilter-persistent save > /dev/null 2>&1
     
@@ -183,6 +187,45 @@ bind_landing() {
 }
 
 # ==================== 家里落地机 (客户端) 模块 ====================
+parse_chain_proxy() {
+    local chain_url="$1"
+    local proto=$(echo "$chain_url" | awk -F'://' '{print $1}')
+    local creds_host=$(echo "$chain_url" | sed -E 's#^[a-z0-9]+://##')
+    
+    local creds="" host_port="$creds_host"
+    if [[ "$creds_host" == *"@"* ]]; then
+        creds=$(echo "$creds_host" | awk -F'@' '{print $1}')
+        host_port=$(echo "$creds_host" | awk -F'@' '{print $2}')
+    fi
+    
+    local host=$(echo "$host_port" | awk -F':' '{print $1}')
+    local port=$(echo "$host_port" | awk -F':' '{print $2}')
+    
+    if [[ "$proto" =~ ^(socks5|http)$ ]] && [[ -n "$host" ]] && [[ "$port" =~ ^[0-9]+$ ]]; then
+        if [[ -n "$creds" ]]; then
+            local user=$(echo "$creds" | awk -F':' '{print $1}')
+            local pass=$(echo "$creds" | awk -F':' '{print $2}')
+            jq -nc --arg p "$proto" --arg h "$host" --arg pt "$port" --arg u "$user" --arg pw "$pass" \
+              '{type:$p, server:$h, server_port:($pt|tonumber), username:$u, password:$pw}'
+        else
+            jq -nc --arg p "$proto" --arg h "$host" --arg pt "$port" \
+              '{type:$p, server:$h, server_port:($pt|tonumber)}'
+        fi
+    elif [[ "$proto" == "shadowsocks" ]] && [[ -n "$host" ]] && [[ "$port" =~ ^[0-9]+$ ]]; then
+        # SS 格式通常为: shadowsocks://method:password@server:port
+        if [[ -n "$creds" ]]; then
+            local decoded_creds=$(echo "$creds" | base64 -d 2>/dev/null || echo "$creds")
+            local method=$(echo "$decoded_creds" | awk -F':' '{print $1}')
+            local password=$(echo "$decoded_creds" | awk -F':' '{print $2}')
+            [ -z "$password" ] && { method=$(echo "$creds" | awk -F':' '{print $1}'); password=$(echo "$creds" | awk -F':' '{print $2}'); }
+            jq -nc --arg h "$host" --arg pt "$port" --arg m "$method" --arg pw "$password" \
+              '{type:"shadowsocks", server:$h, server_port:($pt|tonumber), method:$m, password:$pw}'
+        fi
+    else
+        echo "{ \"type\": \"direct\" }"
+    fi
+}
+
 deploy_landing() {
     clear; echo -e "${YELLOW}━━━ 2. 落地机部署 (粘贴部署码) ━━━${NC}"
     read -p "请粘贴部署码: " DEPLOY_CODE < /dev/tty
@@ -231,6 +274,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/local/bin/udp2raw -c -l 127.0.0.1:${WG_PORT} -r ${VPS_IP}:${FAKE_PORT} --raw-mode faketcp -a -k "${U2R_PASS}"
 Restart=always
+RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -244,42 +288,17 @@ EOF
     UUID=$(/usr/local/bin/sing-box generate uuid 2>/dev/null)
     SHORT_ID=$(/usr/local/bin/sing-box generate rand --hex 8 2>/dev/null)
 
-    # === 链式代理配置询问 ===
     OUTBOUND_JSON='{ "type": "direct" }'
     echo -e "${YELLOW}[*] 配置出站模式:${NC}"
-    read -p "是否配置链式代理 (将落地机收到的流量转发给外部Socks5/Http代理)? [y/N]: " is_chain < /dev/tty
+    read -p "是否配置链式代理 (支持 Shadowsocks / SOCKS5 / HTTP)? [y/N]: " is_chain < /dev/tty
     if [[ "$is_chain" =~ ^[Yy]$ ]]; then
-        echo -e "${CYAN}支持 socks5/http。示例: socks5://127.0.0.1:7890 或 socks5://user:pass@1.2.3.4:1080${NC}"
+        echo -e "${CYAN}支持格式举例:${NC}"
+        echo -e " - socks5://127.0.0.1:7890 或 socks5://user:pass@1.2.3.4:1080"
+        echo -e " - http://127.0.0.1:8118"
+        echo -e " - shadowsocks://aes-256-gcm:password@1.2.3.4:8388"
         read -p "请输入前置代理链接: " chain_url < /dev/tty
-        
-        proto=$(echo "$chain_url" | awk -F'://' '{print $1}')
-        creds_host=$(echo "$chain_url" | sed -E 's#^[a-z0-9]+://##')
-        
-        creds=""; host_port="$creds_host"
-        if [[ "$creds_host" == *"@"* ]]; then
-            creds=$(echo "$creds_host" | cut -d'@' -f1)
-            host_port=$(echo "$creds_host" | cut -d'@' -f2)
-        fi
-        
-        host=$(echo "$host_port" | cut -d':' -f1)
-        port=$(echo "$host_port" | cut -d':' -f2)
-        
-        if [[ "$proto" =~ ^(socks5|http)$ ]] && [[ -n "$host" ]] && [[ "$port" =~ ^[0-9]+$ ]]; then
-            if [[ -n "$creds" ]]; then
-                user=$(echo "$creds" | cut -d':' -f1)
-                pass=$(echo "$creds" | cut -d':' -f2)
-                OUTBOUND_JSON=$(jq -nc \
-                  --arg p "$proto" --arg h "$host" --arg pt "$port" --arg u "$user" --arg pw "$pass" \
-                  '{type:$p, server:$h, server_port:($pt|tonumber), username:$u, password:$pw}')
-            else
-                OUTBOUND_JSON=$(jq -nc \
-                  --arg p "$proto" --arg h "$host" --arg pt "$port" \
-                  '{type:$p, server:$h, server_port:($pt|tonumber)}')
-            fi
-            echo -e "${GREEN}✓ 链式代理配置成功${NC}"
-        else
-            echo -e "${RED}解析失败，将使用直连。${NC}"
-        fi
+        OUTBOUND_JSON=$(parse_chain_proxy "$chain_url")
+        echo -e "${GREEN}✓ 链式代理配置转换完成${NC}"
     fi
 
     cat > /etc/sing-box/config.json << EOF
@@ -331,49 +350,21 @@ manage_chain_proxy() {
     if [ "$cur_out" == "direct" ]; then
         echo -e "当前状态: ${GREEN}直连 (无链式代理)${NC}"
     else
-        local cur_info=$(jq -r '.outbounds[0] | "\(.type)://\(.server):\(.server_port)"' /etc/sing-box/config.json 2>/dev/null)
-        echo -e "当前状态: ${GREEN}链式代理 -> ${cur_info}${NC}"
+        echo -e "当前状态: ${GREEN}链式代理已启用 (${cur_out})${NC}"
     fi
     
-    echo "1. 设置/修改链式代理"
+    echo "1. 设置/修改链式代理 (支持 Shadowsocks / SOCKS5 / HTTP)"
     echo "2. 恢复为直连"
     echo "0. 返回主菜单"
     read -p "选择 [0-2]: " c < /dev/tty
     case $c in
         1) 
-            echo -e "${YELLOW}支持 socks5/http。示例: socks5://127.0.0.1:7890 或 socks5://user:pass@1.2.3.4:1080${NC}"
+            echo -e "${CYAN}支持格式举例: socks5://... , http://... , shadowsocks://...${NC}"
             read -p "请输入前置代理链接: " chain_url < /dev/tty
-            
-            proto=$(echo "$chain_url" | awk -F'://' '{print $1}')
-            creds_host=$(echo "$chain_url" | sed -E 's#^[a-z0-9]+://##')
-            
-            creds=""; host_port="$creds_host"
-            if [[ "$creds_host" == *"@"* ]]; then
-                creds=$(echo "$creds_host" | cut -d'@' -f1)
-                host_port=$(echo "$creds_host" | cut -d'@' -f2)
-            fi
-            
-            host=$(echo "$host_port" | cut -d':' -f1)
-            port=$(echo "$host_port" | cut -d':' -f2)
-            
-            if [[ "$proto" =~ ^(socks5|http)$ ]] && [[ -n "$host" ]] && [[ "$port" =~ ^[0-9]+$ ]]; then
-                if [[ -n "$creds" ]]; then
-                    user=$(echo "$creds" | cut -d':' -f1)
-                    pass=$(echo "$creds" | cut -d':' -f2)
-                    NEW_OUT=$(jq -nc \
-                      --arg p "$proto" --arg h "$host" --arg pt "$port" --arg u "$user" --arg pw "$pass" \
-                      '{type:$p, server:$h, server_port:($pt|tonumber), username:$u, password:$pw}')
-                else
-                    NEW_OUT=$(jq -nc \
-                      --arg p "$proto" --arg h "$host" --arg pt "$port" \
-                      '{type:$p, server:$h, server_port:($pt|tonumber)}')
-                fi
-                jq --argjson out "$NEW_OUT" '.outbounds = [$out]' /etc/sing-box/config.json > /tmp/sb_tmp.json && mv /tmp/sb_tmp.json /etc/sing-box/config.json
-                systemctl restart sing-box
-                echo -e "${GREEN}✓ 链式代理已更新并重启 Sing-box${NC}"
-            else
-                echo -e "${RED}解析失败，未作更改。${NC}"
-            fi
+            NEW_OUT=$(parse_chain_proxy "$chain_url")
+            jq --argjson out "$NEW_OUT" '.outbounds = [$out]' /etc/sing-box/config.json > /tmp/sb_tmp.json && mv /tmp/sb_tmp.json /etc/sing-box/config.json
+            systemctl restart sing-box
+            echo -e "${GREEN}✓ 链式代理已更新并重启 Sing-box${NC}"
             ;;
         2)
             jq '.outbounds = [{"type":"direct"}]' /etc/sing-box/config.json > /tmp/sb_tmp.json && mv /tmp/sb_tmp.json /etc/sing-box/config.json
