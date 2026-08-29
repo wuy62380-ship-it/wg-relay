@@ -1,64 +1,83 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (集成 XanMod BBRv3 完美修复版)
+# 跨境软件定义边缘网络系统 (集成完整 XanMod BBRv3 管理与卸载版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
 
 set -euo pipefail
 
+# 终端颜色定义
+RED='\033[31m'
+G='\033[32m'
+Y='\033[33m'
+C='\033[36m'
+H='\033[35m'
+R='\033[0m'
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "\033[31m[错误] 必须使用 root 权限运行此脚本！\033[0m"
+        echo -e "${RED}[错误] 必须使用 root 权限运行此脚本！${R}"
         exit 1
     fi
 }
 
 detect_hardware_and_bandwidth() {
-    echo -e "\n\033[32m[+] 正在扫描服务器硬件与吞吐指标...\033[0m"
+    echo -e "\n${G}[+] 正在扫描服务器硬件与吞吐指标...${R}"
     CPU_CORES=$(nproc)
     TOTAL_MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo "1048576")
     TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
     TOTAL_MEM_GB=$(awk "BEGIN {printf \"%.1f\", $TOTAL_MEM_MB / 1024}")
     
-    echo -e "    -> CPU核心: \033[36m${CPU_CORES}核 | 物理内存: ${TOTAL_MEM_GB}GB\033[0m"
+    echo -e "    -> CPU核心: ${C}${CPU_CORES}核 | 物理内存: ${TOTAL_MEM_GB}GB${R}"
 }
 
-# ================= XanMod & BBRv3 核心检测与安装逻辑 (完全修复版) =================
+# ================= XanMod & BBRv3 完整内核管理模块 =================
 
 xanmod_add_repo() {
     local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
     local list_file="/etc/apt/sources.list.d/xanmod-release.list"
     local key_url="https://dl.xanmod.org/archive.key"
+    local os_codename=""
 
-    echo -e "\033[32m[+] 正在安装系统基础依赖并导入 XanMod GPG 密钥...\033[0m"
-    export DEBIAN_FRONTEND=noninteractive
+    if command -v lsb_release >/dev/null 2>&1; then
+        os_codename=$(lsb_release -sc)
+    elif [ -r /etc/os-release ]; then
+        os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+    fi
+
+    if ! echo "bookworm trixie forky sid noble plucky questing resolute faye gigi wilma xia zara zena" | grep -qw "$os_codename"; then
+        os_codename="releases"
+    fi
+
+    if echo "jammy focal bullseye buster" | grep -qw "$os_codename" || [ "$os_codename" = "releases" ]; then
+        echo -e "${RED}XanMod 官方已停止对当前系统($os_codename)的 APT 源支持，请升级至 Debian12 / Ubuntu24 或更高版本。${R}"
+        return 1
+    fi
+
+    if [ -z "$os_codename" ]; then
+        echo -e "${RED}无法获取系统代号，无法配置XanMod源${R}"
+        return 1
+    fi
+
+    echo -e "${Y}正在安装依赖并下载密钥...${R}"
     apt-get update -y >/dev/null 2>&1
     apt-get install -y wget gnupg ca-certificates >/dev/null 2>&1
-    
     mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
     if ! wget -qO - "$key_url" | gpg --dearmor -o "$keyring" --yes; then
-        echo -e "\033[31m[错误] XanMod 官方密钥下载失败，请检查网络连接！\033[0m"
+        echo -e "${RED}官方密钥下载失败${R}"
         return 1
     fi
     chmod 644 "$keyring"
-
-    # 动态获取当前系统发行版代号 (如 bookworm, trixie, jammy)
-    local sys_codename=""
-    if [ -f /etc/os-release ]; then
-        sys_codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
-    fi
-    [ -z "$sys_codename" ] && sys_codename="releases"
-
-    echo "deb [signed-by=$keyring] http://deb.xanmod.org $sys_codename main" > "$list_file"
-    echo -e "\033[32m[√] XanMod APT 软件源配置完成 (系统代号: ${sys_codename})\033[0m"
+    echo "deb [signed-by=$keyring] http://deb.xanmod.org $os_codename main" > "$list_file"
+    echo -e "${G}XanMod 源配置完成 (系统代号: $os_codename)${R}"
 }
 
 xanmod_detect_psabi_level() {
     local level=""
     local ld_so=""
     
-    # 优先方法：使用系统 glibc 动态链接器权威获取 x86-64 架构级别
+    # 优先使用动态链接器精确读取 CPU 架构级别
     for f in /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2; do
         if [ -x "$f" ]; then ld_so="$f"; break; fi
     done
@@ -67,16 +86,20 @@ xanmod_detect_psabi_level() {
         level=$("$ld_so" --help 2>/dev/null | grep -oP 'x86-64-v\K[1-4](?= \(supported)' | tail -n1 || echo "")
     fi
 
-    # 备用方法：最基础的 cpuinfo 常用指令集扫描
+    # 降级备用 CPU Flag 检测
     if [ -z "$level" ]; then
-        if grep -qE '\bavx512f\b' /proc/cpuinfo && grep -qE '\bavx512bw\b' /proc/cpuinfo; then level=4
-        elif grep -qE '\bavx2\b' /proc/cpuinfo; then level=3
-        elif grep -qE '\bsse4_2\b' /proc/cpuinfo; then level=2
-        elif grep -qE '\bsse2\b' /proc/cpuinfo; then level=1
-        fi
+        level=$(awk 'BEGIN {
+            while (!/flags/) if (getline < "/proc/cpuinfo" != 1) exit 1
+            if (/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) lvl = 1
+            if (lvl == 1 && /cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) lvl = 2
+            if (lvl == 2 && /avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) lvl = 3
+            if (lvl == 3 && /avx512f/&&/avx512bw/&&/avx512cd/&&/avx512dq/&&/avx512vl/) lvl = 4
+            if (lvl > 0) { print lvl; exit }
+            exit 1
+        }' /proc/cpuinfo 2>/dev/null || echo "3")
     fi
 
-    echo "${level:-3}"
+    printf '%s' "$level"
 }
 
 xanmod_package_available() {
@@ -86,33 +109,29 @@ xanmod_package_available() {
 
 xanmod_detect_package() {
     local psabi_level=""
-    psabi_level=$(xanmod_detect_psabi_level)
+    local level=""
+    local package=""
+    local prefix_list="linux-xanmod-lts linux-xanmod"
+
+    psabi_level=$(xanmod_detect_psabi_level) || psabi_level=3
+    [ "$psabi_level" -gt 3 ] && psabi_level=3
 
     apt-get update -y >/dev/null 2>&1
 
-    # 依次检索 LTS 分支和标准分支，从识别出的最高级别向低级别匹配
-    local prefixes=("linux-xanmod-lts" "linux-xanmod")
-    for lvl in $(seq "$psabi_level" -1 1); do
-        for pfx in "${prefixes[@]}"; do
-            local pkg="${pfx}-x64v${lvl}"
-            if xanmod_package_available "$pkg"; then
-                echo -e "\033[32m[√] 成功匹配 CPU (x64v${lvl})，可用内核包: $pkg\033[0m" >&2
-                printf '%s\n' "$pkg"
+    for prefix in $prefix_list; do
+        level="$psabi_level"
+        while [ "$level" -ge 1 ]; do
+            package="${prefix}-x64v${level}"
+            if xanmod_package_available "$package"; then
+                echo -e "${G}已自动匹配合适安装包: $package${R}" >&2
+                printf '%s\n' "$package"
                 return 0
             fi
+            level=$((level - 1))
         done
     done
 
-    # 保底匹配：通用无级别后缀包
-    for fallback_pkg in linux-xanmod-lts linux-xanmod; do
-        if xanmod_package_available "$fallback_pkg"; then
-            echo -e "\033[32m[√] 保底匹配成功，可用内核包: $fallback_pkg\033[0m" >&2
-            printf '%s\n' "$fallback_pkg"
-            return 0
-        fi
-    done
-
-    echo -e "\033[31m[错误] 软件源中未找到任何可用的 XanMod 内核包！\033[0m" >&2
+    echo -e "${RED}软件源中未找到适配此CPU的XanMod内核包${R}" >&2
     return 1
 }
 
@@ -120,74 +139,124 @@ xanmod_installed() {
     dpkg-query -W -f='${Package}\n' 'linux-*xanmod*' 2>/dev/null | grep -q '^linux-.*xanmod'
 }
 
-install_xanmod_bbr3() {
-    echo -e "\n===================================================================="
-    echo -e "           🚀 一键升级 Linux 内核至 XanMod (支持 BBRv3)              "
-    echo -e "===================================================================="
-    if ! command -v apt-get >/dev/null 2>&1; then
-        echo -e "\033[31m[错误] 目前一键内核升级仅支持 Debian / Ubuntu 系统 (apt)！\033[0m"
-        return 1
-    fi
+ask_reboot() {
+    read -e -p "是否立即重启服务器以应用更改？[Y/n]: " choice
+    case "$choice" in
+        [Yy]|"")
+            echo -e "${Y}正在重启服务器...${R}"
+            reboot
+            ;;
+        *)
+            echo -e "${Y}请稍后手动重启服务器命令: reboot${R}"
+            ;;
+    esac
+}
 
-    read -p "确认要开始安装/升级 XanMod BBRv3 内核吗？安装后需要重启服务器 [y/N]: " confirm_install
-    if [[ ! "$confirm_install" =~ ^[Yy]$ ]]; then
-        return 0
-    fi
-
-    xanmod_add_repo || return 1
-
+xanmod_install_or_update() {
+    local action="$1"
     local package=""
-    package=$(xanmod_detect_package) || {
-        echo -e "\033[31m[错误] 无法获取可用软件包，升级取消。\033[0m"
+
+    xanmod_add_repo || {
+        echo -e "${RED}XanMod官方仓库配置失败，请稍后重试${R}"
         return 1
     }
 
-    echo -e "\033[32m[+] 正在下载并安装内核包 ($package)... \033[0m"
+    package=$(xanmod_detect_package) || {
+        echo -e "${RED}无法识别当前CPU或找不到匹配内核包，已取消安装${R}"
+        return 1
+    }
+
+    echo -e "${Y}正在更新软件源并安装内核 (包大小约100MB，请耐心等待)...${R}"
     apt-get update -y
-    if apt-get install -y "$package"; then
-        echo -e "\n\033[32m[√] XanMod 内核安装完成！\033[0m"
-        read -p "系统需要重启以加载新内核，是否立即重启？[y/N]: " reboot_now
-        if [[ "$reboot_now" =~ ^[Yy]$ ]]; then
-            echo -e "\033[33m正在重启系统，请稍后重新连接 SSH...\033[0m"
-            reboot
-        else
-            echo -e "\033[33m请稍后手动重启服务器 (\`reboot\`) 以激活新内核与 BBRv3。\033[0m"
-        fi
+    if [ "$action" = "update" ]; then
+        apt-get install -y --only-upgrade "$package" || apt-get install -y "$package" || {
+            echo -e "${RED}XanMod内核更新失败，请检查软件源或稍后重试${R}"
+            return 1
+        }
     else
-        echo -e "\033[31m[错误] XanMod 内核安装失败，请检查网络连接或兼容性。\033[0m"
+        apt-get install -y "$package" || {
+            echo -e "${RED}XanMod内核安装失败，请检查软件源或稍后重试${R}"
+            return 1
+        }
+    fi
+
+    set_bbr_algo "bbr3" > /dev/null 2>&1 || true
+
+    echo -e "${G}XanMod BBRv3内核处理完成。重启后生效${R}"
+    ask_reboot
+}
+
+xanmod_uninstall() {
+    echo -e "${Y}正在卸载 XanMod 内核...${R}"
+    apt-get purge -y 'linux-*xanmod*'
+    apt-get autoremove -y
+    if command -v update-grub >/dev/null 2>&1; then
+        sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=0/g' /etc/default/grub
+        update-grub
+    elif command -v grub2-mkconfig >/dev/null 2>&1; then
+        grub2-mkconfig -o /boot/grub2/grub.cfg
+    fi
+    rm -f /etc/apt/sources.list.d/xanmod-release.list
+    rm -f /usr/share/keyrings/xanmod-archive-keyring.gpg
+    echo -e "${G}XanMod内核已卸载。重启后生效${R}"
+    ask_reboot
+}
+
+xanmod_manage() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo -e "${RED}仅支持 Debian/Ubuntu 系统安装 XanMod 内核${R}"
+        read -rs -n 1 -p "按任意键继续..."; return
+    fi
+
+    if xanmod_installed; then
+        while true; do
+            clear
+            local kernel_version=$(uname -r)
+            echo -e "${G}您已安装xanmod的BBRv3内核${R}"
+            echo -e "当前内核版本: ${C}$kernel_version${R}\n"
+            echo -e "${Y}内核管理${R}"
+            echo -e "------------------------"
+            echo -e "${Y}1. 更新BBRv3内核              2. 卸载BBRv3内核${R}"
+            echo -e "------------------------"
+            echo -e "${H}0. 返回上一级选单${R}"
+            read -e -p "请输入你的选择: " sub_choice
+            case $sub_choice in
+                1) xanmod_install_or_update update ;;
+                2) xanmod_uninstall ;;
+                *) break ;;
+            esac
+        done
+    else
+        clear
+        echo -e "${Y}设置BBR3加速${R}"
+        echo -e "------------------------------------------------"
+        echo -e "仅支持Debian/Ubuntu"
+        echo -e "请备份数据，将为你升级Linux内核开启BBR3"
+        echo -e "------------------------------------------------"
+        read -e -p "确定继续吗？[Y/n]: " choice
+        case "$choice" in
+            [Yy]|"") xanmod_install_or_update install ;;
+            *) echo -e "${Y}已取消${R}" ;;
+        esac
     fi
 }
 
-apply_ultimate_kernel() {
-    local target_algo="${1:-auto}"
-    
-    if [ "$target_algo" = "auto" ]; then
-        if modprobe tcp_bbr3 2>/dev/null; then
-            target_algo="bbr3"
-        elif modprobe tcp_bbr 2>/dev/null; then
-            target_algo="bbr"
-        else
-            target_algo="cubic"
-        fi
-    fi
-
-    set_bbr_algo "$target_algo"
-}
+# ================= TCP 网络调优与算法管理 =================
 
 set_bbr_algo() {
     local target_algo="$1"
-    echo -e "\n\033[32m[+] 正在配置并切换 TCP 拥塞控制算法为: ${target_algo}...\033[0m"
+    echo -e "\n${G}[+] 正在配置并切换 TCP 拥塞控制算法为: ${target_algo}...${R}"
     
     if [ "$target_algo" = "bbr3" ]; then
         if ! modprobe tcp_bbr3 2>/dev/null; then
-            echo -e "\033[31m[错误] 当前系统内核不支持 BBRv3 模块 (tcp_bbr3)！\033[0m"
-            echo -e "\033[33m[提示] 请先选择【选项 3】一键安装 XanMod 内核后重试。\033[0m"
+            echo -e "${RED}[错误] 当前系统内核不支持 BBRv3 模块 (tcp_bbr3)！${R}"
+            echo -e "${Y}[提示] 请先一键安装 XanMod 内核后重试。${R}"
             return 1
         fi
         echo "tcp_bbr3" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
     elif [ "$target_algo" = "bbr" ]; then
         if ! modprobe tcp_bbr 2>/dev/null; then
-            echo -e "\033[31m[错误] 当前系统内核无法加载 tcp_bbr 模块！\033[0m"
+            echo -e "${RED}[错误] 当前系统内核无法加载 tcp_bbr 模块！${R}"
             return 1
         fi
         echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
@@ -217,7 +286,7 @@ net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_fin_timeout = 15
 EOF
     sysctl -p /etc/sysctl.d/99-sdn-ultimate.conf >/dev/null 2>&1 || true
-    echo -e "\033[32m[√] TCP 拥塞控制算法已成功切换为: ${target_algo}\033[0m"
+    echo -e "${G}[√] TCP 拥塞控制算法已成功切换为: ${target_algo}${R}"
 }
 
 manage_bbr() {
@@ -229,19 +298,19 @@ manage_bbr() {
         echo "===================================================================="
         echo "               📊 当前系统 BBR / BBRv3 状态与管理                       "
         echo "===================================================================="
-        echo -e "当前 TCP 拥塞控制算法 : \033[32m${CURRENT_ALGO}\033[0m"
-        echo -e "当前队列调度算法     : \033[36m${CURRENT_QDISC}\033[0m"
+        echo -e "当前 TCP 拥塞控制算法 : ${G}${CURRENT_ALGO}${R}"
+        echo -e "当前队列调度算法     : ${C}${CURRENT_QDISC}${R}"
         if xanmod_installed; then
-            echo -e "XanMod 内核状态      : \033[32m已安装 (已支持 BBRv3)\033[0m"
+            echo -e "XanMod 内核状态      : ${G}已安装 (已支持 BBRv3)${R}"
         else
-            echo -e "XanMod 内核状态      : \033[33m未安装\033[0m"
+            echo -e "XanMod 内核状态      : ${Y}未安装${R}"
         fi
         echo "--------------------------------------------------------------------"
-        lsmod | grep bbr || echo -e "\033[33m[提示] 当前未在 lsmod 中发现已加载的 bbr 模块\033[0m"
+        lsmod | grep bbr || echo -e "${Y}[提示] 当前未在 lsmod 中发现已加载的 bbr 模块${R}"
         echo "===================================================================="
         echo " 1. 切换/开启 原版标准 BBR (内核自带)"
         echo " 2. 切换/开启 BBRv3 (需系统内核支持 tcp_bbr3)"
-        echo " 3. 一键安装/更新 XanMod 内核 (智能匹配 CPU x64v1~v4)"
+        echo " 3. XanMod BBRv3 内核管理 (安装 / 更新 / 卸载)"
         echo " 4. 还原为 CUBIC 默认算法"
         echo " 0. 返回主菜单"
         echo "===================================================================="
@@ -255,25 +324,42 @@ manage_bbr() {
                 set_bbr_algo "bbr3"
                 read -p "按回车键继续..." ;;
             3)
-                install_xanmod_bbr3
-                read -p "按回车键继续..." ;;
+                xanmod_manage ;;
             4)
                 set_bbr_algo "cubic"
                 read -p "按回车键继续..." ;;
             0)
                 break ;;
             *)
-                echo -e "\033[31m[错误] 输入无效，请重新选择。\033[0m"; sleep 1 ;;
+                echo -e "${RED}[错误] 输入无效，请重新选择。${R}"; sleep 1 ;;
         esac
     done
 }
+
+apply_ultimate_kernel() {
+    local target_algo="${1:-auto}"
+    
+    if [ "$target_algo" = "auto" ]; then
+        if modprobe tcp_bbr3 2>/dev/null; then
+            target_algo="bbr3"
+        elif modprobe tcp_bbr 2>/dev/null; then
+            target_algo="bbr"
+        else
+            target_algo="cubic"
+        fi
+    fi
+
+    set_bbr_algo "$target_algo"
+}
+
+# ================= 边缘网络组网与节点管理 =================
 
 install_dependencies() {
     ARCH=$(uname -m)
     case $ARCH in
         x86_64) SB_ARCH="amd64"; U2R_ARCH="amd64" ;;
         aarch64) SB_ARCH="arm64"; U2R_ARCH="arm" ;;
-        *) echo -e "\033[31m[错误] 不支持的架构: $ARCH\033[0m"; exit 1 ;;
+        *) echo -e "${RED}[错误] 不支持的架构: $ARCH${R}"; exit 1 ;;
     esac
 
     if [ ! -f "/usr/local/bin/udp2raw" ]; then
@@ -397,14 +483,14 @@ EOF
     touch /etc/sdn_chains_registry.list
 
     echo -e "\n===================================================================="
-    echo -e "\e[32m[√] 香港总控中心初始化完成！\e[0m"
+    echo -e "${G}[√] 香港总控中心初始化完成！${R}"
     echo -e "客户端接入地址: $HK_IP | 端口: $CLIENT_PORT | UUID: $UUID"
     echo -e "===================================================================="
 }
 
 export_token() {
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
-        echo -e "\033[31m[错误] 请先初始化香港总控！\033[0m"
+        echo -e "${RED}[错误] 请先初始化香港总控！${R}"
         return
     fi
     source /etc/sdn_hk_cluster.env
@@ -418,7 +504,7 @@ export_token() {
     DEPLOY_CODE=$(echo -n "${HK_IP}|${WG_PUB}|${U2R_PASS}|${SUBNET_PREFIX}|${FAKE_PORT}" | base64 -w 0 2>/dev/null || echo -n "${HK_IP}|${WG_PUB}|${U2R_PASS}|${SUBNET_PREFIX}|${FAKE_PORT}" | base64)
     echo -e "\n===================================================================="
     echo -e "请复制以下【对接凭证代码】到你的落地机："
-    echo -e "\n\e[36m$DEPLOY_CODE\e[0m\n"
+    echo -e "\n${C}$DEPLOY_CODE${R}\n"
     echo -e "===================================================================="
 }
 
@@ -516,15 +602,15 @@ EOF
 
     REG_PAYLOAD=$(echo -n "${WG_PUB}|${LAND_IP}|${NODE_TAG}|${FAKE_PORT}" | base64 -w 0 2>/dev/null || echo -n "${WG_PUB}|${LAND_IP}|${NODE_TAG}|${FAKE_PORT}" | base64)
     echo -e "\n===================================================================="
-    echo -e "\e[32m[√] 落地节点 ($NODE_TAG) 配置成功！\e[0m"
+    echo -e "${G}[√] 落地节点 ($NODE_TAG) 配置成功！${R}"
     echo -e "请复制以下【注册密文】，回到【香港总控】选择【选项 4】完成绑定："
-    echo -e "\n\e[36m$REG_PAYLOAD\e[0m\n"
+    echo -e "\n${C}$REG_PAYLOAD${R}\n"
     echo -e "===================================================================="
 }
 
 register_node_to_hk() {
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
-        echo -e "\033[31m[错误] 请先初始化香港总控！\033[0m"
+        echo -e "${RED}[错误] 请先初始化香港总控！${R}"
         return
     fi
     source /etc/sdn_hk_cluster.env
@@ -570,13 +656,13 @@ EOF
     ) 200>/var/lock/sdn_registry.lock
 
     echo -e "\n===================================================================="
-    echo -e "\e[32m[√] 落地节点 [$NODE_TAG] 成功加入集群！\e[0m"
+    echo -e "${G}[√] 落地节点 [$NODE_TAG] 成功加入集群！${R}"
     echo -e "===================================================================="
 }
 
 show_node_links() {
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
-        echo -e "\033[31m[错误] 当前服务器未初始化香港总控，或找不到配置文件！\033[0m"
+        echo -e "${RED}[错误] 当前服务器未初始化香港总控，或找不到配置文件！${R}"
         return
     fi
     source /etc/sdn_hk_cluster.env
@@ -586,22 +672,22 @@ show_node_links() {
     echo -e "===================================================================="
 
     if [ ! -f "/etc/sdn_nodes_registry.list" ] || [ ! -s "/etc/sdn_nodes_registry.list" ]; then
-        echo -e "\033[33m[提示] 暂未注册任何落地节点。\033[0m"
+        echo -e "${Y}[提示] 暂未注册任何落地节点。${R}"
     else
-        echo -e "\n\033[35m=== 直连落地节点 ===\033[0m"
+        echo -e "\n${H}=== 直连落地节点 ===${R}"
         while IFS=: read -r prefix tag ip; do
             if [ "$prefix" = "NODE" ]; then
-                echo -e "\n📌 节点标识: \033[32m${tag}\033[0m  |  隧道 IP: \033[33m${ip}\033[0m"
-                echo -e "\033[36mvless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${tag}\033[0m"
+                echo -e "\n📌 节点标识: ${G}${tag}${R}  |  隧道 IP: ${Y}${ip}${R}"
+                echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${tag}${R}"
             fi
         done < /etc/sdn_nodes_registry.list
 
         if [ -f "/etc/sdn_chains_registry.list" ] && [ -s "/etc/sdn_chains_registry.list" ]; then
-            echo -e "\n\033[35m=== 多级链式级联节点 ===\033[0m"
+            echo -e "\n${H}=== 多级链式级联节点 ===${R}"
             while IFS=: read -r prefix chain_tag node1 node2; do
                 if [ "$prefix" = "CHAIN" ]; then
-                    echo -e "\n🔗 链式组合: \033[32m${chain_tag}\033[0m  |  链路: 香港 -> \033[33m${node1}\033[0m -> \033[33m${node2}\033[0m -> 目标"
-                    echo -e "\033[36mvless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-Chain-${chain_tag}\033[0m"
+                    echo -e "\n🔗 链式组合: ${G}${chain_tag}${R}  |  链路: 香港 -> ${Y}${node1}${R} -> ${Y}${node2}${R} -> 目标"
+                    echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-Chain-${chain_tag}${R}"
                 fi
             done < /etc/sdn_chains_registry.list
         fi
@@ -611,18 +697,18 @@ show_node_links() {
 
 setup_chain_proxy() {
     if [ ! -f "/etc/sdn_nodes_registry.list" ] || [ $(grep -c "^NODE:" /etc/sdn_nodes_registry.list 2>/dev/null || echo 0) -lt 2 ]; then
-        echo -e "\033[31m[错误] 配置多级链式代理至少需要注册 2 个以上的落地节点！\033[0m"
+        echo -e "${RED}[错误] 配置多级链式代理至少需要注册 2 个以上的落地节点！${R}"
         return
     fi
 
-    echo -e "\n\033[32m=== 可用的落地节点 ===\033[0m"
+    echo -e "\n${G}=== 可用的落地节点 ===${R}"
     grep "^NODE:" /etc/sdn_nodes_registry.list | cut -d':' -f2,3
 
     read -p "请输入前置跳板节点 Tag [例如 tw3]: " NODE1_TAG
     read -p "请输入最终出口节点 Tag [例如 jp1]: " NODE2_TAG
 
     if [ "$NODE1_TAG" = "$NODE2_TAG" ]; then
-        echo -e "\033[31m[错误] 跳板节点和出口节点不能相同！\033[0m"
+        echo -e "${RED}[错误] 跳板节点和出口节点不能相同！${R}"
         return
     fi
 
@@ -637,7 +723,7 @@ setup_chain_proxy() {
     ) 200>/var/lock/sdn_registry.lock
 
     echo -e "\n===================================================================="
-    echo -e "\e[32m[√] 多级链式代理 [香港 -> $NODE1_TAG -> $NODE2_TAG] 构建完成！\e[0m"
+    echo -e "${G}[√] 多级链式代理 [香港 -> $NODE1_TAG -> $NODE2_TAG] 构建完成！${R}"
     echo -e "===================================================================="
 }
 
@@ -718,7 +804,7 @@ while true; do
     CURRENT_BBR=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || echo "未检测")
     echo "===================================================================="
     echo "    跨境软件定义边缘网络 (集群管理面板)"
-    echo -e "    当前内核拥塞控制算法: [ \033[32m${CURRENT_BBR}\033[0m ]"
+    echo -e "    当前内核拥塞控制算法: [ ${G}${CURRENT_BBR}${R} ]"
     echo "===================================================================="
     echo " 1. 【第一步：香港中转机】初始化总控中心"
     echo " 2. 【第二步：香港中转机】生成落地机对接凭证代码"
@@ -726,7 +812,7 @@ while true; do
     echo " 4. 【第四步：香港总控】输入落地机注册密文完成组网"
     echo " 5. 【香港总控】查看/导出所有节点的 VLESS 接入链接"
     echo " 6. 【香港总控】配置多级链式代理 (例如: 香港->tw3->jp1)"
-    echo " 7. 【系统工具】BBR / BBRv3 算法独立切换与内核管理"
+    echo " 7. 【系统工具】BBR / BBRv3 算法独立切换与内核管理 (含卸载)"
     echo " 0. 退出脚本"
     echo "===================================================================="
     read -p "请选择对应操作的数字 [0-7]: " choice
@@ -742,6 +828,6 @@ while true; do
         6) setup_chain_proxy; read -p "按回车键继续..." ;;
         7) manage_bbr ;;
         0) exit 0 ;;
-        *) echo -e "\033[31m[错误] 输入无效，请重新选择。\033[0m"; sleep 2 ;;
+        *) echo -e "${RED}[错误] 输入无效，请重新选择。${R}"; sleep 2 ;;
     esac
 done
