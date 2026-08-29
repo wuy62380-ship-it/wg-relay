@@ -95,7 +95,10 @@ xanmod_detect_psabi_level() {
 
 xanmod_package_available() {
     local package="$1"
-    apt-cache policy "$package" 2>/dev/null | grep -q 'Candidate: [^ ]'
+    local candidate
+    # 修复: 准确判断候选版本是否有效，防止匹配到 (none) 误认为存在
+    candidate=$(apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ {print $2}')
+    [ -n "$candidate" ] && [ "$candidate" != "(none)" ]
 }
 
 xanmod_detect_package() {
@@ -106,7 +109,11 @@ xanmod_detect_package() {
 
     psabi_level=$(xanmod_detect_psabi_level) || psabi_level=3
     [ -n "$psabi_level" ] || psabi_level=3
-    [ "$psabi_level" -gt 3 ] && psabi_level=3
+    
+    # 修复: 使用 if 语句替代 && 链，防止在 set -e 下因返回 false 导致脚本意外退出
+    if [ "$psabi_level" -gt 3 ]; then
+        psabi_level=3
+    fi
 
     # 关键修复：在执行 apt-cache policy 之前，确保源已更新
     apt-get update -y >/dev/null 2>&1
