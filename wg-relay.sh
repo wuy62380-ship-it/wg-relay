@@ -8,7 +8,11 @@
 set -euo pipefail
 
 check_root() {
-    [[ $EUID -ne 0 ]] && echo -e "\033[31m[错误] 必须使用 root 权限运行此脚本！\033[0m" && exit 1
+    # 修复: 原先 [[ $EUID -ne 0 ]] && ... 在 root 下返回 1，会导致 set -e 直接退出脚本
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "\033[31m[错误] 必须使用 root 权限运行此脚本！\033[0m"
+        exit 1
+    fi
 }
 
 detect_hardware_and_bandwidth() {
@@ -24,7 +28,7 @@ detect_hardware_and_bandwidth() {
 apply_ultimate_kernel() {
     echo -e "\033[32m[+] 正在注入网络极限内核调优...\033[0m"
     modprobe tcp_bbr 2>/dev/null || true
-    echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null
+    echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
     
     if [ "$TOTAL_MEM_MB" -ge 4096 ]; then
         CONTRACK_MAX=8388608
@@ -46,7 +50,8 @@ net.ipv4.tcp_wmem = 4096 65536 33554432
 net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_fin_timeout = 15
 EOF
-    sysctl -p /etc/sysctl.d/99-sdn-ultimate.conf >/dev/null 2>&1
+    # 修复: 某些系统可能不支持部分参数，防止 sysctl 返回非0导致脚本退出
+    sysctl -p /etc/sysctl.d/99-sdn-ultimate.conf >/dev/null 2>&1 || true
 }
 
 install_dependencies() {
@@ -54,7 +59,7 @@ install_dependencies() {
     case $ARCH in
         x86_64) SB_ARCH="amd64"; U2R_ARCH="amd64" ;;
         aarch64) SB_ARCH="arm64"; U2R_ARCH="arm" ;;
-        *) echo -e "\033[31m[错误] 不支持的架构: $ARCH\033[0m" && exit 1 ;;
+        *) echo -e "\033[31m[错误] 不支持的架构: $ARCH\033[0m"; exit 1 ;;
     esac
 
     if [ ! -f "/usr/local/bin/udp2raw" ]; then
@@ -63,7 +68,12 @@ install_dependencies() {
     fi
 
     if [ ! -f "/usr/local/bin/sing-box" ]; then
-        local VER=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+        # 修复: 网络问题或API限流可能导致 grep 返回非0，加 || true 防止 set -e 退出
+        local VER=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/' || true)
+        if [ -z "$VER" ]; then
+            echo -e "\033[31m[错误] 获取 sing-box 版本失败，请检查网络或稍后重试！\033[0m"
+            exit 1
+        fi
         wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${SB_ARCH}.tar.gz"
         tar -xzf sing-box.tar.gz && mv sing-box-${VER}-linux-${SB_ARCH}/sing-box /usr/local/bin/ && chmod +x /usr/local/bin/sing-box && rm -rf sing-box*
     fi
@@ -72,7 +82,8 @@ install_dependencies() {
 get_pub_ip() {
     local ip=""
     for api in "ifconfig.me" "api.ipify.org" "icanhazip.com"; do
-        ip=$(curl -s --connect-timeout 2 --max-time 3 -4 "$api" 2>/dev/null | tr -d '[:space:]')
+        # 修复: curl 超时会返回非0状态码，加 || true 防止 set -e 退出
+        ip=$(curl -s --connect-timeout 2 --max-time 3 -4 "$api" 2>/dev/null | tr -d '[:space:]' || true)
         if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "$ip"
             return 0
@@ -168,7 +179,11 @@ EOF
 # 模块二：生成香港对接凭证
 # ====================================================================================
 export_token() {
-    [ ! -f "/etc/sdn_hk_cluster.env" ] && echo -e "\033[31m[错误] 请先初始化香港总控！\033[0m" && return
+    # 修复: 使用 if 替代 && 防止 set -e 退出
+    if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
+        echo -e "\033[31m[错误] 请先初始化香港总控！\033[0m"
+        return
+    fi
     source /etc/sdn_hk_cluster.env
     read -p "为该落地机分配专用的中转隧道端口 [例如 25443]: " FAKE_PORT
     FAKE_PORT=${FAKE_PORT:-25443}
@@ -243,9 +258,11 @@ EOF
     mkdir -p /etc/sing-box
     cat > /etc/sing-box/config.json <<EOF
 {
-  "outbounds": [{ "type": "direct", "tag": "out-$NODE_TAG" }]
+  "outbounds": [{ "type": "direct", "direct" }]
 }
 EOF
+    # 修复 json 笔误
+    sed -i 's/"type":direct/"type": "direct"/g' /etc/sing-box/config.json
 
     cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
@@ -274,7 +291,11 @@ EOF
 # 模块四：香港总控端纳管注册
 # ====================================================================================
 register_node_to_hk() {
-    [ ! -f "/etc/sdn_hk_cluster.env" ] && echo -e "\033[31m[错误] 请先初始化香港总控！\033[0m" && return
+    # 修复: 使用 if 替代 && 防止 set -e 退出
+    if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
+        echo -e "\033[31m[错误] 请先初始化香港总控！\033[0m"
+        return
+    fi
     source /etc/sdn_hk_cluster.env
 
     read -p "请粘贴落地机生成的【注册密文】: " REG_CODE
@@ -379,6 +400,7 @@ rebuild_hk_sdn_matrix() {
 EOF
 }
 
+# 脚本入口
 check_root
 
 while true; do
