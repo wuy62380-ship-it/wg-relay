@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (工业级最终加固与修复版)
+# 跨境软件定义边缘网络系统 (工业级最终加固与完整功能版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合组网
 # ====================================================================================
@@ -164,7 +164,6 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-    # 防火墙放行客户端入站端口
     iptables -I INPUT -p tcp --dport $CLIENT_PORT -j ACCEPT || true
 
     systemctl daemon-reload
@@ -239,7 +238,6 @@ setup_landing_node() {
     LOCAL_WG_PORT=$((RANDOM % 10000 + 40000))
 
     mkdir -p /etc/wireguard
-    # 修复 Bug 1: PersistentKeepalive 置于 [Peer] 下，且 Endpoint 指向本地 udp2raw
     cat > /etc/wireguard/wg0.conf <<EOF
 [Interface]
 PrivateKey = $WG_PRIV
@@ -273,7 +271,6 @@ After=udp2raw.service
 Wants=udp2raw.service
 EOF
 
-    # 修复 Bug 3: 落地端必须配置 SOCKS5 监听，供香港总控分发流量
     mkdir -p /etc/sing-box
     cat > /etc/sing-box/config.json <<EOF
 {
@@ -334,7 +331,6 @@ register_node_to_hk() {
     NODE_TAG=$(echo "$DECODED_REG" | cut -d'|' -f3)
     FAKE_PORT=$(echo "$DECODED_REG" | cut -d'|' -f4)
 
-    # 修复 Bug 2: 保持 wg0 ListenPort 30000 不变，追加 Peer 记录
     cat >> /etc/wireguard/wg0.conf <<EOF
 
 [Peer]
@@ -344,7 +340,6 @@ AllowedIPs = $LAND_IP/32
 EOF
     systemctl restart wg-quick@wg0
 
-    # 修复 Bug 4: 自动放行防火墙端口，并将 udp2raw 解包数据转发给 WireGuard 30000 端口
     iptables -I INPUT -p tcp --dport $FAKE_PORT -j ACCEPT || true
 
     cat > /etc/systemd/system/udp2raw-${NODE_TAG}.service <<EOF
@@ -362,7 +357,6 @@ EOF
     systemctl daemon-reload
     systemctl enable --now udp2raw-${NODE_TAG}.service
 
-    # 文件锁安全追加并重新构建矩阵
     (
         flock -x 200
         echo "NODE:${NODE_TAG}:${LAND_IP}" >> /etc/sdn_nodes_registry.list
@@ -372,16 +366,42 @@ EOF
 
     echo -e "\n===================================================================="
     echo -e "\e[32m[√] 落地节点 [$NODE_TAG] 成功加入集群！\e[0m"
-    echo -e "客户端节点链接如下，可直接导入客户端："
+    echo -e "客户端节点链接如下："
     echo -e "\e[36mvless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${NODE_TAG}\e[0m"
     echo -e "===================================================================="
+}
+
+# ====================================================================================
+# 模块五：查看/导出所有已注册节点的客户端链接 (新增模块)
+# ====================================================================================
+show_node_links() {
+    if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
+        echo -e "\033[31m[错误] 当前服务器未初始化香港总控，或找不到配置文件！\033[0m"
+        return
+    fi
+    source /etc/sdn_hk_cluster.env
+
+    echo -e "\n===================================================================="
+    echo -e "                   🌐 集群节点 VLESS 接入链接                        "
+    echo -e "===================================================================="
+
+    if [ ! -f "/etc/sdn_nodes_registry.list" ] || [ ! -s "/etc/sdn_nodes_registry.list" ]; then
+        echo -e "\033[33m[提示] 暂未注册任何落地节点。\033[0m"
+    else
+        while IFS=: read -r prefix tag ip; do
+            if [ "$prefix" = "NODE" ]; then
+                echo -e "\n📌 节点标识: \033[32m${tag}\033[0m  |  隧道 IP: \033[33m${ip}\033[0m"
+                echo -e "\033[36mvless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${tag}\033[0m"
+            fi
+        done < /etc/sdn_nodes_registry.list
+    fi
+    echo -e "\n===================================================================="
 }
 
 rebuild_hk_sdn_matrix() {
     local outbounds_json=""
     local tags_array=""
 
-    # 修复 Bug 3: outbound 必须写为 socks 类型，连接落地机的 10808 端口
     if [ -f /etc/sdn_nodes_registry.list ]; then
         while IFS=: read -r prefix tag ip; do
             if [ "$prefix" = "NODE" ]; then
@@ -447,9 +467,10 @@ while true; do
     echo " 2. 【第二步：香港中转机】生成落地机对接凭证代码"
     echo " 3. 【第三步：落地机(动态/静态均可)】配置并加入集群"
     echo " 4. 【第四步：香港总控】输入落地机注册密文完成组网"
+    echo " 5. 【香港总控】查看/导出所有已注册节点的 VLESS 链接"
     echo " 0. 退出脚本"
     echo "===================================================================="
-    read -p "请选择对应操作的数字 [0-4]: " choice
+    read -p "请选择对应操作的数字 [0-5]: " choice
 
     choice=$(echo "$choice" | tr -d '[:space:]')
 
@@ -458,6 +479,7 @@ while true; do
         2) export_token; read -p "按回车键继续..." ;;
         3) setup_landing_node; read -p "按回车键继续..." ;;
         4) register_node_to_hk; read -p "按回车键继续..." ;;
+        5) show_node_links; read -p "按回车键继续..." ;;
         0) exit 0 ;;
         *) echo -e "\033[31m[错误] 输入无效，请重新选择。\033[0m"; sleep 2 ;;
     esac
