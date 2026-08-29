@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (支持中文节点命名版)
+# 跨境软件定义边缘网络系统 (修复策略组逻辑版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -1123,9 +1123,22 @@ rebuild_hk_sdn_matrix() {
     outbounds_json=${outbounds_json%,}
     tags_array=${tags_array%,}
 
+    # 构建策略组的 outbounds 数组
+    local urltest_tag="🚀 智能测速自动优选"
+    local selector_tag="🎯 手动指定切换节点"
+    
+    local urltest_outbounds="$tags_array"
+    if [ -z "$urltest_outbounds" ]; then
+        urltest_outbounds="\"direct\""
+    fi
+
+    local selector_outbounds="\"${urltest_tag}\""
+    if [ -n "$tags_array" ]; then
+        selector_outbounds="\"${urltest_tag}\", $tags_array"
+    fi
+
     if [ -z "$outbounds_json" ]; then
         outbounds_json="{ \"type\": \"direct\", \"tag\": \"direct\" }"
-        tags_array="\"direct\""
     else
         outbounds_json+=", { \"type\": \"direct\", \"tag\": \"direct\" }"
     fi
@@ -1144,22 +1157,22 @@ rebuild_hk_sdn_matrix() {
   "outbounds": [
     {
       "type": "urltest",
-      "tag": "🚀 智能测速自动优选 (TikTok/直播/游戏推荐)",
-      "outbounds": [ $tags_array ],
+      "tag": "${urltest_tag}",
+      "outbounds": [ ${urltest_outbounds} ],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "1m",
       "tolerance": 15
     },
     {
       "type": "selector",
-      "tag": "🎯 手动指定切换节点",
-      "outbounds": [ $tags_array ],
-      "default": "🚀 智能测速自动优选 (TikTok/直播/游戏推荐)"
+      "tag": "${selector_tag}",
+      "outbounds": [ ${selector_outbounds} ],
+      "default": "${urltest_tag}"
     },
     $outbounds_json
   ],
   "route": {
-    "rules": [{ "inbound": ["vless-in"], "outbound": "🎯 手动指定切换节点" }]
+    "rules": [{ "inbound": ["vless-in"], "outbound": "${selector_tag}" }]
   }
 }
 EOF
