@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (完美修复 XanMod 源版)
+# 跨境软件定义边缘网络系统 (支持外部 SOCKS5 节点导入版)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -40,19 +40,16 @@ xanmod_add_repo() {
     local key_url="https://dl.xanmod.org/archive.key"
     local os_codename=""
 
-    # 获取系统真实代号
     if command -v lsb_release >/dev/null 2>&1; then
         os_codename=$(lsb_release -sc)
     elif [ -r /etc/os-release ]; then
         os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
     fi
 
-    # 如果不在白名单，则使用 releases
     if ! echo "bookworm trixie forky sid noble plucky questing resolute faye gigi wilma xia zara zena" | grep -qw "$os_codename"; then
         os_codename="releases"
     fi
 
-    # 黑名单拦截
     if echo "jammy focal bullseye buster" | grep -qw "$os_codename" || [ "$os_codename" = "releases" ]; then
         echo -e "${RED}XanMod 官方已停止对当前系统($os_codename)的 APT 源支持，请升级至 Debian12 / Ubuntu24 或更高版本。${R}"
         return 1
@@ -96,7 +93,6 @@ xanmod_detect_psabi_level() {
 xanmod_package_available() {
     local package="$1"
     local candidate
-    # 修复: 准确判断候选版本是否有效，防止匹配到 (none) 误认为存在
     candidate=$(apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ {print $2}')
     [ -n "$candidate" ] && [ "$candidate" != "(none)" ]
 }
@@ -110,12 +106,10 @@ xanmod_detect_package() {
     psabi_level=$(xanmod_detect_psabi_level) || psabi_level=3
     [ -n "$psabi_level" ] || psabi_level=3
     
-    # 修复: 使用 if 语句替代 && 链，防止在 set -e 下因返回 false 导致脚本意外退出
     if [ "$psabi_level" -gt 3 ]; then
         psabi_level=3
     fi
 
-    # 关键修复：在执行 apt-cache policy 之前，确保源已更新
     apt-get update -y >/dev/null 2>&1
 
     for prefix in $prefix_list; do
@@ -131,7 +125,6 @@ xanmod_detect_package() {
         done
     done
 
-    # 兜底支持
     if xanmod_package_available "linux-xanmod-x64v3"; then
         echo -e "${G}已匹配标准保底安装包: linux-xanmod-x64v3${R}" >&2
         printf 'linux-xanmod-x64v3\n'
@@ -371,7 +364,6 @@ apply_ultimate_kernel() {
         target_algo="bbr"
     fi
 
-    # 修复: 防止因不支持 BBR 导致 set -e 中断后续组网配置
     set_bbr_algo "$target_algo" || true
 }
 
@@ -673,6 +665,7 @@ EOF
 
     (
         flock -x 200
+        sed -i "/^NODE:${NODE_TAG}:/d" /etc/sdn_nodes_registry.list 2>/dev/null || true
         echo "NODE:${NODE_TAG}:${LAND_IP}" >> /etc/sdn_nodes_registry.list
         rebuild_hk_sdn_matrix
         systemctl restart sing-box
@@ -680,6 +673,57 @@ EOF
 
     echo -e "\n===================================================================="
     echo -e "${G}[√] 落地节点 [$NODE_TAG] 成功加入集群！${R}"
+    echo -e "===================================================================="
+}
+
+# ================= 外部 SOCKS5 代理导入模块 =================
+setup_external_proxy() {
+    if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
+        echo -e "${RED}[错误] 请先初始化香港总控！${R}"
+        return
+    fi
+    source /etc/sdn_hk_cluster.env
+
+    echo -e "\n${G}=== 添加外部现成 SOCKS5 代理节点 ===${R}"
+    echo -e "适用于直接购买的静态 SOCKS5 代理 (无需在目标机安装脚本)。"
+    
+    read -p "请输入外部代理节点名称 [例如: us-socks5]: " NODE_TAG
+    
+    read -p "请输入代理服务器IP或域名: " PROXY_SERVER
+    if [ -z "$PROXY_SERVER" ]; then
+        echo -e "${RED}[错误] IP不能为空！${R}"
+        return
+    fi
+
+    while true; do
+        read -p "请输入代理端口 [1-65535]: " PROXY_PORT
+        if [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] && [ "$PROXY_PORT" -ge 1 ] && [ "$PROXY_PORT" -le 65535 ]; then
+            break
+        else
+            echo -e "${RED}端口必须是 1-65535 的数字，请重新输入！${R}"
+        fi
+    done
+
+    read -p "请输入用户名 (无认证则回车跳过): " PROXY_USER
+    local PROXY_PASS="-"
+    if [ -n "$PROXY_USER" ]; then
+        read -s -p "请输入密码: " PROXY_PASS
+        echo ""
+    else
+        PROXY_USER="-"
+    fi
+
+    (
+        flock -x 200
+        sed -i "/^EXT:${NODE_TAG}:/d" /etc/sdn_nodes_registry.list 2>/dev/null || true
+        echo "EXT:${NODE_TAG}:${PROXY_SERVER}:${PROXY_PORT}:${PROXY_USER}:${PROXY_PASS}" >> /etc/sdn_nodes_registry.list
+        rebuild_hk_sdn_matrix
+        systemctl restart sing-box
+    ) 200>/var/lock/sdn_registry.lock
+
+    echo -e "\n===================================================================="
+    echo -e "${G}[√] 外部代理节点 [$NODE_TAG] 成功加入集群！${R}"
+    echo -e "你可以通过选项 5 导出该节点的 VLESS 链接。"
     echo -e "===================================================================="
 }
 
@@ -697,11 +741,19 @@ show_node_links() {
     if [ ! -f "/etc/sdn_nodes_registry.list" ] || [ ! -s "/etc/sdn_nodes_registry.list" ]; then
         echo -e "${Y}[提示] 暂未注册任何落地节点。${R}"
     else
-        echo -e "\n${H}=== 直连落地节点 ===${R}"
-        while IFS=: read -r prefix tag ip; do
+        echo -e "\n${H}=== 直连落地节点 (需服务器部署) ===${R}"
+        while IFS=: read -r prefix p1 p2 p3 p4 p5; do
             if [ "$prefix" = "NODE" ]; then
-                echo -e "\n📌 节点标识: ${G}${tag}${R}  |  隧道 IP: ${Y}${ip}${R}"
-                echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${tag}${R}"
+                echo -e "\n📌 节点标识: ${G}${p1}${R}  |  隧道 IP: ${Y}${p2}${R}"
+                echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-${p1}${R}"
+            fi
+        done < /etc/sdn_nodes_registry.list
+
+        echo -e "\n${H}=== 外部 SOCKS5 代理节点 (现成IP导入) ===${R}"
+        while IFS=: read -r prefix p1 p2 p3 p4 p5; do
+            if [ "$prefix" = "EXT" ]; then
+                echo -e "\n🌍 外部代理: ${G}${p1}${R}  |  目标: ${Y}${p2}:${p3}${R}"
+                echo -e "${C}vless://${UUID}@${HK_IP}:${CLIENT_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid=${SHORT_ID}#SDN-EXT-${p1}${R}"
             fi
         done < /etc/sdn_nodes_registry.list
 
@@ -720,11 +772,12 @@ show_node_links() {
 
 setup_chain_proxy() {
     if [ ! -f "/etc/sdn_nodes_registry.list" ] || [ $(grep -c "^NODE:" /etc/sdn_nodes_registry.list 2>/dev/null || echo 0) -lt 2 ]; then
-        echo -e "${RED}[错误] 配置多级链式代理至少需要注册 2 个以上的落地节点！${R}"
+        echo -e "${RED}[错误] 配置多级链式代理至少需要 2 个以上的内网落地节点！${R}"
+        echo -e "${Y}[提示] 如果你只有1台落地机，请直接使用选项 5 导出单节点链接即可。${R}"
         return
     fi
 
-    echo -e "\n${G}=== 可用的落地节点 ===${R}"
+    echo -e "\n${G}=== 可用的内网落地节点 ===${R}"
     grep "^NODE:" /etc/sdn_nodes_registry.list | cut -d':' -f2,3
 
     read -p "请输入前置跳板节点 Tag [例如 tw3]: " NODE1_TAG
@@ -755,10 +808,25 @@ rebuild_hk_sdn_matrix() {
     local tags_array=""
 
     if [ -f /etc/sdn_nodes_registry.list ]; then
-        while IFS=: read -r prefix tag ip; do
+        while IFS=: read -r prefix p1 p2 p3 p4 p5; do
             if [ "$prefix" = "NODE" ]; then
-                outbounds_json+="{ \"type\": \"socks\", \"tag\": \"out-$tag\", \"server\": \"$ip\", \"server_port\": 10808 },"
-                tags_array+="\"out-$tag\","
+                outbounds_json+="{ \"type\": \"socks\", \"tag\": \"out-$p1\", \"server\": \"$p2\", \"server_port\": 10808 },"
+                tags_array+="\"out-$p1\","
+            elif [ "$prefix" = "EXT" ]; then
+                local ext_tag="$p1"
+                local ext_server="$p2"
+                local ext_port="$p3"
+                local ext_user="$p4"
+                local ext_pass="$p5"
+                
+                local json_entry=""
+                if [ "$ext_user" = "-" ] || [ -z "$ext_user" ]; then
+                    json_entry="{ \"type\": \"socks\", \"tag\": \"out-ext-$ext_tag\", \"server\": \"$ext_server\", \"server_port\": $ext_port }"
+                else
+                    json_entry="{ \"type\": \"socks\", \"tag\": \"out-ext-$ext_tag\", \"server\": \"$ext_server\", \"server_port\": $ext_port, \"username\": \"$ext_user\", \"password\": \"$ext_pass\" }"
+                fi
+                outbounds_json+="${json_entry},"
+                tags_array+="\"out-ext-$ext_tag\","
             fi
         done < /etc/sdn_nodes_registry.list
     fi
@@ -836,9 +904,10 @@ while true; do
     echo " 5. 【香港总控】查看/导出所有节点的 VLESS 接入链接"
     echo " 6. 【香港总控】配置多级链式代理 (例如: 香港->tw3->jp1)"
     echo " 7. 【系统工具】BBR / BBRv3 算法独立切换与内核管理 (含卸载)"
+    echo " 8. 【香港总控】添加外部 SOCKS5 代理节点 (直接使用现成IP)"
     echo " 0. 退出脚本"
     echo "===================================================================="
-    read -p "请选择对应操作的数字 [0-7]: " choice
+    read -p "请选择对应操作的数字 [0-8]: " choice
 
     choice=$(echo "$choice" | tr -d '[:space:]')
 
@@ -850,6 +919,7 @@ while true; do
         5) show_node_links; read -p "按回车键继续..." ;;
         6) setup_chain_proxy; read -p "按回车键继续..." ;;
         7) manage_bbr ;;
+        8) setup_external_proxy; read -p "按回车键继续..." ;;
         0) exit 0 ;;
         *) echo -e "${RED}[错误] 输入无效，请重新选择。${R}"; sleep 2 ;;
     esac
