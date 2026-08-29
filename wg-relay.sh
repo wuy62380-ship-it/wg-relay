@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================================================
-# 跨境软件定义边缘网络系统 (工业级最终加固与完整功能版 - BBR/BBRv3交互选择版)
+# 跨境软件定义边缘网络系统 (工业级最终加固与完整功能版 - 修复 GPG 参数 bug)
 # 架构: 动态/静态落地机 -> 主动反向隧道 (udp2raw+WireGuard) -> 香港总控 -> 智能容灾/链式代理
 # 场景: TikTok 1080p 60fps 手机/电脑娱播推流、低延迟游戏、家宽/机房混合多跳组网
 # ====================================================================================
@@ -102,12 +102,14 @@ install_xanmod_bbr3() {
 
     echo -e "\033[32m[+] 正在配置 XanMod 官方 APT 密钥与软件源...\033[0m"
     apt-get update && apt-get install -y wget gnupg
-    wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --overwrite
+    
+    # 修正 gpg 覆盖参数 --yes
+    wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o /usr/share/keyrings/xanmod-archive-keyring.gpg
     echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
 
     echo -e "\033[32m[+] 正在下载并安装包含 BBRv3 的最新 XanMod 内核...\033[0m"
     apt-get update
-    if apt-get install -y linux-xanmod-x64v3; then
+    if apt-get install -y linux-xanmod-x64v3 || apt-get install -y linux-xanmod-x64v2; then
         echo -e "\n\033[32m[√] XanMod 内核安装完成！\033[0m"
         read -p "系统需要重启以加载新内核，是否立即重启？[y/N]: " reboot_now
         if [[ "$reboot_now" =~ ^[Yy]$ ]]; then
@@ -117,11 +119,10 @@ install_xanmod_bbr3() {
             echo -e "\033[33m请稍后手动重启服务器 (`reboot`) 以激活新内核与 BBRv3。\033[0m"
         fi
     else
-        echo -e "\033[31m[错误] XanMod 内核安装失败，请检查网络连接。\033[0m"
+        echo -e "\033[31m[错误] XanMod 内核安装失败，请检查网络连接或服务器架构兼容性。\033[0m"
     fi
 }
 
-# 模块七：交互式 BBR / BBRv3 管理菜单
 manage_bbr() {
     while true; do
         clear
@@ -216,9 +217,6 @@ get_pub_ip() {
     echo "127.0.0.1"
 }
 
-# ====================================================================================
-# 模块一：香港中转总控初始化
-# ====================================================================================
 setup_hk_master() {
     apt-get update && apt-get install -y wireguard wireguard-tools curl jq iptables iproute2 uuid-runtime systemd
     detect_hardware_and_bandwidth
@@ -302,9 +300,6 @@ EOF
     echo -e "===================================================================="
 }
 
-# ====================================================================================
-# 模块二：生成香港对接凭证
-# ====================================================================================
 export_token() {
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
         echo -e "\033[31m[错误] 请先初始化香港总控！\033[0m"
@@ -325,9 +320,6 @@ export_token() {
     echo -e "===================================================================="
 }
 
-# ====================================================================================
-# 模块三：配置落地机
-# ====================================================================================
 setup_landing_node() {
     apt-get update && apt-get install -y wireguard wireguard-tools curl jq iptables uuid-runtime systemd
     detect_hardware_and_bandwidth
@@ -428,9 +420,6 @@ EOF
     echo -e "===================================================================="
 }
 
-# ====================================================================================
-# 模块四：香港总控端纳管注册
-# ====================================================================================
 register_node_to_hk() {
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
         echo -e "\033[31m[错误] 请先初始化香港总控！\033[0m"
@@ -483,9 +472,6 @@ EOF
     echo -e "===================================================================="
 }
 
-# ====================================================================================
-# 模块五：查看/导出所有节点 VLESS 链接
-# ====================================================================================
 show_node_links() {
     if [ ! -f "/etc/sdn_hk_cluster.env" ]; then
         echo -e "\033[31m[错误] 当前服务器未初始化香港总控，或找不到配置文件！\033[0m"
@@ -521,9 +507,6 @@ show_node_links() {
     echo -e "\n===================================================================="
 }
 
-# ====================================================================================
-# 模块六：配置多级链式代理 (Chain Proxy / Detour)
-# ====================================================================================
 setup_chain_proxy() {
     if [ ! -f "/etc/sdn_nodes_registry.list" ] || [ $(grep -c "^NODE:" /etc/sdn_nodes_registry.list 2>/dev/null || echo 0) -lt 2 ]; then
         echo -e "\033[31m[错误] 配置多级链式代理至少需要注册 2 个以上的落地节点！\033[0m"
